@@ -1,0 +1,176 @@
+[
+  {
+    "name": "disjoint original ranges",
+    "original": "alpha\nbeta\ngamma\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "beta"
+      },
+      {
+        "oldText": "beta",
+        "newText": "delta"
+      }
+    ],
+    "expected": "beta\ndelta\ngamma\n"
+  },
+  {
+    "name": "overlap",
+    "original": "abcdef\n",
+    "edits": [
+      {
+        "oldText": "abcd",
+        "newText": "x"
+      },
+      {
+        "oldText": "cdef",
+        "newText": "y"
+      }
+    ],
+    "error": "edits[0] and edits[1] overlap in fixture.txt. Merge them into one edit or target disjoint regions."
+  },
+  {
+    "name": "ambiguous",
+    "original": "one\none\n",
+    "edits": [
+      {
+        "oldText": "one",
+        "newText": "two"
+      }
+    ],
+    "error": "Found 2 occurrences of the text in fixture.txt. The text must be unique. Please provide more context to make it unique."
+  },
+  {
+    "name": "normalized ambiguous",
+    "original": "x “q”\nx \"q\"\n",
+    "edits": [
+      {
+        "oldText": "x \"q\"",
+        "newText": "changed"
+      }
+    ],
+    "error": "Found 2 occurrences of the text in fixture.txt. The text must be unique. Please provide more context to make it unique."
+  },
+  {
+    "name": "missing",
+    "original": "alpha\n",
+    "edits": [
+      {
+        "oldText": "missing",
+        "newText": "new"
+      }
+    ],
+    "error": "Could not find the exact text in fixture.txt. The old text must match exactly including all whitespace and newlines."
+  },
+  {
+    "name": "no change",
+    "original": "alpha\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "alpha"
+      }
+    ],
+    "error": "No changes made to fixture.txt. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+  },
+  {
+    "name": "empty",
+    "original": "alpha\n",
+    "edits": [
+      {
+        "oldText": "",
+        "newText": "alpha"
+      }
+    ],
+    "error": "oldText must not be empty in fixture.txt."
+  },
+  {
+    "name": "fuzzy preserve untouched",
+    "original": "keep “quotes”   \nconst x = “old”;  \nkeep — dash\n",
+    "edits": [
+      {
+        "oldText": "const x = \"old\";",
+        "newText": "const x = \"new\";"
+      }
+    ],
+    "expected": "keep “quotes”   \nconst x = \"new\";\nkeep — dash\n"
+  },
+  {
+    "name": "mixed exact and fuzzy",
+    "original": "ﬁrst\nexact\nkeep  \n",
+    "edits": [
+      {
+        "oldText": "first",
+        "newText": "first!"
+      },
+      {
+        "oldText": "exact",
+        "newText": "exact!"
+      }
+    ],
+    "expected": "first!\nexact!\nkeep  \n"
+  },
+  {
+    "name": "two changes on normalized line",
+    "original": "“alpha” — beta\nuntouched  \n",
+    "edits": [
+      {
+        "oldText": "\"alpha\"",
+        "newText": "A"
+      },
+      {
+        "oldText": "beta",
+        "newText": "B"
+      }
+    ],
+    "expected": "A - B\nuntouched  \n"
+  },
+  {
+    "name": "multiline newline end",
+    "original": "head\nﬁrst\nsecond\ntail\n",
+    "edits": [
+      {
+        "oldText": "first\nsecond\n",
+        "newText": "new\n"
+      }
+    ],
+    "expected": "head\nnew\ntail\n"
+  },
+  {
+    "name": "unicode offsets",
+    "original": "你好 🪐\nconst n = 1\n",
+    "edits": [
+      {
+        "oldText": "🪐",
+        "newText": "星球"
+      },
+      {
+        "oldText": "n = 1",
+        "newText": "n = 2"
+      }
+    ],
+    "expected": "你好 星球\nconst n = 2\n"
+  },
+  {
+    "name": "crlf arguments",
+    "original": "a\nb\nc\n",
+    "edits": [
+      {
+        "oldText": "a\r\nb",
+        "newText": "x\r\ny"
+      }
+    ],
+    "expected": "x\ny\nc\n"
+  },
+  {
+    "name": "NEL is not JS whitespace",
+    "original": "x\nﬁrst\n",
+    "edits": [
+      {
+        "oldText": "first",
+        "newText": "new"
+      }
+    ],
+    "expected": "x\nnew\n"
+  }
+]
