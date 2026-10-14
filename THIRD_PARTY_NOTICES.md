@@ -12,5 +12,5 @@ at commit `af5d95f255`. Codex is licensed under Apache-2.0; its license is inclu
 in [third_party/codex-LICENSE](third_party/codex-LICENSE). This SDK does not embed
 the Codex application, sandbox or approval-policy implementation.
 
-Go dependencies retain their respective licenses in their modules. These notices
-do not select a license for the remainder of astral-core.
+astral-core is licensed under Apache-2.0; see [LICENSE](LICENSE). Third-party
+adaptations and Go dependencies retain their respective licenses and attribution.

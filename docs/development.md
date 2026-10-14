@@ -91,4 +91,4 @@ go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/Deta
 
 存储格式为 3，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
 
-模块地址为 `github.com/oines/astral-core`，项目自身的开源许可证尚未指定。标准工具参考来源及许可证见 [第三方声明](../THIRD_PARTY_NOTICES.md)。本地验证环境为 macOS / arm64，不能把离线协议测试视为真实 Provider 或所有平台的兼容性认证。
+模块地址为 `github.com/oines/astral-core`，项目使用 [Apache-2.0 许可证](../LICENSE)。标准工具参考来源及许可证见 [第三方声明](../THIRD_PARTY_NOTICES.md)。本地验证环境为 macOS / arm64，不能把离线协议测试视为真实 Provider 或所有平台的兼容性认证。
