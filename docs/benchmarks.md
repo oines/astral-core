@@ -1,90 +1,144 @@
-# 分层与长会话重构：验证与 Benchmark
+# Rollout / Session Fork：版本 3 验收与性能
 
-日期：2026-10-14。代码直接替换旧 API 和格式，入口与边界见 [README](../README.md)，持久语义见 [契约](contracts.md)。
+日期：2026-10-14。契约见 [contracts.md](contracts.md)，离线用法见 [Fork 示例](../examples/fork/main.go)。本轮变更限于 Session、Store、测试、示例和文档；Core 源码没有修改。
 
-## 实施结果
+## 实施与验收
 
-| 阶段 | 交付与验证 |
+- Rollout 拥有历史；Session 拥有独立执行状态。默认 Shared 只新增 Session 和创建记录，Detached 复制所选路径。稳定目标 ID 提供创建幂等。
+- Store 在原子提交范围内分配 Rollout Sequence，再 Reduce 和保存 Receipt；Session 根据已确认区间 Reduce。确认丢失、兄弟提交交错、旧回执遇到新所有者的行为均有回归测试。
+- Child 从 Projection 初始化，本地创建版本为 1。Detached 祖先保留原身份、写入 Session、版本、顺序及协议数据，通过导入路径保存，不参与 Child 本地提交回放。
+- 完整工具批次可 Continue，历史 Tool / Hook 不重跑，Terminate 保留。不完整批次和未解决效果在创建前拒绝。配置、压缩、环境重新确认、Context 预算、队列与生命周期隔离均有覆盖。选择环境切换工具的结果节点时，同样保留快照效果并要求重新确认。
+- SQLite / JSONL 各覆盖分页复制中、发布前、发布后的真实 SIGKILL，以及同身份清理重试、参数冲突和已发布目标保护。原工具副作用恢复的 14 个 SIGKILL 场景继续通过。
+- 跨句柄并发创建、运行中 Parent 与 Child 同时执行、关闭 Parent 后 Child 继续、冷回放与 Checkpoint、一百万历史的有界读取、Detached 脱离源 Rollout、复杂协议数据冷重开保真均已验证。
+- 归档中单条记录超过默认 4 MiB 复制页时，单独读取并完整复制；三后端测试确认它不会被裁剪，也不会重新进入已压缩的有效 Context。
+
+最终检查均通过：
+
+```sh
+go test -race ./...
+go vet ./...
+GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 go test ./...
+```
+
+五个离线示例 `basic`、`approval`、`environments`、`tools`、`fork` 均实际运行成功。审批示例副作用计数为 1；环境示例仍保持原进程绑定；Fork 示例验证 Shared / Detached 的 Rollout 关系及独立生命周期。[验收输出](benchmarks/2026-10-14-rollout-validation.txt)。
+
+## 测量方法
+
+Apple M2，8 个逻辑 CPU，24 GiB RAM，macOS 15.7.5（24G624），darwin/arm64；Go 1.26.3、modernc.org/sqlite v1.38.2。SQLite 使用 WAL、synchronous=FULL、5 秒忙等待和有限连接页缓存。
+
+夹具通过公开 Store.Commit，每批 256 条写入 10,000 / 100,000 / 1,000,000 条固定长度历史消息。摘要覆盖旧消息，固定保留 16 条近期消息；Session 缓存 19 条记录，投影为 17 条模型消息。模型与估算器离线确定，不调用 Provider。
+
+- 热操作各测 20 次，Detached 每个规模测 1 次；夹具构造不计入 ns/op。数值为本机测量，不是延迟保证或吞吐 SLA。
+- Append 追加一条运行记录。MultiSessionCommit 使用 8 个独立 Session 并发提交，报告总耗时除以总提交数；包含协调开销，不是单次请求的尾延迟。
+- 热 OpenSession 在已打开的 Store / Manager 上加载并关闭 Session。ColdOpenSession 每次新建 SQLite Store 句柄和 Manager，随后加载并关闭；它测量新连接与上下文加载，**没有清空 OS 文件缓存，也不是全新进程或物理冷盘测量**。
+- Shared / Detached 均包括边界校验、有效 Context 预算检查和 Child 加载。Shared 不复制祖先；Detached 导入全部祖先历史。
+- Go 堆峰值每 1 ms 采样，包含采样开销，可能遗漏更短峰值。RSS 是操作批次前后的 `ps` 样本，不是每操作峰值；整进程最大 RSS 另由 `/usr/bin/time -l` 报告，包含夹具构造。
+- `db-bytes/op` 是 SQLite 页数增量乘页大小，包含持久索引；`file-growth-B/op` 是数据库、WAL、SHM 的实际文件长度净增量。WAL 复用时文件增长可以为零，仍然发生持久写入。
+- `RowsRead` 为返回给适配器的历史 / 状态行，包含分页预读；不代表 SQLite 内部扫描次数，也不计标量元数据探测。查询计划另行验证。
+
+原始数据：[热操作](benchmarks/2026-10-14-rollout-hot.txt)、[Detached](benchmarks/2026-10-14-rollout-detached.txt)、[查询计划](benchmarks/2026-10-14-rollout-query-plan.txt)。
+
+## 耗时
+
+除 Detached 使用秒，其余均为毫秒 / 操作。
+
+| 历史消息 | Append | 热 Open | 新句柄 Open | PrepareContext | Shared | 8 Session Commit | Detached（秒） |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 0.189 | 0.330 | 0.741 | 0.163 | 0.817 | 0.238 | 0.410 |
+| 100,000 | 0.355 | 0.323 | 0.769 | 0.151 | 0.835 | 0.271 | 4.558 |
+| 1,000,000 | 0.397 | 0.301 | 0.847 | 0.143 | 0.861 | 0.310 | 49.205 |
+
+Shared 三个规模均读取 **41 行**，累计分配约 **222 KB / 次**，SQLite 持久页增量约 **2.2–2.7 KB / 次**；没有复制完整前缀。热 / 新句柄 Open 均读取 20 行；PrepareContext 不读取存储；Append 与多 Session Commit 各读 1 行当前状态。常驻 Context 一直为 19 条记录。
+
+这些结果支持 Shared 的成本取决于有效 Context、创建批次与必要索引访问。耗时仍受 fsync、检查点和索引页访问影响，不能从一次测量推导固定毫秒上限。
+
+## 分配、内存与存储
+
+B/op 是单次操作的累计分配，**不是同时保留的内存**。RSS 列为批次开始 → 结束；所有内存单位 MiB 使用 2²⁰ 字节。
+
+### 10,000 条历史消息
+
+| 操作 | 分配 B/op | allocs/op | Go 堆峰值 MiB | RSS MiB（前 → 后） | DB 增量 B/op | 文件净增量 B/op | 读取行数/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Append | 14,592 | 263 | 2.785 | 30.02 → 30.03 | 204.8 | 0.0 | 1 |
+| OpenSession（热） | 107,403 | 912 | 4.505 | 30.23 → 30.25 | 0.0 | 0.0 | 20 |
+| PrepareContext | 77,881 | 667 | 4.037 | 30.33 → 30.36 | 0.0 | 0.0 | 0 |
+| Shared | 221,575 | 2,101 | 4.755 | 30.36 → 30.52 | 2,458.0 | 0.0 | 41 |
+| 8 Session Commit | 17,658 | 292 | 2.859 | 30.53 → 30.53 | 819.2 | 5,120.0 | 1 |
+| OpenSession（新句柄） | 131,081 | 1,210 | 4.578 | 30.53 → 30.56 | 0.0 | 0.0 | 20 |
+| Detached | 45,498,312 | 605,973 | 5.577 | 29.64 → 30.28 | 18,677,760.0 | 18,610,648.0 | 10,082 |
+
+### 100,000 条历史消息
+
+| 操作 | 分配 B/op | allocs/op | Go 堆峰值 MiB | RSS MiB（前 → 后） | DB 增量 B/op | 文件净增量 B/op | 读取行数/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Append | 14,772 | 270 | 2.820 | 31.50 → 31.50 | 409.6 | 100,966.0 | 1 |
+| OpenSession（热） | 107,350 | 912 | 4.559 | 31.52 → 31.52 | 0.0 | 0.0 | 20 |
+| PrepareContext | 76,987 | 666 | 3.697 | 31.52 → 31.52 | 0.0 | 0.0 | 0 |
+| Shared | 221,844 | 2,102 | 4.841 | 31.52 → 31.52 | 2,253.0 | 0.0 | 41 |
+| 8 Session Commit | 17,806 | 294 | 2.937 | 31.53 → 31.53 | 1,024.0 | 5,325.0 | 1 |
+| OpenSession（新句柄） | 130,953 | 1,209 | 4.741 | 31.53 → 31.53 | 0.0 | 0.0 | 20 |
+| Detached | 453,152,952 | 6,110,224 | 5.870 | 32.34 → 32.50 | 188,825,600.0 | 190,985,032.0 | 100,433 |
+
+### 1,000,000 条历史消息
+
+| 操作 | 分配 B/op | allocs/op | Go 堆峰值 MiB | RSS MiB（前 → 后） | DB 增量 B/op | 文件净增量 B/op | 读取行数/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Append | 14,786 | 270 | 2.923 | 33.47 → 33.47 | 204.8 | 96,666.0 | 1 |
+| OpenSession（热） | 107,124 | 911 | 4.325 | 33.48 → 33.48 | 0.0 | 0.0 | 20 |
+| PrepareContext | 76,219 | 666 | 3.783 | 33.48 → 33.48 | 0.0 | 0.0 | 0 |
+| Shared | 221,260 | 2,101 | 4.716 | 33.50 → 33.50 | 2,662.0 | 0.0 | 41 |
+| 8 Session Commit | 17,779 | 295 | 3.020 | 33.52 → 33.52 | 1,024.0 | 5,530.0 | 1 |
+| OpenSession（新句柄） | 130,918 | 1,208 | 4.710 | 33.52 → 33.52 | 0.0 | 0.0 | 20 |
+| Detached | 4,537,826,720 | 62,252,959 | 6.246 | 32.92 → 30.88 | 1,888,940,032.0 | 1,888,362,688.0 | 1,003,949 |
+
+百万历史 Detached 用时 **49.205 秒**，累计分配 **4.538 GB**，采样 Go 堆峰值 **6.246 MiB**，数据库页增量约 **1.759 GiB**。复制成本随历史量增长；分页只限制同时处理的工作集，不会消除全部历史的累计复制量。
+
+热操作整进程最大 RSS 为 **33.70 MiB**，Detached 整进程为 **33.19 MiB**。它们包括全部三个规模的夹具构造，不是某一个 Fork 独占的峰值内存。
+
+## 独立进程冷启动
+
+另用全新子进程分别测量三个规模，每个规模 3 次；构造夹具后先关闭父进程的 Store。每个子进程从空的 Store / Manager / Session 缓存开始。OS 文件缓存仍可能命中刚写好的夹具，这不是物理冷盘测量。
+
+“首次打开”覆盖 SQLite.Open、Manager 创建、Session 加载与关闭；子进程总时间还包含 Go / testing 启动、GC、RSS 采样子命令及结果传输。分配是子进程内首次打开期间的增量；堆和 RSS 是子进程完成打开后的样本，不能与包含夹具构造的主 Benchmark 进程峰值混为一谈。
+
+| 历史消息 | 首次打开 ms | 子进程总时间 ms | 分配 B/op | allocs/op | 子进程堆 MiB | 子进程 RSS MiB | 读取行数 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1.926 | 14.720 | 266,003 | 2,894 | 2.537 | 17.49 | 20 |
+| 100,000 | 1.958 | 14.884 | 266,565 | 2,897 | 2.542 | 17.70 | 20 |
+| 1,000,000 | 2.121 | 14.856 | 266,864 | 2,897 | 2.543 | 17.56 | 20 |
+
+新进程首次打开仍只读取 20 行；原始数据见 [冷启动输出](benchmarks/2026-10-14-rollout-cold.txt)。
+
+## SQLite 查询计划
+
+历史路径使用有界递归链，并由链中的 ID 对 `entries(rollout_id,id)` 做主键定位。实际计划包含三次 `SEARCH e USING INDEX sqlite_autoindex_entries_1 (rollout_id=? AND id=?)`；`SCAN c` 和排序仅作用于最多一页加一条预读的递归结果，未扫描整个 entries 表。
+
+| 查询 | 有序索引 |
 | --- | --- |
-| 1：唯一执行器 | 独立 astral.Agent 与 session.Session 共用 Loop、工具调度、Retry、取消、输入边界及事件；公共请求、结果顺序、并发上限和事件测试通过 |
-| 2：包与 API | 持久策略迁入 session，可选环境迁入 environment，TokenEstimator 与 Model 分离；标准工具及四个示例均已适配并实际运行 |
-| 3：增量状态与 Store | RuntimeState / Reduce、分页历史、稳定提交回执、Memory / JSONL / SQLite、原子发布的流式 Fork；三后端契约与回放 / Checkpoint 一致性测试通过 |
-| 4：验证与收尾 | 真实崩溃、并发 Fork、协议保真、百万历史性能、Go 1.23 无 CGO、race、vet 和文档完成 |
+| 历史类型 | `entry_kind(rollout_id,kind,seq)` |
+| 仅历史记录 | `entry_history(rollout_id,seq)`，仅索引有 Projection 的记录 |
+| 直接子节点 | `entry_parent(rollout_id,parent_id,seq)`，仅索引有 Projection 的记录 |
+| 写入 Session | `entry_writer(rollout_id,session_id,seq)` |
 
-当前关键入口：`astral.New(Config)`、`session.New(Config)`、`Manager.NewSession/OpenSession`、`Session.History()`、`Head/SelectHead/Fork`。Core 不导入 Session、Store、Environment 或 TokenEstimator。没有第二套 Agent Loop；摘要与普通生成共用内部 Retry 实现。
-
-## 已运行验证
-
-- `go test -race ./...`：通过。
-- `go vet ./...`：通过。
-- `GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 go test ./...`：通过，包含 SQLite 和真实本地工具测试。
-- 四个示例：通过。basic 仅 Model / Tool；approval 持久审批成功且副作用计数为 1；environments 保留原进程目标；tools 真实写入、编辑并读取文件。
-- SQLite / JSONL 各 7 个 SIGKILL 场景：启动提交前、启动提交后、确认丢失、执行完成但未记录、completed 提交后、结果 Hook 后、最终结果提交后。通过同步副作用计数验证无重复派发 / Hook 重跑。
-- SQLite 复制中 SIGKILL：冷重开时 Child 不可见；显式清理拒绝已发布会话。
-- 三后端：Commit ID 幂等、摘要不匹配、当前版本冲突、分页 / 字节限制、取消、隔离、非法信封、回放与 Checkpoint、旧格式逐字节不变。
-- 多模态、有序 Content、Tool Call ID、Reasoning、opaque Metadata（包括大整数）冷重开与 Fork 保真。
-- 暂停 Fork 时 Parent 仍能生成、排队和提交；Child 不复制操作状态，Parent / Child 后续独立。
-- SQLite 实际 Run 的请求准备不读旧历史：仅三个新增提交各读一行当前状态。
-
-## 环境与方法
-
-Apple M2，8 个逻辑 CPU，24 GiB RAM，macOS 15.7.5（24G624），darwin/arm64。Benchmark 使用 Go 1.26.3、modernc.org/sqlite v1.38.2，SQLite WAL + synchronous=FULL，本机临时文件。Go 1.23.12 另行执行无 CGO 全仓测试。
-
-夹具通过公开 Store.Commit，每批 256 条写入 100,000 / 1,000,000 条历史消息。末尾摘要覆盖旧消息，保留 16 条近期消息；Session 常驻 19 条记录（近期消息、边界、摘要、配置），投影为 17 条模型消息。Model 和 TokenEstimator 均为确定性测试实现，没有真实网络调用。
-
-- Append：新增一条运行记录的原子提交，历史窗口不增长。
-- OpenSession：同一已打开 SQLite Store 上创建新 Session 句柄并 Close；不是清空 OS 缓存后的磁盘冷启动。
-- PrepareContext：InspectContext 的真实投影和估算；不包含网络、自动摘要或额外预算检查的耗时。实际执行路径的零历史读取另有测试。
-- Fork：完整复制所选历史路径，创建独立 Child，并加载其有效 Context。
-- 热路径各 20 次操作；Fork 每个规模 1 次。数值是本机测量，不是 SLA。
-- Go 堆峰值每 1 ms 采样，包含运行时与采样开销，可能漏掉更短的峰值。
-- 读取行数是返回给适配器的行数。路径查询另有 EXPLAIN QUERY PLAN 回归测试，确保使用主键定位，不扫描全会话。
-
-## 热路径结果
-
-| 历史消息 | Append | OpenSession | PrepareContext | Open 读取行数 | Prepare 读取行数 | 常驻 Context 记录 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100,000 | 0.145 ms | 0.271 ms | 0.144 ms | 20 | 0 | 19 |
-| 1,000,000 | 0.152 ms | 0.273 ms | 0.141 ms | 20 | 0 | 19 |
-
-| 历史消息 | 操作 | 累计分配 B/op | allocs/op | 采样 Go 堆峰值 MiB |
-| ---: | --- | ---: | ---: | ---: |
-| 100,000 | Append | 10,000 | 182 | 2.711 |
-| 1,000,000 | Append | 10,162 | 183 | 2.760 |
-| 100,000 | OpenSession | 95,091 | 889 | 4.290 |
-| 1,000,000 | OpenSession | 95,125 | 889 | 4.265 |
-| 100,000 | PrepareContext | 75,115 | 646 | 3.692 |
-| 1,000,000 | PrepareContext | 76,003 | 647 | 3.777 |
-
-Append 各读取一行当前状态。历史量增加十倍时，热路径的读取量、保留记录数和分配保持相同量级。[原始热路径输出](benchmarks/2026-10-14-hotpaths.txt)。
-
-验证期间曾发现 SQLite 在只返回 20 行时仍扫描全部历史，OpenSession 从十万条约 46 ms 增至百万条约 452 ms。修复为有界递归链外层驱动的主键查找，并加入查询计划断言后，得到上表结果。
-
-## Fork 结果
-
-| 历史消息 | 时间 | 累计分配 B/op | allocs/op | 采样 Go 堆峰值 MiB | 读取行数 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 100,000 | 2.972 s | 433,380,520 | 5,827,769 | 5.919 | 100,413 |
-| 1,000,000 | 30.625 s | 4,332,381,912 | 58,271,775 | 6.042 | 1,003,929 |
-
-这里的累计分配会被 GC 回收，**不是同时保留的内存**。百万条复制累计分配约 4.33 GB，采样 Go 堆峰值约 6.04 MiB。
-
-Fork 使用预先编译的独立测试进程运行；`/usr/bin/time -l` 报告整次进程（包括两个规模的夹具构造）最大 RSS 为 35,045,376 字节，约 **33.42 MiB**。它不是某一次 Fork 独占的内存，也不是热路径的每操作内存。热路径日志中的 time 统计包含 go test 构建过程，不用于这一 RSS 比较。[原始 Fork 输出](benchmarks/2026-10-14-fork.txt)。
-
-复制时间、磁盘占用和累计分配按历史量增长；Parent 的写锁只在短事务期间持有，临时复制页和 Child 的有效 Context 有界。
+上述筛选的 EXPLAIN 回归断言禁止全 entries 扫描和无界临时排序。主键路径读取、筛选索引和实际 RowsRead 共同支撑百万历史的有界读取结论。
 
 ## 复现
 
 ```sh
-go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/(Append|OpenSession|PrepareContext)$' -benchtime=20x -benchmem -count=1 -timeout=30m
-go test -c -o /tmp/astral-bench.test ./tests/integration
-/usr/bin/time -l /tmp/astral-bench.test -test.run='^$' -test.bench='BenchmarkSQLiteLongHistory/.*/Fork$' -test.benchtime=1x -test.benchmem -test.timeout=30m
+go test -c -o /tmp/astral-rollout-bench.test ./tests/integration
+/usr/bin/time -l /tmp/astral-rollout-bench.test -test.run='^$' -test.bench='BenchmarkSQLiteLongHistory/.*/(Append|OpenSession|PrepareContext|Shared|MultiSessionCommit|ColdOpenSession)$' -test.benchtime=20x -test.benchmem -test.timeout=30m
+/usr/bin/time -l /tmp/astral-rollout-bench.test -test.run='^$' -test.bench='BenchmarkSQLiteLongHistory/.*/Detached$' -test.benchtime=1x -test.benchmem -test.timeout=30m
+/usr/bin/time -l /tmp/astral-rollout-bench.test -test.run='^$' -test.bench='BenchmarkSQLiteColdProcess' -test.benchtime=3x -test.timeout=30m
+go test ./store/sqlite -run 'TestHistoryPathPlan|TestRolloutHistoryFilters' -v
 ```
 
-## 已知边界与未运行项目
+## 剩余限制
 
-SQLite 承担长历史保证；Memory / JSONL 的历史索引在内存中，JSONL 首次访问允许全量回放。Fork 是独立复制，仍有 O(K) 时间、磁盘和累计分配成本。崩溃残留的隐藏 SQLite 目标 / JSONL 临时文件需要宿主按生命周期清理，没有后台 GC。
+- 格式升级为 3，旧格式明确拒绝；没有迁移器、旧 API 兼容层、Rollout / Session 删除 API 或 GC。
+- 宿主保证每个 Session 和同一 Fork 目标的跨进程执行 / 创建所有权；JSONL 要求单进程独占目录。父子等待、取消联动、汇总、配额和外部资源隔离由宿主管理。
+- 百万历史性能数据针对 SQLite。Memory / JSONL 的历史索引与冷回放允许随历史增长；本轮没有它们的百万历史性能测量。
+- Detached 的内存峰值还受最大单条记录影响；固定小记录的 Benchmark 不能预测大图片、巨大 Schema 或大型工具批次的绝对内存。
+- 未执行物理断电、清空 OS 缓存后的冷盘测试、Linux / Windows 全仓验收或真实 Provider 集成。SIGKILL 验证不等于断电认证。
 
-没有真实 Chat Completions / Responses 适配器、旧格式迁移、共享历史前缀或分布式执行租约。宿主仍必须保证同一 Session 单执行所有者。
-
-未运行真实 Provider、断电硬件测试、Linux / Windows 全仓测试或 OS 缓存清空后的存储 Benchmark；SIGKILL 测试不等同于物理断电认证。性能夹具的有效窗口固定且内容较小，不能用于预测大图片、巨大 Schema 或大型并行工具批次的绝对内存与延迟。
+变更保留在本地工作区，没有 push 或发布。

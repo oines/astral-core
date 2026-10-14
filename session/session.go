@@ -14,11 +14,12 @@ type SessionOptions struct {
 	Environment *targetenv.Snapshot
 }
 
-// Session owns a durable history tree and at most one active execution. The
+// Session owns one recoverable execution cursor over its Rollout history. The
 // session_*.go files implement its storage, history, input, approval and recovery.
 type Session struct {
 	mu                 sync.Mutex
 	agent              *Manager
+	rolloutID          string
 	id                 string
 	state              RuntimeState
 	window             []Entry
@@ -41,7 +42,7 @@ type Session struct {
 
 func newSession(a *Manager, id string, state RuntimeState) (*Session, error) {
 	lifetime, cancel := context.WithCancel(context.Background())
-	s := &Session{agent: a, id: id, state: state, windowIndex: map[string]int{}, changed: make(chan struct{}), lifetime: lifetime, stopLifetime: cancel}
+	s := &Session{agent: a, id: id, rolloutID: state.RolloutID, state: state, windowIndex: map[string]int{}, changed: make(chan struct{}), lifetime: lifetime, stopLifetime: cancel}
 	if err := s.initCore(); err != nil {
 		cancel()
 		return nil, err
@@ -49,7 +50,8 @@ func newSession(a *Manager, id string, state RuntimeState) (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) ID() string { return s.id }
+func (s *Session) ID() string        { return s.id }
+func (s *Session) RolloutID() string { return s.rolloutID }
 
 func (s *Session) busyLocked() bool { return s.running || s.maintenance }
 

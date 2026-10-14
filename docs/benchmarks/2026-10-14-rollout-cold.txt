@@ -1,0 +1,26 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/oines/astral-core/tests/integration
+cpu: Apple M2
+BenchmarkSQLiteColdProcess/10000-8         	       3	  14719694 ns/op	    266003 child-B/op	      2894 child-allocs/op	         2.537 child-heap-MiB	        17.49 child-rss-MiB	         1.926 open-ms/op	        20.00 rows/op
+BenchmarkSQLiteColdProcess/100000-8        	       3	  14884153 ns/op	    266565 child-B/op	      2897 child-allocs/op	         2.542 child-heap-MiB	        17.70 child-rss-MiB	         1.958 open-ms/op	        20.00 rows/op
+BenchmarkSQLiteColdProcess/1000000-8       	       3	  14856042 ns/op	    266864 child-B/op	      2897 child-allocs/op	         2.543 child-heap-MiB	        17.56 child-rss-MiB	         2.121 open-ms/op	        20.00 rows/op
+PASS
+      121.08 real       130.19 user        14.09 sys
+            34177024  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              472450  page reclaims
+                  40  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+              108929  signals received
+               47994  voluntary context switches
+             4128899  involuntary context switches
+       2034597155961  instructions retired
+        460787492726  cycles elapsed
+            24904960  peak memory footprint

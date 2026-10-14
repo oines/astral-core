@@ -11,6 +11,7 @@ import (
 // History entries form the parent tree. Operational facts reference their
 // invocation or queue item instead of changing that tree's parent relation.
 type Entry struct {
+	SessionID     string              `json:"session_id"`
 	Sequence      uint64              `json:"sequence"`
 	Version       uint64              `json:"version"`
 	Usage         protocol.Usage      `json:"usage,omitempty"`
@@ -27,7 +28,6 @@ type Entry struct {
 	Tool          *ToolRecord         `json:"tool,omitempty"`
 	Approval      *ApprovalRecord     `json:"approval,omitempty"`
 	Input         *InputRecord        `json:"input,omitempty"`
-	Head          *HeadRecord         `json:"head,omitempty"`
 	Compaction    *CompactionRecord   `json:"compaction,omitempty"`
 	Run           *RunRecord          `json:"run,omitempty"`
 }
@@ -49,7 +49,6 @@ const (
 	EntryApprovalDecided   EntryKind = "approval_decided"
 	EntryInputQueued       EntryKind = "input_queued"
 	EntryInputConsumed     EntryKind = "input_consumed"
-	EntryHeadSelected      EntryKind = "head_selected"
 	EntryCompaction        EntryKind = "compaction"
 	EntryRun               EntryKind = "run"
 )
@@ -64,10 +63,15 @@ func (e Entry) IsHistory() bool {
 }
 
 type CreationRecord struct {
-	FormatVersion int    `json:"format_version"`
-	SessionID     string `json:"session_id"`
-	ForkSessionID string `json:"fork_session_id,omitempty"`
-	ForkEntryID   string `json:"fork_entry_id,omitempty"`
+	ForkDigest    string      `json:"fork_digest,omitempty"`
+	RolloutID     string      `json:"rollout_id"`
+	ForkRolloutID string      `json:"fork_rollout_id,omitempty"`
+	ForkMode      ForkMode    `json:"fork_mode,omitempty"`
+	Projection    *Projection `json:"projection,omitempty"`
+	FormatVersion int         `json:"format_version"`
+	SessionID     string      `json:"session_id"`
+	ForkSessionID string      `json:"fork_session_id,omitempty"`
+	ForkEntryID   string      `json:"fork_entry_id,omitempty"`
 }
 
 type ToolRecord struct {
@@ -90,10 +94,6 @@ type InputRecord struct {
 	ID      string            `json:"id"`
 	Kind    InputKind         `json:"kind"`
 	Message *protocol.Message `json:"message,omitempty"`
-}
-
-type HeadRecord struct {
-	EntryID string `json:"entry_id"`
 }
 
 type CompactionRecord struct {

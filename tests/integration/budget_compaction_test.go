@@ -219,7 +219,7 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 	if view.Environment.CWD != "/exact/path" || view.Request.Messages[0].ContextKind != "summary" {
 		t.Fatal("environment or summary lost")
 	}
-	fork, err := s.Fork(context.Background(), userID, sessions.ForkAt, sessions.SessionOptions{})
+	fork, err := s.Fork(context.Background(), userID, sessions.ForkOptions{ID: "budget-child"})
 	if err != nil {
 		t.Fatal(err)
 	}

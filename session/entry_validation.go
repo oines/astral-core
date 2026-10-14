@@ -6,7 +6,7 @@ import (
 
 func validateEnvelope(e Entry) error {
 	n := 0
-	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Environment != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Head != nil, e.Compaction != nil, e.Run != nil} {
+	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Environment != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Compaction != nil, e.Run != nil} {
 		if v {
 			n++
 		}
@@ -17,7 +17,7 @@ func validateEnvelope(e Entry) error {
 	valid := false
 	switch e.Kind {
 	case EntryCreated:
-		valid = e.Created != nil && e.Created.FormatVersion == FormatVersion && e.Created.SessionID != ""
+		valid = e.Created != nil && e.Created.FormatVersion == FormatVersion && e.Created.SessionID != "" && e.Created.RolloutID != ""
 	case EntryConfiguration:
 		valid = e.Configuration != nil && e.Configuration.ModelID != ""
 	case EntryEnvironment:
@@ -50,8 +50,6 @@ func validateEnvelope(e Entry) error {
 				valid = validateUser(*e.Input.Message) == nil
 			}
 		}
-	case EntryHeadSelected:
-		valid = e.Head != nil && e.Head.EntryID != ""
 	case EntryCompaction:
 		valid = e.Compaction != nil && e.Compaction.ThroughID != "" && e.Compaction.Summary != ""
 	case EntryRun:

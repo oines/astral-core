@@ -2,6 +2,8 @@ package session
 
 import (
 	"fmt"
+	"math"
+	"time"
 
 	protocol "github.com/oines/astral-core"
 )
@@ -16,11 +18,12 @@ type Projection struct {
 	ThroughID            string                       `json:"through_id,omitempty"`
 	LastMessageID        string                       `json:"last_message_id,omitempty"`
 	BatchConfigurationID string                       `json:"batch_configuration_id,omitempty"`
+	Results              map[string]string            `json:"results,omitempty"`
 	PendingCalls         map[string]protocol.ToolCall `json:"pending_calls,omitempty"`
 	Unresolved           map[string]ToolRecord        `json:"unresolved,omitempty"`
 }
 
-func (p Projection) Complete() bool { return len(p.PendingCalls) == 0 }
+func (p Projection) Complete() bool { return len(p.PendingCalls) == 0 && len(p.Unresolved) == 0 }
 
 // ToolState retains only the current assistant batch's execution facts.
 // Exact runtime checkpoints are distinct from model-generated summaries.
@@ -33,9 +36,9 @@ type ToolState struct {
 }
 type RuntimeState struct {
 	FormatVersion    int                       `json:"format_version"`
+	RolloutID        string                    `json:"rollout_id"`
 	SessionID        string                    `json:"session_id"`
 	Version          uint64                    `json:"version"`
-	Sequence         uint64                    `json:"sequence"`
 	Creation         CreationRecord            `json:"creation"`
 	Branch           Projection                `json:"branch"`
 	Tools            map[string]ToolState      `json:"tools,omitempty"`
@@ -60,6 +63,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 	}
 	records := make([]Record, 0, len(c.Entries))
 	ids := map[string]bool{}
+	var lastSequence uint64
 	for _, entry := range c.Entries {
 		e, err := copyJSON(entry)
 		if err != nil {
@@ -68,21 +72,33 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 		if err = validateEnvelope(e); err != nil {
 			return RuntimeState{}, nil, err
 		}
-		if e.ID == "" || ids[e.ID] || e.Sequence != state.Sequence+1 || e.Version != previous.Version+1 {
+		if e.ID == "" || ids[e.ID] || e.Sequence == 0 || (lastSequence != 0 && e.Sequence != lastSequence+1) || e.Version != previous.Version+1 {
 			return RuntimeState{}, nil, fmt.Errorf("%w: entry identity, sequence or version", ErrCorrupt)
 		}
 		ids[e.ID] = true
-		state.Sequence = e.Sequence
+		lastSequence = e.Sequence
 		if previous.Version == 0 && len(records) == 0 {
 			if e.Kind != EntryCreated || e.Created.FormatVersion != FormatVersion {
 				return RuntimeState{}, nil, ErrUnsupportedFormat
 			}
 			state.FormatVersion = FormatVersion
 			state.SessionID = e.Created.SessionID
+			state.RolloutID = e.Created.RolloutID
+			if e.Created.Projection != nil {
+				if e.Created.ForkEntryID == "" || e.Created.Projection.HeadID != e.Created.ForkEntryID || !e.Created.Projection.Complete() {
+					return RuntimeState{}, nil, ErrCorrupt
+				}
+				state.Branch = clone(*e.Created.Projection)
+			} else if e.Created.ForkEntryID != "" {
+				return RuntimeState{}, nil, ErrCorrupt
+			}
 			state.Creation = *e.Created
 			state.BoundaryRequired = e.Created.ForkSessionID != ""
 		} else if e.Kind == EntryCreated {
 			return RuntimeState{}, nil, fmt.Errorf("%w: duplicate creation", ErrCorrupt)
+		}
+		if e.SessionID != state.SessionID {
+			return RuntimeState{}, nil, fmt.Errorf("%w: entry belongs to another session", ErrCorrupt)
 		}
 		if e.IsHistory() {
 			if e.ParentID != state.Branch.HeadID {
@@ -107,6 +123,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.LastMessageID = e.ID
 			state.Branch.BatchConfigurationID = state.Branch.ConfigurationID
 			state.Branch.PendingCalls = nil
+			state.Branch.Results = nil
 			state.Tools = nil
 			state.Approvals = nil
 			if len(e.Message.ToolCalls) > 0 {
@@ -161,10 +178,21 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				}
 				work.Completed = &e
 			case EntryToolResult, EntryToolResolution:
+				snapshot, err := resultEnvironment(e)
+				if err != nil {
+					return RuntimeState{}, nil, err
+				}
+				if snapshot != nil {
+					state.Branch.EnvironmentID = e.ID
+				}
 				if e.Kind == EntryToolResult && work.Completed != nil && (work.Completed.Tool.Result.Outcome != e.Tool.Result.Outcome || !sameJSON(work.Completed.Tool.Result.Context, e.Tool.Result.Context)) {
 					return RuntimeState{}, nil, fmt.Errorf("%w: completed effect changed", ErrCorrupt)
 				}
 				work.Result = &e
+				if state.Branch.Results == nil {
+					state.Branch.Results = map[string]string{}
+				}
+				state.Branch.Results[inv.Call.ID] = e.ID
 				delete(state.Branch.PendingCalls, inv.Call.ID)
 				if len(state.Branch.PendingCalls) == 0 {
 					state.Branch.PendingCalls = nil
@@ -212,14 +240,6 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				state.Approvals = map[string]ApprovalRecord{}
 			}
 			state.Approvals[e.Approval.ExecutionID] = *e.Approval
-		case EntryHeadSelected:
-			if c.Selection == nil || c.Selection.HeadID != e.Head.EntryID {
-				return RuntimeState{}, nil, ErrCorrupt
-			}
-			state.Branch = clone(*c.Selection)
-			state.Tools = nil
-			state.Approvals = nil
-			state.BoundaryRequired = true
 		case EntryCompaction:
 			if len(state.Branch.PendingCalls) > 0 || len(state.Branch.Unresolved) > 0 {
 				return RuntimeState{}, nil, protocol.ErrIncompleteBatch
@@ -242,24 +262,57 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 	return state, records, nil
 }
 
-// ForkState resets operational work while inheriting the chosen history only.
+// ForkState validates the immutable boundary. Ancestors are never reduced as
+// child commits; its creation entry carries the inherited projection instead.
 func ForkState(request ForkRequest, head Record) (RuntimeState, error) {
 	if err := ValidateFork(request); err != nil {
 		return RuntimeState{}, err
 	}
-	if head.Projection == nil || head.Entry.Version > request.SourceVersion {
+	if head.Projection == nil || head.Entry.ID != request.HeadID {
 		return RuntimeState{}, ErrNotFound
 	}
-	if !head.Projection.Complete() && !request.AllowIncomplete {
+	if len(head.Projection.Unresolved) > 0 {
+		return RuntimeState{}, protocol.ErrOutcomeUnknown
+	}
+	if !head.Projection.Complete() {
 		return RuntimeState{}, protocol.ErrIncompleteBatch
 	}
-	state := RuntimeState{FormatVersion: FormatVersion, SessionID: request.TargetID, Version: 1, Sequence: head.Entry.Sequence, Creation: *request.Creation.Created, Branch: clone(*head.Projection), BoundaryRequired: true}
-	return state, nil
+	return RuntimeState{FormatVersion: FormatVersion, SessionID: request.TargetID, RolloutID: request.RolloutID(), Branch: clone(*head.Projection), BoundaryRequired: true}, nil
 }
 
 func ValidateFork(r ForkRequest) error {
-	if r.SourceID == "" || r.TargetID == "" || r.SourceID == r.TargetID || r.HeadID == "" || r.SourceVersion == 0 || r.Creation.Kind != EntryCreated || r.Creation.Created == nil || r.Creation.Created.SessionID != r.TargetID || r.Creation.Created.FormatVersion != FormatVersion || r.Creation.ID == "" || r.Creation.Sequence != 1 || r.Creation.Version != 1 {
+	if r.SourceID == "" || r.SourceRolloutID == "" || r.TargetID == "" || r.SourceID == r.TargetID || r.HeadID == "" || r.Mode > ForkDetached {
 		return protocol.ErrInvalid
 	}
 	return nil
+}
+
+// PrepareFork builds only the child's creation commit, using Store-assigned
+// rollout positions. Imported history retains its original writer and version.
+func PrepareFork(r ForkRequest, head Record, first uint64) (Commit, RuntimeState, []Record, Receipt, error) {
+	if first == 0 || first > math.MaxInt64 || (r.Environment != nil && first == math.MaxInt64) {
+		return Commit{}, RuntimeState{}, nil, Receipt{}, ErrCorrupt
+	}
+	seed, err := ForkState(r, head)
+	if err != nil {
+		return Commit{}, RuntimeState{}, nil, Receipt{}, err
+	}
+	digest, err := r.Digest()
+	if err != nil {
+		return Commit{}, RuntimeState{}, nil, Receipt{}, err
+	}
+	creation := &CreationRecord{ForkDigest: digest, FormatVersion: FormatVersion, SessionID: r.TargetID, RolloutID: seed.RolloutID, ForkRolloutID: r.SourceRolloutID, ForkSessionID: r.SourceID, ForkEntryID: r.HeadID, ForkMode: r.Mode, Projection: &seed.Branch}
+	c := Commit{ID: ForkCommitID, Entries: []Entry{{ID: newID(), SessionID: r.TargetID, Version: 1, Time: time.Now().UTC(), Kind: EntryCreated, Created: creation}}}
+	if r.Environment != nil {
+		c.Entries = append(c.Entries, Entry{ID: newID(), SessionID: r.TargetID, Version: 1, ParentID: r.HeadID, Time: time.Now().UTC(), Kind: EntryEnvironment, Environment: clone(r.Environment)})
+	}
+	for i := range c.Entries {
+		c.Entries[i].Sequence = first + uint64(i)
+	}
+	state, records, err := Reduce(RuntimeState{}, c)
+	if err != nil {
+		return Commit{}, RuntimeState{}, nil, Receipt{}, err
+	}
+	receipt := Receipt{CommitID: ForkCommitID, Version: 1, CurrentVersion: 1, Digest: digest, FirstSequence: first, LastSequence: first + uint64(len(c.Entries)) - 1}
+	return c, state, records, receipt, err
 }

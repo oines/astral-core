@@ -123,5 +123,13 @@ func (s *Session) toolStateLocked(assistantID, callID string) toolState {
 		return toolState{}
 	}
 	v := s.state.Tools[callID]
+	if v.Result == nil {
+		if i, ok := s.windowIndex[s.state.Branch.Results[callID]]; ok {
+			e := s.window[i]
+			if e.Tool != nil && e.Tool.Invocation.AssistantID == assistantID && e.Tool.Invocation.Call.ID == callID {
+				v.Result = &e
+			}
+		}
+	}
 	return toolState{prepared: v.Prepared, authorized: v.Authorized, started: v.Started, completed: v.Completed, result: v.Result}
 }

@@ -1,0 +1,24 @@
+=== RUN   TestHistoryPathPlanUsesEntryPointLookups
+    fork_test.go:39: CO-ROUTINE chain
+    fork_test.go:39: SETUP
+    fork_test.go:39: SEARCH r USING INDEX sqlite_autoindex_rollouts_1 (id=?)
+    fork_test.go:39: SEARCH e USING INDEX sqlite_autoindex_entries_1 (rollout_id=? AND id=?)
+    fork_test.go:39: RECURSIVE STEP
+    fork_test.go:39: SCAN c
+    fork_test.go:39: SEARCH e USING INDEX sqlite_autoindex_entries_1 (rollout_id=? AND id=?)
+    fork_test.go:39: SCAN c
+    fork_test.go:39: SEARCH e USING INDEX sqlite_autoindex_entries_1 (rollout_id=? AND id=?)
+    fork_test.go:39: USE TEMP B-TREE FOR ORDER BY
+--- PASS: TestHistoryPathPlanUsesEntryPointLookups (0.06s)
+=== RUN   TestRolloutHistoryFiltersUseOrderedIndexes
+    fork_test.go:213: SEARCH r USING INDEX sqlite_autoindex_rollouts_1 (id=?)
+    fork_test.go:213: SEARCH e USING INDEX entry_kind (rollout_id=? AND kind=?)
+    fork_test.go:213: SEARCH r USING INDEX sqlite_autoindex_rollouts_1 (id=?)
+    fork_test.go:213: SEARCH e USING INDEX entry_history (rollout_id=?)
+    fork_test.go:213: SEARCH r USING INDEX sqlite_autoindex_rollouts_1 (id=?)
+    fork_test.go:213: SEARCH e USING INDEX entry_parent (rollout_id=? AND parent_id=?)
+    fork_test.go:213: SEARCH r USING INDEX sqlite_autoindex_rollouts_1 (id=?)
+    fork_test.go:213: SEARCH e USING INDEX entry_writer (rollout_id=? AND session_id=?)
+--- PASS: TestRolloutHistoryFiltersUseOrderedIndexes (0.04s)
+PASS
+ok  	github.com/oines/astral-core/store/sqlite	0.546s

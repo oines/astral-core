@@ -17,7 +17,7 @@ import (
 	"github.com/oines/astral-core/store/memory"
 )
 
-func TestBranchesSelectExistingLeavesAndPersistHead(t *testing.T) {
+func TestSharedForkPreservesSiblingPathsAndIndependentHeads(t *testing.T) {
 	store := memory.New()
 	m := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		users := texts(r.Messages, astral.RoleUser)
@@ -35,18 +35,16 @@ func TestBranchesSelectExistingLeavesAndPersistHead(t *testing.T) {
 	}
 	second := waitOK(t, start(t, s, "two"))
 	originalCount := len(entries(s))
-	if err := s.SelectHead(context.Background(), first.LastMessageID); err != nil {
+	child, err := s.Fork(context.Background(), first.LastMessageID, sessions.ForkOptions{ID: "sibling"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Configuration().SystemPrompt != "first config" {
+	if child.Configuration().SystemPrompt != "first config" {
 		t.Fatal("future configuration leaked")
 	}
-	third := waitOK(t, start(t, s, "three"))
+	third := waitOK(t, start(t, child, "three"))
 	if len(children(s, first.LastMessageID)) != 2 {
 		t.Fatal("sibling branch was overwritten")
-	}
-	if err := s.SelectHead(context.Background(), second.LastMessageID); err != nil {
-		t.Fatal(err)
 	}
 	view, err := s.InspectContext(context.Background())
 	if err != nil {
@@ -66,7 +64,7 @@ func TestBranchesSelectExistingLeavesAndPersistHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	if opened.Head() != second.LastMessageID {
-		t.Fatal("head selection was not durable")
+		t.Fatal("parent head was not durable")
 	}
 	if _, ok := entry(opened, third.LastMessageID); !ok {
 		t.Fatal("sibling entry missing")
@@ -76,7 +74,7 @@ func TestBranchesSelectExistingLeavesAndPersistHead(t *testing.T) {
 	}
 }
 
-func TestForkBeforeUserCopiesPathButNoOperationalState(t *testing.T) {
+func TestDetachedParentBoundaryCopiesPathButNoOperationalState(t *testing.T) {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return answer("answer"), nil
 	})
@@ -86,13 +84,13 @@ func TestForkBeforeUserCopiesPathButNoOperationalState(t *testing.T) {
 	var target string
 	for _, entry := range entries(s) {
 		if entry.Message != nil && entry.Message.Role == astral.RoleUser && entry.Message.Content[0].Text == "two" {
-			target = entry.ID
+			target = entry.ParentID
 		}
 	}
 	if _, err := s.FollowUp(context.Background(), astral.User("source-only queue")); err != nil {
 		t.Fatal(err)
 	}
-	fork, err := s.Fork(context.Background(), target, sessions.ForkBefore, sessions.SessionOptions{ID: "fork"})
+	fork, err := s.Fork(context.Background(), target, sessions.ForkOptions{ID: "fork", Mode: sessions.ForkDetached})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +110,7 @@ func TestForkBeforeUserCopiesPathButNoOperationalState(t *testing.T) {
 	if len(m.observed()) != 3 {
 		t.Fatal("source queue copied to fork")
 	}
-	if _, err = s.Fork(context.Background(), fork.Head(), sessions.ForkBefore, sessions.SessionOptions{}); err == nil {
+	if _, err = s.Fork(context.Background(), fork.Head(), sessions.ForkOptions{ID: "foreign"}); err == nil {
 		t.Fatal("cross-session entry accepted")
 	}
 }
@@ -135,18 +133,8 @@ func TestHistoricalPartialToolBatchCannotExecute(t *testing.T) {
 			boundary = entry.ID
 		}
 	}
-	fork, err := s.Fork(context.Background(), boundary, sessions.ForkAt, sessions.SessionOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = fork.Continue(context.Background()); !errors.Is(err, astral.ErrIncompleteBatch) {
-		t.Fatalf("partial fork executed: %v", err)
-	}
-	if err = s.SelectHead(context.Background(), boundary); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = s.Continue(context.Background()); !errors.Is(err, astral.ErrIncompleteBatch) {
-		t.Fatalf("partial branch executed: %v", err)
+	if _, err := s.Fork(context.Background(), boundary, sessions.ForkOptions{ID: "incomplete"}); !errors.Is(err, astral.ErrIncompleteBatch) {
+		t.Fatalf("partial fork created: %v", err)
 	}
 	if effects.Load() != 1 {
 		t.Fatal("history replayed effects")
@@ -255,10 +243,11 @@ func TestReopenAndBranchRequireEnvironmentRediscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitOK(t, start(t, opened, "two"))
-	if err = opened.SelectHead(context.Background(), first.LastMessageID); err != nil {
+	child, err := opened.Fork(context.Background(), first.LastMessageID, sessions.ForkOptions{ID: "old-environment"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = opened.Continue(context.Background()); !errors.Is(err, sessions.ErrEnvironmentRefresh) {
+	if _, err = child.Continue(context.Background()); !errors.Is(err, sessions.ErrEnvironmentRefresh) {
 		t.Fatalf("branch trusted historical environment: %v", err)
 	}
 	if err = a2.Close(context.Background()); err != nil {

@@ -1,7 +1,6 @@
-// Package jsonl is a durable version-2 checksummed journal. It rebuilds its
-// in-memory indexes once on open and thereafter reads only newly appended data.
-// The host must give one process exclusive directory ownership. Use SQLite for
-// bounded-memory, indexed long-history storage.
+// Package jsonl persists one checksummed journal per Rollout. A single process
+// owns the directory; handles in that process share indexes and write locks.
+// Cold replay and indexes grow with history. Use SQLite for bounded storage reads.
 package jsonl
 
 import (
@@ -15,10 +14,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	core "github.com/oines/astral-core"
 	s "github.com/oines/astral-core/session"
+	"github.com/oines/astral-core/store/internal/historypage"
 	"github.com/oines/astral-core/store/internal/ledger"
 )
 
@@ -26,14 +27,13 @@ type cached struct {
 	file   *os.File
 	offset int64
 	header bool
-	dirty  bool
 }
 type directory struct {
-	mu       sync.Mutex
-	index    *ledger.Store
-	files    map[string]*cached
-	reserved map[string]bool
-	refs     int
+	mu    sync.Mutex
+	index *ledger.Store
+	files map[string]*cached
+	refs  int
+	dirty bool // only unresolved writes require discovery/replay after initial Open
 }
 
 var directories = struct {
@@ -47,17 +47,19 @@ type Store struct {
 	closed    bool
 }
 type header struct {
-	Format    int    `json:"format_version"`
-	SessionID string `json:"session_id"`
+	Format    int            `json:"format_version"`
+	RolloutID string         `json:"rollout_id"`
+	Fork      *s.ForkRequest `json:"fork,omitempty"`
 }
 type envelope struct {
 	Body   json.RawMessage `json:"body"`
 	SHA256 string          `json:"sha256"`
 }
 type journal struct {
-	Commit  *s.Commit       `json:"commit,omitempty"`
-	Records []s.Record      `json:"fork_records,omitempty"`
-	Publish *s.RuntimeState `json:"publish,omitempty"`
+	SessionID string     `json:"session_id,omitempty"`
+	Commit    *s.Commit  `json:"commit,omitempty"`
+	Receipt   *s.Receipt `json:"receipt,omitempty"`
+	Records   []s.Record `json:"import,omitempty"`
 }
 
 func Open(path string) (*Store, error) {
@@ -76,18 +78,68 @@ func Open(path string) (*Store, error) {
 	defer directories.Unlock()
 	d := directories.all[abs]
 	if d == nil {
-		d = &directory{index: ledger.New(), files: map[string]*cached{}, reserved: map[string]bool{}}
+		if err = checkFormat(abs); err != nil {
+			return nil, err
+		}
+		d = &directory{index: ledger.New(), files: map[string]*cached{}, dirty: true}
+		st := &Store{directory: abs, shared: d}
+		if err = st.refreshAll(context.Background()); err != nil {
+			for _, c := range d.files {
+				c.file.Close()
+			}
+			return nil, err
+		}
 		directories.all[abs] = d
 	}
 	d.refs++
 	return &Store{directory: abs, shared: d}, nil
 }
+func checkFormat(dir string) error {
+	name := filepath.Join(dir, "format.json")
+	b, err := os.ReadFile(name)
+	if err == nil {
+		var h header
+		if json.Unmarshal(b, &h) != nil || h.Format != s.FormatVersion {
+			return s.ErrUnsupportedFormat
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if !strings.HasPrefix(f.Name(), ".format-") {
+			return s.ErrUnsupportedFormat
+		}
+	}
+	f, err := os.CreateTemp(dir, ".format-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	b, _ = json.Marshal(header{Format: s.FormatVersion})
+	if err = writeAll(f, b); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = os.Link(f.Name(), name); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
 func (st *Store) filename(id string) string {
 	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(st.directory, hex.EncodeToString(sum[:])+".jsonl")
 }
-func (st *Store) syncDirectory() error {
-	f, err := os.Open(st.directory)
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
@@ -112,34 +164,66 @@ func (st *Store) Close() error {
 	for _, c := range d.files {
 		errs = append(errs, c.file.Close())
 	}
-	d.files = nil
-	d.index = ledger.New()
 	delete(directories.all, st.directory)
 	return errors.Join(errs...)
 }
-func (st *Store) refresh(ctx context.Context, id string) error {
+
+// refreshAll also resolves complete but unacknowledged writes before any read.
+func (st *Store) refreshAll(ctx context.Context) error {
 	if st.closed {
 		return core.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	d := st.shared
-	if d.reserved[id] {
-		return s.ErrNotFound
+	if !st.shared.dirty {
+		return nil
 	}
-	c := d.files[id]
-	if c == nil {
-		f, err := os.OpenFile(st.filename(id), os.O_RDWR, 0600)
-		if errors.Is(err, os.ErrNotExist) {
-			return s.ErrNotFound
+	files, err := os.ReadDir(st.directory)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".jsonl") {
+			continue
 		}
-		if err != nil {
+		name := filepath.Join(st.directory, file.Name())
+		var c *cached
+		var id string
+		for key, value := range st.shared.files {
+			if st.filename(key) == name {
+				id = key
+				c = value
+				break
+			}
+		}
+		if c == nil {
+			f, e := os.OpenFile(name, os.O_RDWR, 0600)
+			if e != nil {
+				return e
+			}
+			line, e := bufio.NewReader(f).ReadBytes('\n')
+			var h header
+			if e != nil || json.Unmarshal(line, &h) != nil || h.Format != s.FormatVersion {
+				f.Close()
+				return s.ErrUnsupportedFormat
+			}
+			if h.RolloutID == "" || st.filename(h.RolloutID) != name {
+				f.Close()
+				return s.ErrCorrupt
+			}
+			id = h.RolloutID
+			c = &cached{file: f}
+			st.shared.files[id] = c
+		}
+		if err = st.refresh(ctx, id, c); err != nil {
 			return err
 		}
-		c = &cached{file: f}
-		d.files[id] = c
 	}
+	st.shared.dirty = false
+	return nil
+}
+func (st *Store) refresh(ctx context.Context, id string, c *cached) error {
 	info, err := c.file.Stat()
 	if err != nil {
 		return err
@@ -147,144 +231,120 @@ func (st *Store) refresh(ctx context.Context, id string) error {
 	if info.Size() < c.offset {
 		return s.ErrCorrupt
 	}
+	if info.Size() == c.offset {
+		return nil
+	}
+	// A previous Sync/ack may have failed. Do not expose those bytes until synced.
+	if err = c.file.Sync(); err != nil {
+		return err
+	}
+	if err = syncDir(st.directory); err != nil {
+		return err
+	}
 	reader := bufio.NewReader(io.NewSectionReader(c.file, c.offset, info.Size()-c.offset))
 	for {
-		if err := ctx.Err(); err != nil {
+		if err = ctx.Err(); err != nil {
 			return err
 		}
-		line, err := reader.ReadBytes('\n')
-		if err == io.EOF {
+		line, e := reader.ReadBytes('\n')
+		if e == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if e != nil {
+			return e
 		}
 		if !c.header {
 			var h header
 			if json.Unmarshal(line, &h) != nil || h.Format != s.FormatVersion {
 				return s.ErrUnsupportedFormat
 			}
-			if h.SessionID != id {
+			if h.RolloutID != id {
 				return s.ErrCorrupt
 			}
 			c.header = true
 			c.offset += int64(len(line))
 			continue
 		}
-		var e envelope
-		if json.Unmarshal(line, &e) != nil {
+		var env envelope
+		if json.Unmarshal(line, &env) != nil {
 			return s.ErrCorrupt
 		}
-		hash := sha256.Sum256(e.Body)
-		if e.SHA256 != hex.EncodeToString(hash[:]) {
+		hash := sha256.Sum256(env.Body)
+		if env.SHA256 != hex.EncodeToString(hash[:]) {
 			return s.ErrCorrupt
 		}
 		var j journal
-		if json.Unmarshal(e.Body, &j) != nil {
+		if json.Unmarshal(env.Body, &j) != nil {
 			return s.ErrCorrupt
 		}
-		index := d.index
+		index := st.shared.index
 		index.Mu.Lock()
-		data := index.Sessions[id]
-		if data == nil {
-			data = ledger.NewData()
-			index.Sessions[id] = data
-		}
-		switch {
-		case j.Commit != nil:
-			next, records, receipt, prepareErr := data.Prepare(id, *j.Commit)
-			if prepareErr != nil {
-				index.Mu.Unlock()
-				return prepareErr
-			}
-			if len(records) > 0 {
-				data.Apply(next, records, receipt)
-			}
-		case len(j.Records) > 0:
-			if data.Ready {
-				index.Mu.Unlock()
-				return s.ErrCorrupt
-			}
-			for _, r := range j.Records {
-				if _, exists := data.Records[r.Entry.ID]; exists || r.Entry.ID == "" {
-					index.Mu.Unlock()
-					return s.ErrCorrupt
-				}
-				data.Add(r)
-			}
-		case j.Publish != nil:
-			if data.Ready || j.Publish.SessionID != id || j.Publish.FormatVersion != s.FormatVersion {
-				index.Mu.Unlock()
-				return s.ErrCorrupt
-			}
-			if _, ok := data.Records[j.Publish.Branch.HeadID]; !ok {
-				index.Mu.Unlock()
-				return s.ErrCorrupt
-			}
-			data.State = *j.Publish
-			data.Sort()
-			data.Ready = true
-		default:
-			index.Mu.Unlock()
-			return s.ErrCorrupt
-		}
+		err = applyJournal(index, id, j)
 		index.Mu.Unlock()
+		if err != nil {
+			return err
+		}
 		c.offset += int64(len(line))
-		c.dirty = true
-	}
-	if !c.header && info.Size() > 0 {
-		return s.ErrUnsupportedFormat
-	}
-	if c.dirty {
-		if err = c.file.Sync(); err != nil {
-			return err
-		}
-		if err = st.syncDirectory(); err != nil {
-			return err
-		}
-		c.dirty = false
 	}
 	return nil
 }
-func (st *Store) LoadState(ctx context.Context, id string) (s.RuntimeState, error) {
-	st.shared.mu.Lock()
-	defer st.shared.mu.Unlock()
-	if err := st.refresh(ctx, id); err != nil {
-		return s.RuntimeState{}, err
+func applyJournal(index *ledger.Store, id string, j journal) error {
+	if len(j.Records) > 0 {
+		if j.Commit != nil || j.Receipt != nil {
+			return s.ErrCorrupt
+		}
+		r := index.Rollouts[id]
+		if r == nil {
+			r = ledger.NewRollout(id)
+			r.Status = "building"
+			index.Rollouts[id] = r
+		}
+		if r.Status != "building" {
+			return s.ErrCorrupt
+		}
+		for _, record := range j.Records {
+			if !record.Entry.IsHistory() || record.Projection == nil || record.Entry.ID == "" || record.Entry.Sequence == 0 || record.Entry.Version == 0 || record.Entry.SessionID == "" || record.Projection.HeadID != record.Entry.ID {
+				return s.ErrCorrupt
+			}
+			if _, exists := r.Records[record.Entry.ID]; exists {
+				return s.ErrCorrupt
+			}
+			if len(r.Order) > 0 {
+				previous := r.Records[r.Order[len(r.Order)-1]].Entry
+				if previous.ParentID != record.Entry.ID || previous.Sequence <= record.Entry.Sequence {
+					return s.ErrCorrupt
+				}
+			}
+			r.Add(record)
+		}
+		return nil
 	}
-	return st.shared.index.LoadState(ctx, id)
-}
-func (st *Store) Get(ctx context.Context, id, key string) (s.Record, error) {
-	st.shared.mu.Lock()
-	defer st.shared.mu.Unlock()
-	if err := st.refresh(ctx, id); err != nil {
-		return s.Record{}, err
+	if j.Commit == nil || j.Receipt == nil || j.SessionID == "" {
+		return s.ErrCorrupt
 	}
-	return st.shared.index.Get(ctx, id, key)
-}
-func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error) {
-	st.shared.mu.Lock()
-	defer st.shared.mu.Unlock()
-	if err := st.refresh(ctx, id); err != nil {
-		return s.Page{}, err
+	if len(j.Commit.Entries) == 0 {
+		return s.ErrCorrupt
 	}
-	return st.shared.index.Scan(ctx, id, q)
-}
-func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Page, error) {
-	st.shared.mu.Lock()
-	defer st.shared.mu.Unlock()
-	if err := st.refresh(ctx, id); err != nil {
-		return s.Page{}, err
+	if created := j.Commit.Entries[0].Created; created != nil && created.RolloutID != id {
+		return s.ErrCorrupt
 	}
-	return st.shared.index.Pending(ctx, id, q)
-}
-func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, error) {
-	st.shared.mu.Lock()
-	defer st.shared.mu.Unlock()
-	if err := st.refresh(ctx, id); err != nil {
-		return s.Receipt{}, err
+	if d := index.Sessions[j.SessionID]; d != nil && d.State.RolloutID != id {
+		return s.ErrCorrupt
 	}
-	return st.shared.index.LookupCommit(ctx, id, key)
+	if r := index.Rollouts[id]; r != nil && r.Status == "building" {
+		if len(r.Order) == 0 || r.Records[r.Order[len(r.Order)-1]].Entry.ParentID != "" {
+			return s.ErrCorrupt
+		}
+	}
+	change, err := index.PrepareConfirmed(j.SessionID, *j.Commit, *j.Receipt)
+	if err != nil {
+		return err
+	}
+	index.Apply(change)
+	if j.Commit.ID == s.ForkCommitID {
+		index.Rollouts[id].Sort()
+	}
+	return nil
 }
 func encode(j journal) ([]byte, error) {
 	body, err := json.Marshal(j)
@@ -302,163 +362,262 @@ func writeAll(w io.Writer, b []byte) error {
 	}
 	return err
 }
-func (st *Store) Commit(ctx context.Context, id string, commit s.Commit) (s.Receipt, error) {
-	if id == "" {
-		return s.Receipt{}, core.ErrInvalid
+func (st *Store) append(ctx context.Context, id string, j journal) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	line, err := encode(j)
+	if err != nil {
+		return err
+	}
+	st.shared.dirty = true
+	c := st.shared.files[id]
+	if c == nil {
+		f, e := os.CreateTemp(st.directory, filepath.Base(st.filename(id))+".create-")
+		if e != nil {
+			return e
+		}
+		keep := false
+		defer func() {
+			os.Remove(f.Name())
+			if !keep {
+				f.Close()
+			}
+		}()
+		h, _ := json.Marshal(header{Format: s.FormatVersion, RolloutID: id})
+		h = append(h, '\n')
+		if e = writeAll(f, h); e == nil {
+			e = writeAll(f, line)
+		}
+		if e == nil {
+			e = f.Sync()
+		}
+		if e == nil {
+			e = os.Link(f.Name(), st.filename(id))
+		}
+		if e == nil {
+			e = syncDir(st.directory)
+		}
+		if e != nil {
+			return e
+		}
+		st.shared.files[id] = &cached{file: f, offset: int64(len(h) + len(line)), header: true}
+		keep = true
+		st.shared.dirty = false
+		return nil
+	}
+	if err = c.file.Truncate(c.offset); err != nil {
+		return err
+	}
+	if _, err = c.file.Seek(c.offset, io.SeekStart); err != nil {
+		return err
+	}
+	if err = writeAll(c.file, line); err != nil {
+		return err
+	}
+	if err = c.file.Sync(); err != nil {
+		return err
+	}
+	c.offset += int64(len(line))
+	st.shared.dirty = false
+	return nil
+}
+func (st *Store) LoadState(ctx context.Context, id string) (s.RuntimeState, error) {
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err := st.refreshAll(ctx); err != nil {
+		return s.RuntimeState{}, err
+	}
+	return st.shared.index.LoadState(ctx, id)
+}
+func (st *Store) Get(ctx context.Context, id, key string) (s.Record, error) {
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err := st.refreshAll(ctx); err != nil {
+		return s.Record{}, err
+	}
+	return st.shared.index.Get(ctx, id, key)
+}
+func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error) {
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err := st.refreshAll(ctx); err != nil {
+		return s.Page{}, err
+	}
+	return st.shared.index.Scan(ctx, id, q)
+}
+func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Page, error) {
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err := st.refreshAll(ctx); err != nil {
+		return s.Page{}, err
+	}
+	return st.shared.index.Pending(ctx, id, q)
+}
+func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, error) {
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err := st.refreshAll(ctx); err != nil {
+		return s.Receipt{}, err
+	}
+	return st.shared.index.LookupCommit(ctx, id, key)
+}
+func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (s.Receipt, error) {
 	d := st.shared
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.reserved[id] {
-		return s.Receipt{}, s.ErrConflict
-	}
-	if err := st.refresh(ctx, id); err != nil && !errors.Is(err, s.ErrNotFound) {
+	if err := st.refreshAll(ctx); err != nil {
 		return s.Receipt{}, err
 	}
 	d.index.Mu.Lock()
 	defer d.index.Mu.Unlock()
-	data := d.index.Sessions[id]
-	if data == nil {
-		data = ledger.NewData()
-	}
-	state, records, receipt, err := data.Prepare(id, commit)
+	change, err := d.index.Prepare(id, c)
 	if err != nil {
 		return s.Receipt{}, err
 	}
-	if len(records) == 0 {
-		return receipt, nil
+	if len(change.Records) == 0 {
+		return change.Receipt, nil
 	}
-	line, err := encode(journal{Commit: &commit})
-	if err != nil {
+	if err = st.append(ctx, change.State.RolloutID, journal{SessionID: id, Commit: &change.Commit, Receipt: &change.Receipt}); err != nil {
 		return s.Receipt{}, err
 	}
-	c := d.files[id]
-	if c == nil {
-		f, err := os.OpenFile(st.filename(id), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		if err != nil {
-			return s.Receipt{}, err
-		}
-		c = &cached{file: f}
-		d.files[id] = c
-	}
-	if err = ctx.Err(); err != nil {
-		return s.Receipt{}, err
-	}
-	if !c.header {
-		h, _ := json.Marshal(header{Format: s.FormatVersion, SessionID: id})
-		h = append(h, '\n')
-		if err = writeAll(c.file, h); err != nil {
-			return s.Receipt{}, err
-		}
-		c.header = true
-		c.offset = int64(len(h))
-	}
-	if err = c.file.Truncate(c.offset); err != nil {
-		return s.Receipt{}, err
-	}
-	if _, err = c.file.Seek(c.offset, io.SeekStart); err != nil {
-		return s.Receipt{}, err
-	}
-	if err = writeAll(c.file, line); err != nil {
-		return s.Receipt{}, err
-	}
-	// Leave the offset unchanged until sync succeeds. LookupCommit can then read
-	// and sync this exact stable commit after an ambiguous acknowledgement.
-	if err = c.file.Sync(); err != nil {
-		return s.Receipt{}, err
-	}
-	if err = st.syncDirectory(); err != nil {
-		return s.Receipt{}, err
-	}
-	c.offset += int64(len(line))
-	data.Apply(state, records, receipt)
-	d.index.Sessions[id] = data
-	return receipt, nil
+	d.index.Apply(change)
+	return change.Receipt, nil
 }
-func (st *Store) Fork(ctx context.Context, r s.ForkRequest) (state s.RuntimeState, err error) {
+func (st *Store) Fork(ctx context.Context, r s.ForkRequest) (s.RuntimeState, error) {
+	return st.fork(ctx, r, nil)
+}
+func (st *Store) fork(ctx context.Context, r s.ForkRequest, afterPage func()) (s.RuntimeState, error) {
+	return st.forkWithCheckpoint(ctx, r, func(phase string) {
+		if phase == "page" && afterPage != nil {
+			afterPage()
+		}
+	})
+}
+
+// The private checkpoint observes durable boundaries in real process-crash tests.
+func (st *Store) forkWithCheckpoint(ctx context.Context, r s.ForkRequest, checkpoint func(string)) (state s.RuntimeState, err error) {
 	if err = s.ValidateFork(r); err != nil {
 		return state, err
 	}
 	d := st.shared
+	unlock, err := d.index.LockFork(ctx, r.TargetID)
+	if err != nil {
+		return state, err
+	}
+	defer unlock()
 	d.mu.Lock()
-	if st.closed {
+	if err = st.refreshAll(ctx); err != nil {
 		d.mu.Unlock()
-		return state, core.ErrClosed
-	}
-	if d.reserved[r.TargetID] {
-		d.mu.Unlock()
-		return state, s.ErrConflict
-	}
-	if _, statErr := os.Stat(st.filename(r.TargetID)); statErr == nil {
-		d.mu.Unlock()
-		return state, s.ErrConflict
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		d.mu.Unlock()
-		return state, statErr
-	}
-	d.reserved[r.TargetID] = true
-	d.mu.Unlock()
-	defer func() { d.mu.Lock(); delete(d.reserved, r.TargetID); d.mu.Unlock() }()
-	head, err := st.Get(ctx, r.SourceID, r.HeadID)
-	if err != nil {
 		return state, err
 	}
-	state, err = s.ForkState(r, head)
-	if err != nil {
+	d.index.Mu.RLock()
+	state, found, err := d.index.ExistingFork(r)
+	d.index.Mu.RUnlock()
+	if found || err != nil {
+		d.mu.Unlock()
 		return state, err
 	}
-	file, err := os.CreateTemp(st.directory, ".fork-")
-	if err != nil {
-		return state, err
-	}
-	name := file.Name()
-	defer os.Remove(name)
-	defer file.Close()
-	h, _ := json.Marshal(header{Format: s.FormatVersion, SessionID: r.TargetID})
-	if err = writeAll(file, append(h, '\n')); err != nil {
-		return state, err
-	}
-	emit := func(records []s.Record) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		line, err := encode(journal{Records: records})
+	source, err := d.index.LoadState(ctx, r.SourceID)
+	if err != nil || source.RolloutID != r.SourceRolloutID {
+		d.mu.Unlock()
 		if err != nil {
-			return err
+			return state, err
 		}
-		return writeAll(file, line)
+		return state, s.ErrNotFound
 	}
-	if err = emit([]s.Record{{Entry: r.Creation}}); err != nil {
+	head, err := d.index.Get(ctx, r.SourceRolloutID, r.HeadID)
+	if err != nil {
+		d.mu.Unlock()
 		return state, err
 	}
+	if _, err = s.ForkState(r, head); err != nil {
+		d.mu.Unlock()
+		return state, err
+	}
+	if r.Mode == s.ForkShared {
+		defer d.mu.Unlock()
+		d.index.Mu.Lock()
+		defer d.index.Mu.Unlock()
+		rollout := d.index.Rollouts[r.SourceRolloutID]
+		c, next, records, receipt, e := s.PrepareFork(r, head, rollout.Sequence+1)
+		if e != nil {
+			return state, e
+		}
+		if e = st.append(ctx, r.RolloutID(), journal{SessionID: r.TargetID, Commit: &c, Receipt: &receipt}); e != nil {
+			return state, e
+		}
+		d.index.Apply(ledger.Change{Commit: c, State: next, Records: records, Receipt: receipt})
+		return ledger.Clone(next)
+	}
+	pending := st.filename(r.RolloutID()) + ".pending"
+	if data, e := os.Open(pending); e == nil {
+		line, _ := bufio.NewReader(data).ReadBytes('\n')
+		data.Close()
+		var h header
+		if json.Unmarshal(line, &h) != nil || h.Fork == nil || h.RolloutID != r.RolloutID() {
+			d.mu.Unlock()
+			return state, s.ErrCorrupt
+		}
+		{
+			a, _ := h.Fork.Digest()
+			b, _ := r.Digest()
+			if a != b {
+				d.mu.Unlock()
+				return state, s.ErrConflict
+			}
+		}
+		if e = os.Remove(pending); e != nil {
+			d.mu.Unlock()
+			return state, e
+		}
+	} else if !errors.Is(e, os.ErrNotExist) {
+		d.mu.Unlock()
+		return state, e
+	}
+	if err = st.removePreparing(r.RolloutID()); err != nil {
+		d.mu.Unlock()
+		return state, err
+	}
+	file, err := st.createPending(r, pending)
+	d.mu.Unlock()
+	if err != nil {
+		return state, err
+	}
+	defer file.Close()
+	defer os.Remove(pending)
+
+	imported := ledger.NewRollout(r.RolloutID())
 	cursor := ""
 	for {
-		page, readErr := st.Scan(ctx, r.SourceID, s.Query{PathHead: r.HeadID, Cursor: cursor, Limit: s.DefaultPageSize, MaxBytes: s.DefaultContextBytes})
-		if readErr != nil {
-			return state, readErr
+		page, e := historypage.Read(ctx, st, r.SourceRolloutID, r.HeadID, cursor)
+		if e != nil {
+			return state, e
 		}
-		for i := range page.Records {
-			page.Records[i].Entry.Version = 1
+		line, e := encode(journal{Records: page.Records})
+		if e != nil {
+			return state, e
 		}
-		if err = emit(page.Records); err != nil {
-			return state, err
+		if e = writeAll(file, line); e != nil {
+			return state, e
+		}
+		for _, record := range page.Records {
+			imported.Add(record)
+		}
+		if checkpoint != nil {
+			checkpoint("page")
 		}
 		if page.Next == "" {
 			break
 		}
 		cursor = page.Next
 	}
-	if r.Environment != nil {
-		next, records, reduceErr := s.Reduce(state, s.Commit{ID: r.Environment.ID, ExpectedVersion: state.Version, Entries: []s.Entry{*r.Environment}})
-		if reduceErr != nil {
-			return state, reduceErr
-		}
-		state = next
-		if err = emit(records); err != nil {
-			return state, err
-		}
+	imported.Sort()
+	c, state, records, receipt, err := s.PrepareFork(r, head, imported.Sequence+1)
+	if err != nil {
+		return state, err
 	}
-	line, err := encode(journal{Publish: &state})
+	line, err := encode(journal{SessionID: r.TargetID, Commit: &c, Receipt: &receipt})
 	if err != nil {
 		return state, err
 	}
@@ -468,21 +627,114 @@ func (st *Store) Fork(ctx context.Context, r s.ForkRequest) (state s.RuntimeStat
 	if err = file.Sync(); err != nil {
 		return state, err
 	}
-	if err = ctx.Err(); err != nil {
-		return state, err
-	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if st.closed {
-		return state, core.ErrClosed
-	}
-	if err = os.Link(name, st.filename(r.TargetID)); err != nil {
-		return state, fmt.Errorf("publish fork: %w", err)
-	}
-	if err = st.syncDirectory(); err != nil {
+	if err = st.refreshAll(ctx); err != nil {
 		return state, err
 	}
-	return state, nil
+	d.index.Mu.Lock()
+	defer d.index.Mu.Unlock()
+	if d.index.Sessions[r.TargetID] != nil || d.index.Rollouts[r.RolloutID()] != nil {
+		return state, s.ErrConflict
+	}
+	if parent := d.index.Rollouts[r.SourceRolloutID]; parent == nil || parent.Status != "active" {
+		return state, s.ErrNotFound
+	}
+	if checkpoint != nil {
+		checkpoint("before_publish")
+	}
+	d.dirty = true
+	if err = os.Link(pending, st.filename(r.RolloutID())); err != nil {
+		return state, fmt.Errorf("publish fork: %w", err)
+	}
+	if err = syncDir(st.directory); err != nil {
+		return state, err
+	}
+	opened, err := os.OpenFile(st.filename(r.RolloutID()), os.O_RDWR, 0600)
+	if err != nil {
+		return state, err
+	}
+	info, err := opened.Stat()
+	if err != nil {
+		opened.Close()
+		return state, err
+	}
+	d.files[r.RolloutID()] = &cached{file: opened, offset: info.Size(), header: true}
+	d.index.Rollouts[imported.ID] = imported
+	d.index.Apply(ledger.Change{Commit: c, State: state, Records: records, Receipt: receipt})
+	d.dirty = false
+	if checkpoint != nil {
+		checkpoint("after_publish")
+	}
+	return ledger.Clone(state)
+}
+
+// Publish a complete, synced identity before any copy page is written.
+func (st *Store) createPending(r s.ForkRequest, pending string) (*os.File, error) {
+	f, err := os.CreateTemp(st.directory, filepath.Base(st.filename(r.RolloutID()))+".preparing-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(f.Name())
+	h, err := json.Marshal(header{Format: s.FormatVersion, RolloutID: r.RolloutID(), Fork: &r})
+	if err == nil {
+		err = writeAll(f, append(h, '\n'))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if err == nil {
+		err = os.Link(f.Name(), pending)
+	}
+	if err == nil {
+		err = syncDir(st.directory)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (st *Store) removePreparing(rolloutID string) error {
+	names, err := filepath.Glob(st.filename(rolloutID) + ".preparing-*")
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if err = os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (st *Store) DiscardUnpublished(ctx context.Context, id string) error {
+	unlock, err := st.shared.index.LockFork(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	st.shared.mu.Lock()
+	defer st.shared.mu.Unlock()
+	if err = st.refreshAll(ctx); err != nil {
+		return err
+	}
+	st.shared.index.Mu.RLock()
+	exists := st.shared.index.Sessions[id] != nil
+	st.shared.index.Mu.RUnlock()
+	if exists {
+		return s.ErrConflict
+	}
+	target := s.ForkRequest{TargetID: id, Mode: s.ForkDetached}
+	err = os.Remove(st.filename(target.RolloutID()) + ".pending")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err = st.removePreparing(target.RolloutID()); err != nil {
+		return err
+	}
+	return syncDir(st.directory)
 }
 
 var _ s.Store = (*Store)(nil)

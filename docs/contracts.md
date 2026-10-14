@@ -10,7 +10,7 @@ Core 的 `Driver.Commit` 必须在事实被采用、依赖动作开始之前确�
 
 ## 所有权与生命周期
 
-一个 Manager 内，同一 ID 的 OpenSession 返回同一已打开对象。一个 Session 同时只能有一个 Run 或独占维护操作，冲突返回 `astral.ErrBusy`。Compact、恢复预检、环境重新发现和效果确认属于维护操作。只读 Fork 不占用 Parent 的维护状态。
+一个 Manager 内，同一 ID 的 OpenSession 返回同一已打开对象。一个 Session 同时只能有一个 Run 或独占维护操作，冲突返回 `astral.ErrBusy`。Compact、恢复预检、环境重新发现和效果确认属于维护操作。Fork 不占用 Parent 的维护状态，也不改变 Parent 的状态。
 
 宿主必须保证跨 Manager、进程和主机的独占执行所有权。Store CAS 只能拒绝冲突写入，不能撤销外部操作；SDK 不实现分布式租约或调度。
 
@@ -37,16 +37,22 @@ type Store interface {
 }
 ```
 
-格式版本为 2。旧 API 和旧日志没有兼容层或自动迁移；不支持的格式返回 `ErrUnsupportedFormat`，不改写原文件。
+格式版本为 3。旧 API 和旧日志没有兼容层或自动迁移；不支持的格式返回 `ErrUnsupportedFormat`，不改写原文件。
 
-Commit 包含稳定 ID、ExpectedVersion、已分配标识 / Sequence / Version 的 Entry，以及选择历史节点时的 Projection。初始版本为 0；一次非空原子批次把版本加 1。Entry ID 在 Session 内唯一，提交后不可变。Sequence 在一个会话中单调递增，Fork 复制掉操作记录后允许出现空隙。
+`Get` / `Scan` 的第一个字符串参数是 **RolloutID**。`LoadState` / `Pending` / `Commit` / `LookupCommit` 的第一个字符串参数是 **SessionID**；SessionID 在 Store 内唯一。
 
-一个成功 Commit 原子保存：
+Commit 包含稳定 ID、ExpectedVersion、已有 EntryID / 写入 SessionID / 本地 Version 的 Entry；请求中的 Sequence 必须为 0。RuntimeState 的 Version 只用于该 Session 的 CAS，没有运行状态 Sequence。Entry ID 在 Rollout 内唯一，提交后不可变。Entry.Version 保留写入 Session 的提交版本；Entry.Sequence 表示 Rollout 内存储顺序。
 
-1. 新 Entry 与历史节点的 branch Projection。
-2. 通过 `session.Reduce` 计算的精确 RuntimeState。
-3. 历史、父子、待办等索引更新。
-4. Commit ID、版本和内容摘要组成的 Receipt。
+普通提交顺序固定为：
+
+1. Session 形成请求，不分配 Sequence，不提前 Reduce 或推进缓存。
+2. Store 在原子写入范围内验证 Session CAS 和 Rollout 可写状态，分配连续 Sequence 区间。
+3. 对已分配顺序的 Entry 执行 Reduce；原子保存 Entry、Projection、RuntimeState、索引和 Receipt。
+4. Receipt 返回实际的 FirstSequence / LastSequence；Session 校验回执后，用 `Commit.Confirmed` 恢复同一批 Entry，再 Reduce 更新缓存。
+
+Commit 摘要排除 Store 分配的 Sequence，其余请求内容绑定幂等身份。不同 Session 可交错提交而互不推进对方的 Version；Rollout Sequence 在交错批次间统一递增。Detached 导入保留祖先原始 Sequence，允许空隙，新提交从导入路径的最大 Sequence 后开始。
+
+完整回放和 Checkpoint 使用持久化的已确认 Entry，不能从当前计数重建序号。Fork 的创建回执使用固定 `ForkCommitID`，摘要绑定 ForkRequest；它不属于普通 Commit 重试入口。
 
 所有读取返回隔离副本。不存在返回 ErrNotFound，版本不符返回 ErrConflict。同一 Commit ID、相同内容的重试返回原始回执；同一 ID 改变内容是冲突。State 更新和 JSONL 回放使用同一个 Reduce；未确认的提交不能推进 Session 内存状态。
 
@@ -56,15 +62,15 @@ Commit 包含稳定 ID、ExpectedVersion、已分配标识 / Sequence / Version 
 
 ### SQLite
 
-`store/sqlite` 使用 Go 1.23 兼容的纯 Go modernc 驱动，不需要 CGO。连接使用 WAL、synchronous=FULL、busy_timeout=5000，并设置有限页缓存。一个 Commit 的记录、状态、索引、回执在同一事务里提交。
+`store/sqlite` 使用 Go 1.23 兼容的纯 Go modernc 驱动，不需要 CGO。连接使用 WAL、synchronous=FULL、busy_timeout=5000，并设置有限页缓存。写事务使用 BEGIN IMMEDIATE，顺序分配、CAS、记录、状态、索引、回执在同一事务里提交。数据库忙等待保留为数据库错误，不伪装成版本冲突。
 
-entries 按 Session / ID、Session / Sequence、父节点、类型 / 引用建立索引；pending 为待处理输入及审批建立索引。当前状态单独存储。普通 Commit 处理新增批次和当前工作状态，不回放或复制全部历史。历史路径通过受限的递归查询、固定连接顺序和主键查找读取；查询计划测试防止退化为全 Session 扫描。
+rollouts 保存状态与顺序计数；entries 按 Rollout / ID、Rollout / Sequence、写入 Session、父节点、类型 / 引用建立索引。sessions、receipts、pending 和未发布副本均有明确 Rollout 归属；pending 按 Session 隔离。当前状态单独存储。普通 Commit 处理新增批次和当前工作状态，不回放或复制全部历史。历史路径通过受限的递归查询、固定连接顺序和主键查找读取；查询计划测试防止退化为全 Rollout 扫描。
 
 `Stats().RowsRead` 统计实际返回给适配器的记录 / 状态行，不能单独代表 SQLite 内部扫描次数；需要结合查询计划和实测耗时判断。
 
 ### JSONL 与 Memory
 
-JSONL 使用 Session ID 的 SHA-256 文件名、版本头和带 SHA-256 校验和的批次。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
+JSONL 目录包含版本 3 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本头和带 SHA-256 校验和的批次。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
 
 未以换行结束的最后一行视为未提交尾部，读取忽略它，下一次 Commit 仅截去这段。完整行损坏、校验和失败或非法状态转换返回 ErrCorrupt，不自动修复已提交历史。确认恢复在采用新读到的完整提交前执行同步。
 
@@ -72,9 +78,9 @@ JSONL 使用 Session ID 的 SHA-256 文件名、版本头和带 SHA-256 校验�
 
 ## 精确状态、Context 与预算
 
-RuntimeState 包含版本、Sequence、创建信息、Head、有效配置 / 环境 / 摘要引用、当前批次执行事实、当前审批和待办数量。队列正文留在 Store 中，按索引分页读取；旧批次不保存在运行状态中。
+RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head、有效配置 / 环境 / 摘要引用、当前批次执行事实、当前审批和待办数量。队列正文留在 Store 中，按索引分页读取；旧批次不保存在运行状态中。
 
-每个历史节点保存 Projection，SelectHead 通过索引取得所选节点的分支状态，不继承兄弟分支的运行事实。Session 保留有效 Context 与必要引用，没有完整历史树缓存。任意旧节点若没有摘要且有效路径超限，选择或打开会明确报预算错误。
+每个历史节点保存 Projection，Fork 通过索引取得所选节点状态；Projection 保留末尾工具批次的结果引用，Child 可向 Core 提供已完成的 CallState。授权、执行中状态、审批和队列不继承。Session 保留有效 Context 与必要引用，没有完整历史树缓存。任意旧节点若没有摘要且有效路径超限，Fork 或打开会明确报预算错误。
 
 `MaxContextBytes` 默认 32 MiB，最小 4096，约束准备发送的 Request。Context 记录缓存还容纳信封、配置和当前批次，使用约两倍预算的保护上限。Token 估算与字节限制独立；模型上限仍由 EstimateTokens、输出预留和安全余量共同检查。当前工作状态、调用者持有的副本和 Backend 内存不包含在 Request 字节限制中。
 
@@ -147,16 +153,52 @@ Subscribe 为尽力投递，缓冲溢出关闭订阅并返回 ErrSlowSubscriber�
 
 ## 环境、历史位置与 Fork
 
-Environment 可选。environment.Snapshot 描述宿主确认的 Runtime / Computer / Workspace、OS、Shell、cwd、能力、资源和 opaque Metadata。环境条目按发生位置进入 Context，不改写 System Prompt。
+Environment 可选。environment.Snapshot 描述宿主确认的 Runtime / Computer / Workspace、OS、Shell、cwd、能力、资源和 opaque Metadata。环境条目按发生位置进入 Context，不改写 System Prompt。环境切换工具的结果节点本身也保存了快照效果：若 Fork 恰好选在结果节点、尚未包含同批后续环境节点，Projection 会引用结果内的快照，继续执行前仍需宿主重新确认。
 
 标准工具通过 environment.Decode 解释 opaque Binding。已有进程保存原始 Binding；切换当前 Runtime 或 Workspace 不会改变进程目标。审批看到的目标与执行时验证的目标必须一致。
 
-重新打开、Reload、SelectHead 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。没有环境的纯聊天 / 业务 API Session 不要求环境发现。
+重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。没有环境的纯聊天 / 业务 API Session 不要求环境发现。
 
-SelectHead 只在空闲时追加选择记录，不删除兄弟分支。原 Session 的输入队列继续保留。ForkAt 复制指定历史节点及祖先；ForkBefore 仅接受用户消息，复制至它的父节点。ID 在 Session 内唯一，复制保留历史 ID / ParentID / Sequence 及协议引用，复制条目的 Version 归为 Child 的初始版本；Child 有新创建记录和独立后续提交。
+```go
+type ForkMode uint8
+const (
+    ForkShared ForkMode = iota
+    ForkDetached
+)
+type ForkOptions struct {
+    ID          string
+    Mode        ForkMode
+    Environment *environment.Snapshot
+}
+func (s *Session) RolloutID() string
+func (s *Session) Fork(context.Context, string, ForkOptions) (*Session, error)
+```
 
-运行中 Fork 只接受已提交、协议完整的节点。短暂固定 SourceVersion 和 Head 后在 Parent 锁外复制；不改变 Parent 的 Head、队列、环境、取消状态或执行路径。空闲时可以复制部分批次供检查，但任何不完整历史批次都不能自动进入执行。
+Rollout 拥有历史和存储命名空间；Session 拥有执行状态；Run 仍表示一次执行。NewSession 创建新 Rollout 及首个 Session；OpenSession 仍使用 Store 内唯一的 SessionID。Shared 是默认模式，同 Rollout 内共享历史；Detached 导入所选节点及祖先，建立独立 Rollout。
 
-Fork 不复制 Run、审批或输入队列，不共享父历史存储。复制时间与磁盘成本为 O(K)。SQLite 每页短事务写 ready=0 的隐藏目标，完成后原子发布；JSONL 写临时文件、同步并原子发布。失败、取消、进程崩溃不能暴露半成品。
+Fork 的 nodeID 是包含式边界。排除消息时传其 ParentID。SelectHead、ForkAt、ForkBefore 和选择记录已移除；History 只读浏览，OpenSession 恢复已有执行，Fork 另起执行。History.Scan 支持 SessionID、Kind、HistoryOnly；Children 分页读取直接子节点，Path 从节点向祖先分页读取。Shared 的 History 可见整个 Rollout，不能把历史可见性当作该 Session 的运行状态。
 
-SQLite 崩溃可能留下隐藏目标，宿主可在确认没有同名活动 Fork 后调用 DiscardUnpublished；该方法拒绝已发布 Session。JSONL 的崩溃临时文件也不会作为会话打开，由宿主按生命周期清理。没有后台 GC 或共享前缀回收机制。
+| 所选边界 | 创建与 Continue |
+| --- | --- |
+| User 消息 | 创建后 Continue 调用模型 |
+| 完整工具批次 | 复用历史结果，不重跑 Tool / Hook，保留 Terminate 语义 |
+| Assistant 最终回复 | Continue 保持完成；Start 可追加输入 |
+| 配置、环境、压缩节点 | 由 Projection 和最后有效消息决定 |
+| 不完整工具批次 | ErrIncompleteBatch，不创建 Child |
+| 未解决外部效果 | ErrOutcomeUnknown，不创建 Child |
+
+无论 Parent 是否运行，边界规则相同。检查 Rollout 归属、已提交节点和 Projection，不使用变化中的父 Version 判断历史可见性。Parent 可继续生成、审批、排队和提交；Fork 不改变其 Head、Version 或取消状态。
+
+两种模式都从所选 Projection 初始化 Child，自己的创建批次使本地 Version 从 0 到 1。Detached 祖先通过历史导入路径写入，保留原始 EntryID、写入 SessionID、ParentID、Version、Sequence 和协议数据。祖先版本可以高于 Child；回放时不能把这些祖先作为 Child 的本地 Commit Reduce。Child 后续回放从创建记录保存的 Projection 开始，只应用自己的提交。Detached 的来源字段仅用于追溯，不依赖源 Rollout 存活。
+
+目标 ID 必填，作为创建幂等身份。摘要绑定来源 Rollout、来源 Session、nodeID、模式、目标 ID 和显式 Environment，排除随机记录 ID、时间戳和父 Version。创建、Rollout 关联、来源记录和创建回执原子发布。相同请求返回同一 Child；参数变化返回 ErrConflict；已推进 Child 不重置、不自动启动。确认丢失可通过目标 Session 的 LookupCommit / OpenSession 恢复。
+
+Shared 不复制历史前缀，只保存 Child 创建批次并读取有效 Context。Detached 的时间、磁盘和累计分配为 O(K)：SQLite 以短事务写入 building Rollout 和 ready=0 Session，JSONL 使用带稳定请求身份的 .pending 文件；完成后原子发布。复制页默认 4 MiB；超过页大小的不可分割历史记录单独读取并完整复制，峰值内存因此也取决于最大单条记录。有效 Context 预算与归档复制互相独立。分页和发布前后的真实 SIGKILL 测试覆盖两种持久后端。
+
+未完成 Detached 在核对请求身份、取得同目标创建锁后安全清理并从头复制，不提供断点续传。`DiscardUnpublished` 同样持有目标锁并拒绝已发布目标；重试不能删除仍在复制的目标。跨进程由宿主保证目标创建和执行的独占所有权，JSONL 额外要求独占目录。所有持久记录和临时副本都可按 Rollout 归属定位。
+
+## Rollout 生命周期边界
+
+Session.Close 只释放执行资源，保留持久状态和全部历史；Parent 与 Child 生命周期独立。等待、取消联动、汇总、并发配额、工作目录和终端资源隔离由宿主实现。Shared 不意味着共享授权，Detached 也不自动复制外部资源。
+
+本轮不提供 Rollout / Session 删除 API，不引入 TreeID、Branch 管理器、引用计数或 GC。Rollout 是未来整体删除单位：事务内先标记不可写，阻止 Commit / Fork；宿主停止并等待执行；整体移出可见集合并清理。崩溃后继续清理，不重新变为可执行 Rollout。当前读写路径已检查 Rollout 状态，分页导入和最终发布也验证目标仍处于 building 状态。

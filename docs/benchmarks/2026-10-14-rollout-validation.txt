@@ -1,0 +1,56 @@
+$ go test -race ./...
+?   	github.com/oines/astral-core	[no test files]
+?   	github.com/oines/astral-core/environment	[no test files]
+?   	github.com/oines/astral-core/examples/approval	[no test files]
+?   	github.com/oines/astral-core/examples/basic	[no test files]
+?   	github.com/oines/astral-core/examples/environments	[no test files]
+?   	github.com/oines/astral-core/examples/fork	[no test files]
+?   	github.com/oines/astral-core/examples/internal/demo	[no test files]
+?   	github.com/oines/astral-core/examples/tools	[no test files]
+?   	github.com/oines/astral-core/internal/retry	[no test files]
+?   	github.com/oines/astral-core/session	[no test files]
+ok  	github.com/oines/astral-core/standardtools	(cached)
+ok  	github.com/oines/astral-core/standardtools/local	(cached)
+?   	github.com/oines/astral-core/store/internal/historypage	[no test files]
+?   	github.com/oines/astral-core/store/internal/ledger	[no test files]
+?   	github.com/oines/astral-core/store/internal/targetlock	[no test files]
+ok  	github.com/oines/astral-core/store/jsonl	4.005s
+?   	github.com/oines/astral-core/store/memory	[no test files]
+ok  	github.com/oines/astral-core/store/sqlite	17.766s
+ok  	github.com/oines/astral-core/tests/integration	21.970s
+exit status: 0
+
+$ GOTOOLCHAIN=go1.23.12 CGO_ENABLED=0 go test ./...
+?   	github.com/oines/astral-core	[no test files]
+?   	github.com/oines/astral-core/environment	[no test files]
+?   	github.com/oines/astral-core/examples/approval	[no test files]
+?   	github.com/oines/astral-core/examples/basic	[no test files]
+?   	github.com/oines/astral-core/examples/environments	[no test files]
+?   	github.com/oines/astral-core/examples/fork	[no test files]
+?   	github.com/oines/astral-core/examples/internal/demo	[no test files]
+?   	github.com/oines/astral-core/examples/tools	[no test files]
+?   	github.com/oines/astral-core/internal/retry	[no test files]
+?   	github.com/oines/astral-core/session	[no test files]
+?   	github.com/oines/astral-core/store/internal/historypage	[no test files]
+?   	github.com/oines/astral-core/store/internal/ledger	[no test files]
+?   	github.com/oines/astral-core/store/internal/targetlock	[no test files]
+ok  	github.com/oines/astral-core/standardtools	(cached)
+ok  	github.com/oines/astral-core/standardtools/local	(cached)
+?   	github.com/oines/astral-core/store/memory	[no test files]
+ok  	github.com/oines/astral-core/store/jsonl	0.691s
+ok  	github.com/oines/astral-core/store/sqlite	1.460s
+ok  	github.com/oines/astral-core/tests/integration	5.648s
+exit status: 0
+
+$ go vet ./...
+(no diagnostics)
+exit status: 0
+
+Offline examples (run separately): basic, approval, environments, tools, fork
+Command for each: go run ./examples/<name>
+Each executed sequentially and exited 0.
+basic: Order order-42: shipped
+approval: approval persisted: true; completed changes: 1; reopened messages: 4
+environments: current runtime: runtime-b; process runtime: runtime-a
+tools: Hello from astral-core
+fork: regeneration shares rollout: true; detached owns new rollout: true; Answer: Independent follow-up

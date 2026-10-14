@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"fmt"
 
 	protocol "github.com/oines/astral-core"
 	targetenv "github.com/oines/astral-core/environment"
@@ -33,9 +34,26 @@ func (s *Session) RefreshEnvironment(ctx context.Context, snapshot targetenv.Sna
 func effectiveEnvironment(path []Entry) (*targetenv.Snapshot, targetenv.Binding) {
 	for i := len(path) - 1; i >= 0; i-- {
 		e := path[i]
-		if e.Kind == EntryEnvironment {
-			return e.Environment, targetenv.Binding{SnapshotID: e.ID, RuntimeID: e.Environment.RuntimeID, ComputerID: e.Environment.ComputerID, WorkspaceID: e.Environment.WorkspaceID}
+		snapshot := e.Environment
+		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution {
+			snapshot, _ = resultEnvironment(e)
+		}
+		if snapshot != nil {
+			return snapshot, targetenv.Binding{SnapshotID: e.ID, RuntimeID: snapshot.RuntimeID, ComputerID: snapshot.ComputerID, WorkspaceID: snapshot.WorkspaceID}
 		}
 	}
 	return nil, targetenv.Binding{}
+}
+
+// A result's environment effect belongs to that inclusive history boundary,
+// even before the following explicit environment node in the atomic batch.
+func resultEnvironment(e Entry) (*targetenv.Snapshot, error) {
+	if e.Tool == nil || e.Tool.Result == nil || len(e.Tool.Result.Context) == 0 {
+		return nil, nil
+	}
+	payload, err := targetenv.Decode(e.Tool.Result.Context)
+	if err != nil || payload.Snapshot == nil {
+		return nil, fmt.Errorf("%w: tool result environment snapshot", ErrCorrupt)
+	}
+	return payload.Snapshot, nil
 }

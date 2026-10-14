@@ -54,7 +54,7 @@ func TestRunningParentContinuesWhileForkIsPaused(t *testing.T) {
 		}
 		finished := make(chan result, 1)
 		go func() {
-			child, err := parent.Fork(context.Background(), first.LastMessageID, sessions.ForkAt, sessions.SessionOptions{ID: "child"})
+			child, err := parent.Fork(context.Background(), first.LastMessageID, sessions.ForkOptions{ID: "child"})
 			finished <- result{child, err}
 		}()
 		signal(t, st.entered)
@@ -81,7 +81,7 @@ func TestRunningParentContinuesWhileForkIsPaused(t *testing.T) {
 			t.Fatalf("fixed fork boundary: %+v %v", view, err)
 		}
 		for _, e := range entries(child) {
-			if !e.IsHistory() && e.Kind != sessions.EntryCreated {
+			if e.SessionID == child.ID() && !e.IsHistory() && e.Kind != sessions.EntryCreated {
 				t.Fatalf("operational fact copied: %s", e.Kind)
 			}
 		}
@@ -114,10 +114,10 @@ func TestRunningParentRejectsIncompleteFork(t *testing.T) {
 		parent := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 		run := start(t, parent, "go")
 		signal(t, entered)
-		if _, err := parent.Fork(context.Background(), parent.Head(), sessions.ForkAt, sessions.SessionOptions{ID: "invalid"}); !errors.Is(err, astral.ErrIncompleteBatch) {
+		if _, err := parent.Fork(context.Background(), parent.Head(), sessions.ForkOptions{ID: "invalid"}); !errors.Is(err, astral.ErrIncompleteBatch) {
 			t.Fatalf("running partial fork: %v", err)
 		}
-		if _, err := parent.Fork(context.Background(), "not-committed", sessions.ForkAt, sessions.SessionOptions{ID: "invalid"}); !errors.Is(err, sessions.ErrNotFound) {
+		if _, err := parent.Fork(context.Background(), "not-committed", sessions.ForkOptions{ID: "invalid"}); !errors.Is(err, sessions.ErrNotFound) {
 			t.Fatalf("uncommitted fork: %v", err)
 		}
 		close(release)

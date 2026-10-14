@@ -1,5 +1,4 @@
-// Package ledger is the in-process index used by the memory and JSONL adapters.
-// SQLite keeps these indexes in the database instead.
+// Package ledger indexes Rollout history separately from execution state.
 package ledger
 
 import (
@@ -11,55 +10,87 @@ import (
 
 	core "github.com/oines/astral-core"
 	s "github.com/oines/astral-core/session"
+	"github.com/oines/astral-core/store/internal/historypage"
+	"github.com/oines/astral-core/store/internal/targetlock"
 )
 
 type Data struct {
-	State      s.RuntimeState
-	Records    map[string]s.Record
-	Order      []string
-	History    []string
-	Children   map[string][]string
-	References map[string][]string
-	Pending    map[string]s.Record
-	Receipts   map[string]s.Receipt
-	Ready      bool
+	State    s.RuntimeState
+	Pending  map[string]s.Record
+	Receipts map[string]s.Receipt
+}
+type Rollout struct {
+	ID                   string
+	Status               string
+	Sequence             uint64
+	Records              map[string]s.Record
+	Order, History       []string
+	Children, References map[string][]string
 }
 type Store struct {
 	Mu       sync.RWMutex
 	Sessions map[string]*Data
+	Rollouts map[string]*Rollout
+	forks    targetlock.Map
+}
+type Change struct {
+	Commit  s.Commit
+	State   s.RuntimeState
+	Records []s.Record
+	Receipt s.Receipt
 }
 
-func New() *Store { return &Store{Sessions: map[string]*Data{}} }
-func NewData() *Data {
-	return &Data{Records: map[string]s.Record{}, Children: map[string][]string{}, References: map[string][]string{}, Pending: map[string]s.Record{}, Receipts: map[string]s.Receipt{}}
+func New() *Store    { return &Store{Sessions: map[string]*Data{}, Rollouts: map[string]*Rollout{}} }
+func NewData() *Data { return &Data{Pending: map[string]s.Record{}, Receipts: map[string]s.Receipt{}} }
+func NewRollout(id string) *Rollout {
+	return &Rollout{ID: id, Status: "active", Records: map[string]s.Record{}, Children: map[string][]string{}, References: map[string][]string{}}
 }
 func Clone[T any](v T) (T, error) {
 	var out T
-	b, err := json.Marshal(v)
-	if err != nil {
-		return out, err
+	b, e := json.Marshal(v)
+	if e != nil {
+		return out, e
 	}
-	err = json.Unmarshal(b, &out)
-	return out, err
+	e = json.Unmarshal(b, &out)
+	return out, e
 }
-func (d *Data) Add(r s.Record) {
-	e := r.Entry
-	d.Records[e.ID] = r
-	d.Order = append(d.Order, e.ID)
+func Equal(a, b any) bool {
+	x, e := json.Marshal(a)
+	y, f := json.Marshal(b)
+	return e == nil && f == nil && string(x) == string(y)
+}
+func (r *Rollout) Add(record s.Record) {
+	e := record.Entry
+	r.Records[e.ID] = record
+	r.Order = append(r.Order, e.ID)
+	if e.Sequence > r.Sequence {
+		r.Sequence = e.Sequence
+	}
 	if e.IsHistory() {
-		d.History = append(d.History, e.ID)
-		d.Children[e.ParentID] = append(d.Children[e.ParentID], e.ID)
+		r.History = append(r.History, e.ID)
+		r.Children[e.ParentID] = append(r.Children[e.ParentID], e.ID)
 	}
-	for _, key := range []string{string(e.Kind) + "\x00", string(e.Kind) + "\x00" + s.Reference(e)} {
-		if key == string(e.Kind)+"\x00" && s.Reference(e) == "" {
-			continue
-		}
-		d.References[key] = append(d.References[key], e.ID)
+	key := string(e.Kind) + "\x00"
+	r.References[key] = append(r.References[key], e.ID)
+	if ref := s.Reference(e); ref != "" {
+		r.References[key+ref] = append(r.References[key+ref], e.ID)
 	}
-	if s.Reference(e) == "" {
-		key := string(e.Kind) + "\x00"
-		d.References[key] = append(d.References[key], e.ID)
+}
+func (r *Rollout) Sort() {
+	less := func(ids []string) {
+		sort.Slice(ids, func(i, j int) bool { return r.Records[ids[i]].Entry.Sequence < r.Records[ids[j]].Entry.Sequence })
 	}
+	less(r.Order)
+	less(r.History)
+	for _, v := range r.Children {
+		less(v)
+	}
+	for _, v := range r.References {
+		less(v)
+	}
+}
+func (d *Data) AddPending(r s.Record) {
+	e := r.Entry
 	switch e.Kind {
 	case s.EntryInputQueued:
 		d.Pending["input:"+e.Input.ID] = r
@@ -69,31 +100,12 @@ func (d *Data) Add(r s.Record) {
 		d.Pending["approval:"+e.Approval.ID] = r
 	case s.EntryApprovalDecided:
 		delete(d.Pending, "approval:"+e.Approval.ID)
-	case s.EntryToolResult, s.EntryToolResolution:
+	case s.EntryToolResult, s.EntryToolResolution, s.EntryMessage:
 		for key, p := range d.Pending {
-			if p.Entry.Approval != nil && p.Entry.Approval.ExecutionID == e.Tool.Invocation.ExecutionID {
+			if p.Entry.Approval != nil && (e.Kind == s.EntryMessage || p.Entry.Approval.ExecutionID == e.Tool.Invocation.ExecutionID) {
 				delete(d.Pending, key)
 			}
 		}
-	case s.EntryMessage, s.EntryHeadSelected:
-		for key, p := range d.Pending {
-			if p.Entry.Approval != nil {
-				delete(d.Pending, key)
-			}
-		}
-	}
-}
-func (d *Data) Sort() {
-	less := func(ids []string) {
-		sort.Slice(ids, func(i, j int) bool { return d.Records[ids[i]].Entry.Sequence < d.Records[ids[j]].Entry.Sequence })
-	}
-	less(d.Order)
-	less(d.History)
-	for _, ids := range d.Children {
-		less(ids)
-	}
-	for _, ids := range d.References {
-		less(ids)
 	}
 }
 func (st *Store) LoadState(ctx context.Context, id string) (s.RuntimeState, error) {
@@ -103,7 +115,7 @@ func (st *Store) LoadState(ctx context.Context, id string) (s.RuntimeState, erro
 	st.Mu.RLock()
 	defer st.Mu.RUnlock()
 	d := st.Sessions[id]
-	if d == nil || !d.Ready {
+	if d == nil || st.Rollouts[d.State.RolloutID] == nil || st.Rollouts[d.State.RolloutID].Status != "active" {
 		return s.RuntimeState{}, s.ErrNotFound
 	}
 	return Clone(d.State)
@@ -114,8 +126,8 @@ func (st *Store) Get(ctx context.Context, id, key string) (s.Record, error) {
 	}
 	st.Mu.RLock()
 	defer st.Mu.RUnlock()
-	d := st.Sessions[id]
-	if d == nil || !d.Ready {
+	d := st.Rollouts[id]
+	if d == nil || d.Status != "active" {
 		return s.Record{}, s.ErrNotFound
 	}
 	r, ok := d.Records[key]
@@ -131,7 +143,7 @@ func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, e
 	st.Mu.RLock()
 	defer st.Mu.RUnlock()
 	d := st.Sessions[id]
-	if d == nil || !d.Ready {
+	if d == nil || st.Rollouts[d.State.RolloutID] == nil || st.Rollouts[d.State.RolloutID].Status != "active" {
 		return s.Receipt{}, s.ErrNotFound
 	}
 	r, ok := d.Receipts[key]
@@ -142,107 +154,165 @@ func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, e
 	return r, nil
 }
 
-// Prepare does not mutate Data. The JSONL adapter writes and syncs this complete
-// commit before calling Apply, so an IO error cannot advance its in-memory view.
-func (d *Data) Prepare(id string, c s.Commit) (s.RuntimeState, []s.Record, s.Receipt, error) {
+// Prepare is non-mutating and requires Mu. Durable adapters sync before Apply.
+func (st *Store) Prepare(id string, c s.Commit) (Change, error) {
+	if id == "" || len(c.Entries) == 0 || c.ID == s.ForkCommitID {
+		return Change{}, core.ErrInvalid
+	}
+	var rolloutID string
+	d := st.Sessions[id]
+	if d != nil {
+		rolloutID = d.State.RolloutID
+	} else if c.Entries[0].Created != nil && c.Entries[0].Created.Projection == nil {
+		rolloutID = c.Entries[0].Created.RolloutID
+	} else {
+		return Change{}, s.ErrCorrupt
+	}
+	r := st.Rollouts[rolloutID]
+	if r == nil {
+		if d != nil || rolloutID == "" {
+			return Change{}, s.ErrCorrupt
+		}
+		r = NewRollout(rolloutID)
+	} else if r.Status != "active" {
+		return Change{}, s.ErrNotFound
+	} else if d == nil {
+		return Change{}, s.ErrConflict
+	}
 	digest, err := c.Digest()
 	if err != nil {
-		return s.RuntimeState{}, nil, s.Receipt{}, err
+		return Change{}, err
 	}
-	if old, ok := d.Receipts[c.ID]; ok {
-		if old.Digest != digest {
-			return s.RuntimeState{}, nil, s.Receipt{}, s.ErrConflict
+	if d != nil {
+		if old, ok := d.Receipts[c.ID]; ok {
+			if old.Digest != digest {
+				return Change{}, s.ErrConflict
+			}
+			old.CurrentVersion = d.State.Version
+			return Change{Receipt: old, State: d.State}, nil
 		}
-		old.CurrentVersion = d.State.Version
-		return d.State, nil, old, nil
 	}
-	if d.State.Version > 0 && !d.Ready {
-		return s.RuntimeState{}, nil, s.Receipt{}, s.ErrConflict
+	confirmed, receipt, err := s.AssignCommit(c, r.Sequence+1)
+	if err != nil {
+		return Change{}, err
+	}
+	return st.PrepareConfirmed(id, confirmed, receipt)
+}
+
+// PrepareConfirmed validates an exact durable commit, including Fork seeds.
+func (st *Store) PrepareConfirmed(id string, c s.Commit, receipt s.Receipt) (Change, error) {
+	d := st.Sessions[id]
+	if d == nil {
+		d = NewData()
 	}
 	if c.ExpectedVersion != d.State.Version {
-		return s.RuntimeState{}, nil, s.Receipt{}, s.ErrConflict
+		return Change{}, s.ErrConflict
+	}
+	if len(c.Entries) == 0 || receipt.FirstSequence == 0 || receipt.LastSequence-receipt.FirstSequence != uint64(len(c.Entries)-1) || receipt.Version != c.ExpectedVersion+1 || receipt.CommitID != c.ID {
+		return Change{}, s.ErrCorrupt
+	}
+	for i, e := range c.Entries {
+		if e.Sequence != receipt.FirstSequence+uint64(i) {
+			return Change{}, s.ErrCorrupt
+		}
+	}
+	digest, err := c.Digest()
+	if err != nil {
+		return Change{}, err
+	}
+	if c.ID == s.ForkCommitID {
+		if c.Entries[0].Created == nil {
+			return Change{}, s.ErrCorrupt
+		}
+		digest = c.Entries[0].Created.ForkDigest
+	}
+	if digest != receipt.Digest {
+		return Change{}, s.ErrCorrupt
 	}
 	state, records, err := s.Reduce(d.State, c)
 	if err != nil {
-		return s.RuntimeState{}, nil, s.Receipt{}, err
+		return Change{}, err
 	}
 	if state.SessionID != id {
-		return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
+		return Change{}, s.ErrCorrupt
+	}
+	r := st.Rollouts[state.RolloutID]
+	if r == nil {
+		r = NewRollout(state.RolloutID)
+	}
+	if (r.Status != "active" && !(r.Status == "building" && c.ID == s.ForkCommitID && d.State.Version == 0)) || receipt.FirstSequence != r.Sequence+1 {
+		return Change{}, s.ErrCorrupt
+	}
+	if c.Entries[0].Created != nil && c.Entries[0].Created.Projection != nil {
+		head, ok := r.Records[c.Entries[0].Created.ForkEntryID]
+		if !ok || !Equal(head.Projection, c.Entries[0].Created.Projection) {
+			return Change{}, s.ErrCorrupt
+		}
 	}
 	queued := map[string]bool{}
 	for _, e := range c.Entries {
-		if _, ok := d.Records[e.ID]; ok {
-			return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
-		}
-		if e.Head != nil {
-			r, ok := d.Records[e.Head.EntryID]
-			if !ok || r.Projection == nil || !Equal(r.Projection, c.Selection) {
-				return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
-			}
+		if _, ok := r.Records[e.ID]; ok {
+			return Change{}, s.ErrCorrupt
 		}
 		if e.Compaction != nil {
-			r, ok := d.Records[e.Compaction.ThroughID]
-			if !ok || r.Projection == nil {
-				return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
+			rec, ok := r.Records[e.Compaction.ThroughID]
+			if !ok || rec.Projection == nil {
+				return Change{}, s.ErrCorrupt
 			}
 		}
 		if e.Kind == s.EntryInputConsumed {
 			p, ok := d.Pending["input:"+e.Input.ID]
 			if !ok || p.Entry.Input.Kind != e.Input.Kind {
-				return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
+				return Change{}, s.ErrCorrupt
 			}
 		}
 		if e.Kind == s.EntryInputQueued {
-			_, exists := d.Pending["input:"+e.Input.ID]
-			if exists || queued[e.Input.ID] {
-				return s.RuntimeState{}, nil, s.Receipt{}, s.ErrCorrupt
+			_, ok := d.Pending["input:"+e.Input.ID]
+			if ok || queued[e.Input.ID] {
+				return Change{}, s.ErrCorrupt
 			}
 			queued[e.Input.ID] = true
 		}
 	}
-	receipt := s.Receipt{CommitID: c.ID, Version: state.Version, CurrentVersion: state.Version, Digest: digest}
-	return state, records, receipt, nil
+	return Change{Commit: c, State: state, Records: records, Receipt: receipt}, nil
 }
-func Equal(a, b any) bool {
-	x, e := json.Marshal(a)
-	y, f := json.Marshal(b)
-	return e == nil && f == nil && string(x) == string(y)
-}
-func (d *Data) Apply(state s.RuntimeState, records []s.Record, r s.Receipt) {
-	for _, record := range records {
-		d.Add(record)
+func (st *Store) Apply(change Change) {
+	id := change.State.SessionID
+	d := st.Sessions[id]
+	if d == nil {
+		d = NewData()
+		st.Sessions[id] = d
 	}
-	d.State = state
-	d.Ready = true
-	d.Receipts[r.CommitID] = r
+	r := st.Rollouts[change.State.RolloutID]
+	if r == nil {
+		r = NewRollout(change.State.RolloutID)
+		st.Rollouts[r.ID] = r
+	}
+	r.Status = "active"
+	for _, record := range change.Records {
+		r.Add(record)
+		d.AddPending(record)
+	}
+	d.State = change.State
+	d.Receipts[change.Receipt.CommitID] = change.Receipt
 }
 func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (s.Receipt, error) {
 	if err := ctx.Err(); err != nil {
 		return s.Receipt{}, err
 	}
-	if id == "" {
-		return s.Receipt{}, core.ErrInvalid
-	}
 	st.Mu.Lock()
 	defer st.Mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return s.Receipt{}, err
-	}
-	d := st.Sessions[id]
-	if d == nil {
-		d = NewData()
-	} else if !d.Ready {
-		return s.Receipt{}, s.ErrConflict
-	}
-	state, records, r, err := d.Prepare(id, c)
+	change, err := st.Prepare(id, c)
 	if err != nil {
 		return s.Receipt{}, err
 	}
-	if len(records) > 0 {
-		d.Apply(state, records, r)
-		st.Sessions[id] = d
+	if err = ctx.Err(); err != nil {
+		return s.Receipt{}, err
 	}
-	return r, nil
+	if len(change.Records) > 0 {
+		st.Apply(change)
+	}
+	return change.Receipt, nil
 }
 func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error) {
 	if err := ctx.Err(); err != nil {
@@ -250,8 +320,8 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 	}
 	st.Mu.RLock()
 	defer st.Mu.RUnlock()
-	d := st.Sessions[id]
-	if d == nil || !d.Ready {
+	d := st.Rollouts[id]
+	if d == nil || d.Status != "active" {
 		return s.Page{}, s.ErrNotFound
 	}
 	limit, maxBytes := s.PageLimits(q.Limit, q.MaxBytes)
@@ -341,7 +411,7 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 				return s.Page{}, err
 			}
 			r := d.Records[ids[i]]
-			if q.Kind != "" && r.Entry.Kind != q.Kind || q.Reference != "" && s.Reference(r.Entry) != q.Reference || q.HistoryOnly && !r.Entry.IsHistory() {
+			if q.SessionID != "" && r.Entry.SessionID != q.SessionID || q.Kind != "" && r.Entry.Kind != q.Kind || q.Reference != "" && s.Reference(r.Entry) != q.Reference || q.HistoryOnly && !r.Entry.IsHistory() {
 				continue
 			}
 			if len(page.Records) == limit {
@@ -367,7 +437,7 @@ func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Pa
 	st.Mu.RLock()
 	defer st.Mu.RUnlock()
 	d := st.Sessions[id]
-	if d == nil || !d.Ready {
+	if d == nil || st.Rollouts[d.State.RolloutID] == nil || st.Rollouts[d.State.RolloutID].Status != "active" {
 		return s.Page{}, s.ErrNotFound
 	}
 	var rows []s.Record
@@ -410,82 +480,101 @@ func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Pa
 	return Clone(page)
 }
 
-// ForkInto copies in bounded reverse pages into a private destination index.
-// The caller controls durable staging and publication. Source records are immutable.
-func (st *Store) ForkInto(ctx context.Context, request s.ForkRequest, emit func([]s.Record) error) (s.RuntimeState, error) {
-	head, err := st.Get(ctx, request.SourceID, request.HeadID)
-	if err != nil {
-		return s.RuntimeState{}, err
-	}
-	state, err := s.ForkState(request, head)
-	if err != nil {
-		return s.RuntimeState{}, err
-	}
-	creation := s.Record{Entry: request.Creation}
-	if err = emit([]s.Record{creation}); err != nil {
-		return s.RuntimeState{}, err
-	}
-	cursor := ""
-	for {
-		p, err := st.Scan(ctx, request.SourceID, s.Query{PathHead: request.HeadID, Cursor: cursor, Limit: s.DefaultPageSize, MaxBytes: s.DefaultContextBytes})
-		if err != nil {
-			return s.RuntimeState{}, err
-		}
-		for i := range p.Records {
-			p.Records[i].Entry.Version = 1
-		}
-		if err = emit(p.Records); err != nil {
-			return s.RuntimeState{}, err
-		}
-		if p.Next == "" {
-			break
-		}
-		cursor = p.Next
-	}
-	if request.Environment != nil {
-		c := s.Commit{ID: request.Environment.ID, ExpectedVersion: state.Version, Entries: []s.Entry{*request.Environment}}
-		next, records, err := s.Reduce(state, c)
-		if err != nil {
-			return s.RuntimeState{}, err
-		}
-		state = next
-		if err = emit(records); err != nil {
-			return s.RuntimeState{}, err
-		}
-	}
-	return state, nil
+// LockFork serializes only the same target; unrelated parent writes can proceed.
+func (st *Store) LockFork(ctx context.Context, id string) (func(), error) {
+	return st.forks.Lock(ctx, id)
 }
-func (st *Store) Fork(ctx context.Context, request s.ForkRequest) (s.RuntimeState, error) {
-	if err := s.ValidateFork(request); err != nil {
+func (st *Store) ExistingFork(r s.ForkRequest) (s.RuntimeState, bool, error) {
+	d := st.Sessions[r.TargetID]
+	if d == nil {
+		return s.RuntimeState{}, false, nil
+	}
+	if rollout := st.Rollouts[d.State.RolloutID]; rollout == nil || rollout.Status != "active" {
+		return s.RuntimeState{}, true, s.ErrNotFound
+	}
+	digest, err := r.Digest()
+	if err != nil {
+		return s.RuntimeState{}, true, err
+	}
+	receipt, ok := d.Receipts[s.ForkCommitID]
+	if !ok || receipt.Digest != digest {
+		return s.RuntimeState{}, true, s.ErrConflict
+	}
+	state, err := Clone(d.State)
+	return state, true, err
+}
+func (st *Store) Fork(ctx context.Context, r s.ForkRequest) (s.RuntimeState, error) {
+	if err := s.ValidateFork(r); err != nil {
 		return s.RuntimeState{}, err
 	}
-	st.Mu.Lock()
-	if st.Sessions[request.TargetID] != nil {
-		st.Mu.Unlock()
-		return s.RuntimeState{}, s.ErrConflict
+	unlock, err := st.LockFork(ctx, r.TargetID)
+	if err != nil {
+		return s.RuntimeState{}, err
 	}
-	d := NewData()
-	st.Sessions[request.TargetID] = d
-	st.Mu.Unlock()
-	state, err := st.ForkInto(ctx, request, func(records []s.Record) error {
-		owned, err := Clone(records)
-		if err != nil {
-			return err
+	defer unlock()
+	st.Mu.RLock()
+	state, found, err := st.ExistingFork(r)
+	source := st.Sessions[r.SourceID]
+	validSource := source != nil && source.State.RolloutID == r.SourceRolloutID
+	st.Mu.RUnlock()
+	if found || err != nil {
+		return state, err
+	}
+	if !validSource {
+		return state, s.ErrNotFound
+	}
+	head, err := st.Get(ctx, r.SourceRolloutID, r.HeadID)
+	if err != nil {
+		return state, err
+	}
+	if _, err = s.ForkState(r, head); err != nil {
+		return state, err
+	}
+	var detached *Rollout
+	if r.Mode == s.ForkDetached {
+		detached = NewRollout(r.RolloutID())
+		cursor := ""
+		for {
+			page, e := historypage.Read(ctx, st, r.SourceRolloutID, r.HeadID, cursor)
+			if e != nil {
+				return state, e
+			}
+			for _, record := range page.Records {
+				detached.Add(record)
+			}
+			if page.Next == "" {
+				break
+			}
+			cursor = page.Next
 		}
-		for _, r := range owned {
-			d.Add(r)
-		}
-		return ctx.Err()
-	})
+		detached.Sort()
+	}
 	st.Mu.Lock()
 	defer st.Mu.Unlock()
-	if err != nil {
-		delete(st.Sessions, request.TargetID)
-		return s.RuntimeState{}, err
+	if err = ctx.Err(); err != nil {
+		return state, err
 	}
-	d.State = state
-	d.Sort()
-	d.Ready = true
+	if state, found, err = st.ExistingFork(r); found || err != nil {
+		return state, err
+	}
+	rollout := st.Rollouts[r.SourceRolloutID]
+	if rollout == nil || rollout.Status != "active" {
+		return state, s.ErrNotFound
+	}
+	if detached != nil {
+		if st.Rollouts[detached.ID] != nil {
+			return state, s.ErrConflict
+		}
+		rollout = detached
+	}
+	c, state, records, receipt, err := s.PrepareFork(r, head, rollout.Sequence+1)
+	if err != nil {
+		return state, err
+	}
+	if detached != nil {
+		st.Rollouts[detached.ID] = detached
+	}
+	st.Apply(Change{Commit: c, State: state, Records: records, Receipt: receipt})
 	return Clone(state)
 }
 

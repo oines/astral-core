@@ -19,7 +19,7 @@ import (
 
 func storeHeader() []sessions.Entry {
 	return []sessions.Entry{
-		{ID: "created", Kind: sessions.EntryCreated, Created: &sessions.CreationRecord{FormatVersion: sessions.FormatVersion, SessionID: "session"}},
+		{ID: "created", Kind: sessions.EntryCreated, Created: &sessions.CreationRecord{FormatVersion: sessions.FormatVersion, SessionID: "session", RolloutID: "session"}},
 		{ID: "config", Kind: sessions.EntryConfiguration, Configuration: &sessions.Configuration{ModelID: "model"}},
 	}
 }
@@ -176,11 +176,11 @@ func TestJSONLRecoversOnlyUnterminatedTail(t *testing.T) {
 	if err = appendStore(ctx, s, "session", 0, storeHeader()); err != nil {
 		t.Fatal(err)
 	}
-	files, err := os.ReadDir(directory)
+	files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	filename := filepath.Join(directory, files[0].Name())
+	filename := files[0]
 	prefix, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
@@ -239,11 +239,11 @@ func TestJSONLRejectsCommittedCorruptionWithoutRepairingIt(t *testing.T) {
 	if err = appendStore(ctx, s, "session", 0, storeHeader()); err != nil {
 		t.Fatal(err)
 	}
-	files, err := os.ReadDir(directory)
+	files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	filename := filepath.Join(directory, files[0].Name())
+	filename := files[0]
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
@@ -258,16 +258,8 @@ func TestJSONLRejectsCommittedCorruptionWithoutRepairingIt(t *testing.T) {
 	if err = os.WriteFile(filename, corrupt, 0600); err != nil {
 		t.Fatal(err)
 	}
-	s, err = jsonl.Open(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if _, err = readStore(ctx, s, "session"); !errors.Is(err, sessions.ErrCorrupt) {
-		t.Fatalf("read corruption: %v", err)
-	}
-	if err = appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage("one", "config")}); !errors.Is(err, sessions.ErrCorrupt) {
-		t.Fatalf("append corruption: %v", err)
+	if _, err = jsonl.Open(directory); !errors.Is(err, sessions.ErrCorrupt) {
+		t.Fatalf("open corruption: %v", err)
 	}
 	after, err := os.ReadFile(filename)
 	if err != nil {

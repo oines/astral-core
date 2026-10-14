@@ -16,7 +16,7 @@ astral-core/
 │   ├── driver.go, run.go          # Core 适配与恢复预检，无第二套循环
 │   ├── state.go, entry.go         # 精确状态、纯 Reduce 与历史记录
 │   ├── store.go, session_store.go # 新 Store 契约、确认核对、窗口缓存
-│   ├── session_history.go        # HistoryReader、SelectHead、Fork
+│   ├── session_history.go        # Rollout HistoryReader、Shared / Detached Fork
 │   ├── session_input.go          # 持久队列
 │   ├── session_approval.go       # 审批门
 │   ├── session_recovery.go       # 中断恢复和宿主效果确认
@@ -30,11 +30,11 @@ astral-core/
 │   ├── local/                    # 本地文件、管道和 PTY
 │   └── testdata/                 # Pi 参考行为样例
 ├── tests/integration/            # 从宿主公开 API 验证语义
-├── examples/                     # 四个可运行的离线示例
+├── examples/                     # 五个可运行的离线示例
 └── docs/
 ```
 
-接入从 [独立 Core 示例](../examples/basic/main.go) 和 [持久审批示例](../examples/approval/main.go) 开始。执行路径按 `run.go → generation.go / tool_execution.go → Driver` 阅读；持久路径按 `session/driver.go → session_store.go → Reduce → Store.Commit` 阅读。
+接入从 [独立 Core 示例](../examples/basic/main.go) 和 [持久审批示例](../examples/approval/main.go) 开始。执行路径按 `run.go → generation.go / tool_execution.go → Driver` 阅读；持久路径按 `session/driver.go → session_store.go → Store.Commit（分配 Sequence、Reduce、原子保存）→ Receipt → Session Reduce` 阅读。
 
 Core 的直接第三方依赖只有 JSON Schema 编译器；不导入 Session、存储、环境、Provider SDK 或标准工具。Session 通过组合 Core 加入策略，Store 实现反向依赖 session.Store 契约。
 
@@ -50,6 +50,7 @@ go run ./examples/basic
 go run ./examples/approval
 go run ./examples/environments
 go run ./examples/tools
+go run ./examples/fork
 ```
 
 集成测试不需要模型账号或网络。模型为受控实现，文件、SQLite、JSONL 和 Shell / PTY 测试使用真实资源。Go 1.23 工具链及模块首次安装需要网络；下载后测试可离线运行。Unix 外会跳过或明确拒绝本地 Shell / PTY 功能。
@@ -62,12 +63,14 @@ go run ./examples/tools
 | `crash_test.go` | SQLite / JSONL 在七个确定屏障强杀子进程；持久效果与 Hook 计数证明无重复副作用 |
 | `recovery_test.go` | 审批恢复、固定授权、未知效果、完成但缺输出、丢失确认 |
 | `state_store_test.go` | 三后端回执、分页、取消、非法批次；增量 / 全回放 / Checkpoint 一致；旧格式逐字节不变；多模态 / Reasoning / Metadata 冷重开与 Fork |
+| `rollout_test.go` / `rollout_durable_test.go` | 共享并发 Sequence、按 Session 回放、边界矩阵、工具结果、创建幂等、独立生命周期、Detached 无源恢复 |
+| `store/*/rollout_crash_test.go` | SQLite / JSONL 分页中、发布前后 SIGKILL 与清理重试 |
 | `fork_concurrent_test.go` | Parent 运行与排队期间 Fork；固定读取边界、Child 隔离、不复制操作状态；错误所有权回执不授权执行 |
 | `store/sqlite/fork_test.go` | 分页中间暂停时 Parent 仍能写；取消清理；复制中真实进程崩溃；路径查询计划无全历史扫描 |
-| `scale_test.go` | 十万 / 百万历史 Benchmark；固定有效窗口；Open 读行数、Context 保留记录数和零历史读取准备 |
+| `scale_test.go` / `cold_start_test.go` | 一万 / 十万 / 百万历史 Benchmark；固定有效窗口；新进程冷打开、Open 读行数、Context 保留记录数和零历史读取准备 |
 | `lifecycle_test.go` | Close / Cancel、创建中的环境发现、卸载与重开、并发上限、Hook 效果不可改写 |
 | `budget_compaction_test.go` | 工具输出与累计预算、完整批次摘要、裁剪副本、环境原子重申 |
-| `history_environment_test.go` | 分支配置隔离、ForkAt / Before、不完整批次、环境重新发现 |
+| `history_environment_test.go` | 分支配置隔离、包含式 Fork 边界、不完整批次、环境重新发现 |
 | `store_test.go` | 三后端隔离 / CAS / 原子性，JSONL 多句柄、未提交尾部和已提交损坏 |
 | 标准工具包测试 | Pi 样例、真实文件与图片、命令等待、PTY、原目标绑定、进程清理 |
 
@@ -76,14 +79,14 @@ go run ./examples/tools
 ## Benchmark
 
 ```sh
-go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/(Append|OpenSession|PrepareContext)$' -benchtime=20x -benchmem -count=1 -timeout=30m
-go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/Fork$' -benchtime=1x -benchmem -count=1 -timeout=30m
+go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/(Append|OpenSession|PrepareContext|Shared|MultiSessionCommit|ColdOpenSession)$' -benchtime=20x -benchmem -count=1 -timeout=30m
+go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/Detached$' -benchtime=1x -benchmem -count=1 -timeout=30m
 ```
 
-夹具通过公开 Commit 以 256 条批次写入，摘要后固定保留 16 条消息。热路径报告延迟、每操作分配、采样 Go 堆峰值、读取行数和 Context 记录数。Fork 单独测量，以免重复复制大量数据影响热路径。环境、原始输出及限制见 [Benchmark 报告](benchmarks.md)。
+夹具通过公开 Commit 以 256 条批次写入，摘要后固定保留 16 条消息。1 万 / 10 万 / 100 万历史分别测量 Shared、Detached、多 Session Commit、Append、热 / 冷 OpenSession 和 PrepareContext；报告延迟、分配、Go 堆、RSS 样本、磁盘增量、读取行数。Detached 单独测量，以免重复复制大量数据影响热路径。环境、原始输出及限制见 [Benchmark 报告](benchmarks.md)。
 
 ## 范围
 
-存储格式为 2，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约、共享历史前缀或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
+存储格式为 3，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
 
 模块地址为 `github.com/oines/astral-core`，项目自身的开源许可证尚未指定。标准工具参考来源及许可证见 [第三方声明](../THIRD_PARTY_NOTICES.md)。本地验证环境为 macOS / arm64，不能把离线协议测试视为真实 Provider 或所有平台的兼容性认证。

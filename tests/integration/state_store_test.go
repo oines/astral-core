@@ -75,7 +75,7 @@ func TestMalformedStoreEnvelopeCannotPanicOrPartiallyCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, kind := range []sessions.EntryKind{sessions.EntryInputConsumed, sessions.EntryHeadSelected, sessions.EntryToolStarted, sessions.EntryApprovalDecided, sessions.EntryCompaction} {
+		for _, kind := range []sessions.EntryKind{sessions.EntryInputConsumed, sessions.EntryToolStarted, sessions.EntryApprovalDecided, sessions.EntryCompaction} {
 			c := makeCommit(before, before.Version, []sessions.Entry{{ID: string(kind), Kind: kind}})
 			if _, err = st.Commit(ctx, "session", c); !errors.Is(err, sessions.ErrCorrupt) {
 				t.Fatalf("malformed %s: %v", kind, err)
@@ -139,8 +139,7 @@ func TestStorePaginationAndCancelledFork(t *testing.T) {
 		}
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
-		creation := makeCommit(sessions.RuntimeState{}, 0, []sessions.Entry{{ID: "child-created", Kind: sessions.EntryCreated, Created: &sessions.CreationRecord{FormatVersion: sessions.FormatVersion, SessionID: "child"}}}).Entries[0]
-		_, err = st.Fork(cancelled, sessions.ForkRequest{SourceID: "session", TargetID: "child", HeadID: parent, SourceVersion: 2, Creation: creation})
+		_, err = st.Fork(cancelled, sessions.ForkRequest{SourceID: "session", SourceRolloutID: "session", TargetID: "child", HeadID: parent, Mode: sessions.ForkDetached})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled fork: %v", err)
 		}
@@ -168,7 +167,11 @@ func (s *capturedStore) Commit(ctx context.Context, id string, c sessions.Commit
 	if err != nil {
 		return r, err
 	}
-	raw, _ := json.Marshal(c)
+	confirmed, err := c.Confirmed(r)
+	if err != nil {
+		return r, err
+	}
+	raw, _ := json.Marshal(confirmed)
 	var owned sessions.Commit
 	_ = json.Unmarshal(raw, &owned)
 	s.commits = append(s.commits, owned)
@@ -203,12 +206,9 @@ func TestIncrementalFullReplayAndCheckpointAgree(t *testing.T) {
 		if err := s.DecideApproval(context.Background(), approval, sessions.ApprovalDecision{Approved: true}); err != nil {
 			t.Fatal(err)
 		}
-		first := waitOK(t, r)
+		waitOK(t, r)
 		waitOK(t, start(t, s, "two"))
 		if _, err := s.Compact(context.Background(), "retain decisions"); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.SelectHead(context.Background(), first.LastMessageID); err != nil {
 			t.Fatal(err)
 		}
 		waitOK(t, start(t, s, "branch"))
@@ -250,17 +250,8 @@ func TestOldFormatsAreRejectedWithoutMutation(t *testing.T) {
 		if err := os.WriteFile(path, old, 0600); err != nil {
 			t.Fatal(err)
 		}
-		st, err := jsonl.Open(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer st.Close()
-		if _, err = st.LoadState(context.Background(), "session"); !errors.Is(err, sessions.ErrUnsupportedFormat) {
+		if _, err := jsonl.Open(dir); !errors.Is(err, sessions.ErrUnsupportedFormat) {
 			t.Fatalf("old format: %v", err)
-		}
-		c := makeCommit(sessions.RuntimeState{}, 0, storeHeader())
-		if _, err = st.Commit(context.Background(), "session", c); !errors.Is(err, sessions.ErrUnsupportedFormat) {
-			t.Fatalf("old write: %v", err)
 		}
 		after, _ := os.ReadFile(path)
 		if !bytes.Equal(old, after) {
@@ -333,16 +324,39 @@ func TestProtocolPayloadsSurviveColdReopenAndFork(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			child, err := s.Fork(context.Background(), s.Head(), sessions.ForkAt, sessions.SessionOptions{ID: "child"})
-			if err != nil {
-				t.Fatal(err)
+			candidates := []*sessions.Session{s}
+			for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
+				child, err := s.Fork(context.Background(), s.Head(), sessions.ForkOptions{ID: fmt.Sprintf("child-%d", mode), Mode: mode})
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidates = append(candidates, child)
 			}
-			for _, candidate := range []*sessions.Session{s, child} {
+			for _, candidate := range candidates {
 				got, err := candidate.InspectContext(context.Background())
 				if err != nil || !reflect.DeepEqual(got.Request, want.Request) {
 					t.Fatalf("payload lost after reopen/fork: %v", err)
 				}
 			}
+			if err = a.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			closeStore()
+			st, closeStore = durableStore(t, backend, dir)
+			defer closeStore()
+			c.Store = st
+			a = newAgent(t, c)
+			for _, id := range []string{"child-0", "child-1"} {
+				child, err := a.OpenSession(context.Background(), id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := child.InspectContext(context.Background())
+				if err != nil || !reflect.DeepEqual(got.Request, want.Request) {
+					t.Fatalf("cold child payload changed: %v", err)
+				}
+			}
+
 		})
 	}
 }

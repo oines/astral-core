@@ -72,7 +72,7 @@ func (s *Session) DecideApproval(ctx context.Context, id string, decision Approv
 	if s.closed {
 		return protocol.ErrClosed
 	}
-	page, err := s.agent.config.Store.Scan(ctx, s.id, Query{Kind: EntryApprovalDecided, Reference: id, Reverse: true, Limit: 1})
+	page, err := s.agent.config.Store.Scan(ctx, s.rolloutID, Query{SessionID: s.id, Kind: EntryApprovalDecided, Reference: id, Reverse: true, Limit: 1})
 	if err != nil {
 		return err
 	}

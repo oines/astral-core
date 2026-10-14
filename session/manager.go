@@ -114,7 +114,7 @@ func (a *Manager) NewSession(ctx context.Context, options SessionOptions) (*Sess
 		}
 		options.Environment = &snapshot
 	}
-	entries := []Entry{{Kind: EntryCreated, Created: &CreationRecord{FormatVersion: FormatVersion, SessionID: options.ID}}, {Kind: EntryConfiguration, Configuration: &a.defaults}}
+	entries := []Entry{{Kind: EntryCreated, Created: &CreationRecord{FormatVersion: FormatVersion, SessionID: options.ID, RolloutID: newID()}}, {Kind: EntryConfiguration, Configuration: &a.defaults}}
 	if options.Environment != nil {
 		entries = append(entries, Entry{Kind: EntryEnvironment, Environment: options.Environment})
 	}

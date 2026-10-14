@@ -73,12 +73,12 @@ Manager 缓存已打开的 Session。`Session.Close` 取消并等待自身工作
 | 分页历史 | `History().Scan`、`Get`、`Children`、`Path` |
 | 有效请求 / 精确状态 / 保留规模 | `InspectContext(ctx)` / `State()` / `Stats()` |
 | 压缩 / 配置 / 模型 | `Compact` / `Configure` / `SelectModel` |
-| 选择历史位置 | `Head()` / `SelectHead(ctx, entryID)` |
-| 独立复制历史路径 | `Fork(ctx, entryID, session.ForkAt/ForkBefore, options)` |
+| 当前执行位置 / 历史所属 Rollout | `Head()` / `RolloutID()` |
+| 从历史另起执行 | `Fork(ctx, nodeID, session.ForkOptions{ID: "child"})` |
 | 审批 | `PendingApprovals` / `DecideApproval` |
 | 确认未知工具效果 | `UnresolvedTools` / `ResolveTool` |
 
-历史接口需要 Context。默认每页 256 条、4 MiB；把 `NextCursor` 放入下一次 `Query.Cursor` 继续。`Path` 从 Head 向祖先倒序读取；没有全量 `Rollout/Entries/Tree` 或 `Branch` 同义入口。`Wait` 的 Context 只限制等待，`Start/Continue` 的 Context 控制 Run 生命周期。
+History 面向整个 Rollout，包含兄弟 Session 的历史。`Query.SessionID` 筛选写入者，`Kind` / `HistoryOnly` 筛选记录类型；恢复和待办始终按 Session 隔离。历史接口需要 Context。默认每页 256 条、4 MiB；把 `NextCursor` 放入下一次 `Query.Cursor` 继续。`Path` 从 Head 向祖先倒序读取；没有全量 `Rollout/Entries/Tree` 或 `Branch` 同义入口。`Wait` 的 Context 只限制等待，`Start/Continue` 的 Context 控制 Run 生命周期。
 
 ## 执行保证
 
@@ -102,7 +102,24 @@ Manager 缓存已打开的 Session。`Session.Close` 取消并等待自身工作
 
 Session 只保存当前 Context、精确 RuntimeState 和当前批次的工具事实，队列正文通过索引读取。模型摘要与运行 Checkpoint 分离。SQLite 普通 Commit 只处理新增批次；OpenSession 只加载当前状态、有效窗口及必要引用；请求准备使用缓存窗口。压缩提交前移读取边界并释放旧 Context。
 
-运行中的 Parent 可从已提交且协议完整的节点 Fork。复制在 Parent 锁外进行，Parent 可继续生成和提交；Child 不复制 Run、审批或队列。SQLite 分批短事务构建不可见目标后原子发布；JSONL 使用临时文件、同步和原子发布。Fork 的时间、磁盘和累计分配随复制量增长，分页缓冲有界。
+**Rollout owns history. Session owns execution.** NewSession 创建新 Rollout；Rollout 是历史的存储命名空间和未来整体删除单位。Entry 通过 ParentID 形成 Rollout 内的树，每个 Session 拥有独立 Head、Version、队列、审批和恢复状态。
+
+```go
+// 默认 Shared：同一 Rollout 中创建新的执行状态，共享已有历史。
+child, err := parent.Fork(ctx, nodeID, session.ForkOptions{ID: "edit-1"})
+// Detached：复制所选路径，建立不依赖源 Rollout 的历史与执行状态。
+copy, err := parent.Fork(ctx, nodeID, session.ForkOptions{
+    ID: "independent-1", Mode: session.ForkDetached,
+})
+```
+
+目标 ID 必填，也是创建幂等身份。边界包含 nodeID；若要排除某条消息，传入其 ParentID。同 ID、同参数重试返回已有 Child，包括已经推进的 Child；参数不同返回 ErrConflict。浏览用 History，恢复执行用 OpenSession，从历史另起执行用 Fork。
+
+运行中的 Parent 可以从较早的合法节点 Fork。Child 不继承父 Session 的授权、运行、审批或队列。完整工具批次的历史结果可继续使用，不重跑工具和 Hook，并保留终止语义；不完整批次或未解决效果在创建前拒绝。环境与 Context 预算仍需校验。
+
+Shared 仅新增 Session 和创建记录，成本取决于有效 Context 和必要索引读取。Detached 按路径复制，时间、磁盘与累计分配随复制量增长。SQLite 以分页短事务构建不可见目标，JSONL 使用临时目标；两者最终原子发布，未完成复制在核对身份后清理重试。Parent 的执行状态不受影响，Child 的版本从自身创建批次独立开始。
+
+Close 只释放执行资源，保留历史与持久状态。父子等待、取消联动、汇总、并发配额和外部资源隔离由宿主负责。本轮没有 Rollout / Session 删除 API 或 GC。
 
 Memory 与 JSONL 的历史索引保存在内存中，不提供 SQLite 的长历史内存保证。JSONL 首次打开允许全量回放，后续 Commit 只处理新增尾部。实测数据见 [长会话 Benchmark](docs/benchmarks.md)。
 
@@ -112,7 +129,7 @@ Memory 与 JSONL 的历史索引保存在内存中，不提供 SQLite 的长历�
 
 Session Request 默认字节上限为 32 MiB，独立于 Token 预算，可通过 `MaxContextBytes` 配置。Context 记录缓存允许约两倍字节预算容纳信封、引用和当前批次；这不是整个进程的内存上限。默认压缩保留约 20000 Tokens 的完整消息 / 工具批次，摘要输出最多 4096 Tokens。`Compaction.Disabled` 关闭自动压缩，手动 `Compact` 仍有效。无法满足预算时明确报错。
 
-模块要求 Go 1.23。四个示例使用确定性离线 Model，无需 API Key：
+模块要求 Go 1.23。五个示例使用确定性离线 Model，无需 API Key：
 
 ```sh
 go test -race ./...
@@ -121,11 +138,12 @@ go run ./examples/basic
 go run ./examples/approval
 go run ./examples/environments
 go run ./examples/tools
+go run ./examples/fork
 ```
 
-[basic](examples/basic/main.go) 演示独立 Core；[approval](examples/approval/main.go) 演示持久审批和 JSONL 重开；[environments](examples/environments/main.go) 演示环境切换和进程目标固定；[tools](examples/tools/main.go) 执行真实文件及 Shell 操作。后两个需要 Unix。工具集由宿主调用 `Set.Close` 清理，详见 [标准工具](docs/standardtools.md)。
+[basic](examples/basic/main.go) 演示独立 Core；[approval](examples/approval/main.go) 演示持久审批和 JSONL 重开；[environments](examples/environments/main.go) 演示环境切换和进程目标固定；[tools](examples/tools/main.go) 执行真实文件及 Shell 操作。environments 和 tools 需要 Unix。[fork](examples/fork/main.go) 演示共享历史的重新生成、独立复制及父子生命周期。工具集由宿主调用 `Set.Close` 清理，详见 [标准工具](docs/standardtools.md)。
 
-本次直接替换旧 API 和存储格式。格式版本为 2，不提供旧 API 兼容层或日志迁移；旧格式被拒绝且原文件保持不变。真实 Chat Completions / Responses 适配器、精确 Token 计数和远程 Runtime 接入留待后续。
+本次直接替换旧 API 和存储格式。格式版本为 3，不提供旧 API 兼容层或日志迁移；旧格式被拒绝且原文件保持不变。真实 Chat Completions / Responses 适配器、精确 Token 计数和远程 Runtime 接入留待后续。
 
 - [宿主和适配器契约](docs/contracts.md)
 - [代码导航与验证](docs/development.md)

@@ -1,0 +1,41 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/oines/astral-core/tests/integration
+cpu: Apple M2
+BenchmarkSQLiteLongHistory/10000/Append-8  	      20	    188721 ns/op	       204.8 db-bytes/op	         0 file-growth-B/op	         2.785 peak-heap-MiB	         1.000 rows/op	        30.03 rss-after-MiB	        30.02 rss-before-MiB	   14592 B/op	     263 allocs/op
+BenchmarkSQLiteLongHistory/10000/OpenSession-8         	      20	    329717 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         4.505 peak-heap-MiB	        20.00 rows/op	        30.25 rss-after-MiB	        30.23 rss-before-MiB	  107403 B/op	     912 allocs/op
+BenchmarkSQLiteLongHistory/10000/PrepareContext-8      	      20	    162627 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         4.037 peak-heap-MiB	         0 rows/op	        30.36 rss-after-MiB	        30.33 rss-before-MiB	   77881 B/op	     667 allocs/op
+BenchmarkSQLiteLongHistory/10000/Shared-8              	      20	    817388 ns/op	      2458 db-bytes/op	         0 file-growth-B/op	         4.755 peak-heap-MiB	        41.00 rows/op	        30.52 rss-after-MiB	        30.36 rss-before-MiB	  221575 B/op	    2101 allocs/op
+BenchmarkSQLiteLongHistory/10000/MultiSessionCommit-8  	      20	    237933 ns/op	       819.2 db-bytes/op	      5120 file-growth-B/op	         2.859 peak-heap-MiB	         1.000 rows/op	        30.53 rss-after-MiB	        30.53 rss-before-MiB	   17658 B/op	     292 allocs/op
+BenchmarkSQLiteLongHistory/10000/ColdOpenSession-8     	      20	    741035 ns/op	         0 db-bytes/op	         0 file-growth-B/op	         4.578 peak-heap-MiB	        20.00 rows/op	        30.56 rss-after-MiB	        30.53 rss-before-MiB	  131081 B/op	    1210 allocs/op
+BenchmarkSQLiteLongHistory/100000/Append-8             	      20	    354642 ns/op	       409.6 db-bytes/op	    100966 file-growth-B/op	         2.820 peak-heap-MiB	         1.000 rows/op	        31.50 rss-after-MiB	        31.50 rss-before-MiB	   14772 B/op	     270 allocs/op
+BenchmarkSQLiteLongHistory/100000/OpenSession-8        	      20	    323479 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         4.559 peak-heap-MiB	        20.00 rows/op	        31.52 rss-after-MiB	        31.52 rss-before-MiB	  107350 B/op	     912 allocs/op
+BenchmarkSQLiteLongHistory/100000/PrepareContext-8     	      20	    151102 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         3.697 peak-heap-MiB	         0 rows/op	        31.52 rss-after-MiB	        31.52 rss-before-MiB	   76987 B/op	     666 allocs/op
+BenchmarkSQLiteLongHistory/100000/Shared-8             	      20	    835192 ns/op	      2253 db-bytes/op	         0 file-growth-B/op	         4.841 peak-heap-MiB	        41.00 rows/op	        31.52 rss-after-MiB	        31.52 rss-before-MiB	  221844 B/op	    2102 allocs/op
+BenchmarkSQLiteLongHistory/100000/MultiSessionCommit-8 	      20	    270769 ns/op	      1024 db-bytes/op	      5325 file-growth-B/op	         2.937 peak-heap-MiB	         1.000 rows/op	        31.53 rss-after-MiB	        31.53 rss-before-MiB	   17806 B/op	     294 allocs/op
+BenchmarkSQLiteLongHistory/100000/ColdOpenSession-8    	      20	    768862 ns/op	         0 db-bytes/op	         0 file-growth-B/op	         4.741 peak-heap-MiB	        20.00 rows/op	        31.53 rss-after-MiB	        31.53 rss-before-MiB	  130953 B/op	    1209 allocs/op
+BenchmarkSQLiteLongHistory/1000000/Append-8            	      20	    397125 ns/op	       204.8 db-bytes/op	     96666 file-growth-B/op	         2.923 peak-heap-MiB	         1.000 rows/op	        33.47 rss-after-MiB	        33.47 rss-before-MiB	   14786 B/op	     270 allocs/op
+BenchmarkSQLiteLongHistory/1000000/OpenSession-8       	      20	    301138 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         4.325 peak-heap-MiB	        20.00 rows/op	        33.48 rss-after-MiB	        33.48 rss-before-MiB	  107124 B/op	     911 allocs/op
+BenchmarkSQLiteLongHistory/1000000/PrepareContext-8    	      20	    143231 ns/op	        19.00 context-records	         0 db-bytes/op	         0 file-growth-B/op	         3.783 peak-heap-MiB	         0 rows/op	        33.48 rss-after-MiB	        33.48 rss-before-MiB	   76219 B/op	     666 allocs/op
+BenchmarkSQLiteLongHistory/1000000/Shared-8            	      20	    861177 ns/op	      2662 db-bytes/op	         0 file-growth-B/op	         4.716 peak-heap-MiB	        41.00 rows/op	        33.50 rss-after-MiB	        33.50 rss-before-MiB	  221260 B/op	    2101 allocs/op
+BenchmarkSQLiteLongHistory/1000000/MultiSessionCommit-8         	      20	    310419 ns/op	      1024 db-bytes/op	      5530 file-growth-B/op	         3.020 peak-heap-MiB	         1.000 rows/op	        33.52 rss-after-MiB	        33.52 rss-before-MiB	   17779 B/op	     295 allocs/op
+BenchmarkSQLiteLongHistory/1000000/ColdOpenSession-8            	      20	    847350 ns/op	         0 db-bytes/op	         0 file-growth-B/op	         4.710 peak-heap-MiB	        20.00 rows/op	        33.52 rss-after-MiB	        33.52 rss-before-MiB	  130918 B/op	    1208 allocs/op
+PASS
+       59.56 real        63.64 user         6.73 sys
+            35340288  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              283360  page reclaims
+                  76  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+               51443  signals received
+               22792  voluntary context switches
+             2063185  involuntary context switches
+       1019169496782  instructions retired
+        226258574833  cycles elapsed
+            25625792  peak memory footprint

@@ -1,0 +1,26 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/oines/astral-core/tests/integration
+cpu: Apple M2
+BenchmarkSQLiteLongHistory/10000/Detached-8         	       1	 409514708 ns/op	  18677760 db-bytes/op	  18610648 file-growth-B/op	         5.577 peak-heap-MiB	     10082 rows/op	        30.28 rss-after-MiB	        29.64 rss-before-MiB	45498312 B/op	  605973 allocs/op
+BenchmarkSQLiteLongHistory/100000/Detached-8        	       1	4557793459 ns/op	 188825600 db-bytes/op	 190985032 file-growth-B/op	         5.870 peak-heap-MiB	    100433 rows/op	        32.50 rss-after-MiB	        32.34 rss-before-MiB	453152952 B/op	 6110224 allocs/op
+BenchmarkSQLiteLongHistory/1000000/Detached-8       	       1	49204755209 ns/op	1888940032 db-bytes/op	1888362688 file-growth-B/op	         6.246 peak-heap-MiB	   1003949 rows/op	        30.88 rss-after-MiB	        32.92 rss-before-MiB	4537826720 B/op	62252959 allocs/op
+PASS
+      114.90 real       113.56 user        21.25 sys
+            34799616  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              317556  page reclaims
+                  15  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+              118929  signals received
+              104856  voluntary context switches
+             7990818  involuntary context switches
+       1811737060581  instructions retired
+        428016163664  cycles elapsed
+            25822464  peak memory footprint

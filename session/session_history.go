@@ -2,21 +2,31 @@ package session
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"math"
 	"time"
 
 	protocol "github.com/oines/astral-core"
+	targetenv "github.com/oines/astral-core/environment"
 )
 
-type ForkPosition string
+type ForkMode uint8
 
 const (
-	ForkAt     ForkPosition = "at"
-	ForkBefore ForkPosition = "before"
+	ForkShared ForkMode = iota
+	ForkDetached
 )
+
+type ForkOptions struct {
+	ID          string
+	Mode        ForkMode
+	Environment *targetenv.Snapshot
+}
 
 type HistoryReader struct {
 	store     Store
-	sessionID string
+	rolloutID string
 }
 type HistoryPage struct {
 	Entries    []Entry
@@ -24,14 +34,14 @@ type HistoryPage struct {
 }
 
 func (s *Session) History() HistoryReader {
-	return HistoryReader{store: s.agent.config.Store, sessionID: s.id}
+	return HistoryReader{store: s.agent.config.Store, rolloutID: s.rolloutID}
 }
 func (h HistoryReader) Get(ctx context.Context, id string) (Entry, error) {
-	r, err := h.store.Get(ctx, h.sessionID, id)
+	r, err := h.store.Get(ctx, h.rolloutID, id)
 	return r.Entry, err
 }
 func (h HistoryReader) Scan(ctx context.Context, q Query) (HistoryPage, error) {
-	p, err := h.store.Scan(ctx, h.sessionID, q)
+	p, err := h.store.Scan(ctx, h.rolloutID, q)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -52,26 +62,20 @@ func (h HistoryReader) Children(ctx context.Context, parent string, q Query) (Hi
 	return h.Scan(ctx, q)
 }
 func (s *Session) Head() string { s.mu.Lock(); defer s.mu.Unlock(); return s.state.Branch.HeadID }
-func (s *Session) SelectHead(ctx context.Context, id string) error {
+
+// Fork creates a new execution cursor at an inclusive, committed history node.
+// The stable target ID is required for retries, including after a lost reply.
+func (s *Session) Fork(ctx context.Context, id string, options ForkOptions) (*Session, error) {
 	if err := s.agent.checkOpen(); err != nil {
-		return err
+		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return protocol.ErrClosed
+	request := ForkRequest{SourceID: s.id, SourceRolloutID: s.rolloutID, TargetID: options.ID, HeadID: id, Mode: options.Mode}
+	var err error
+	request.Environment, err = copyJSON(options.Environment)
+	if err != nil {
+		return nil, err
 	}
-	if s.busyLocked() {
-		return protocol.ErrBusy
-	}
-	if _, err := s.appendLocked(ctx, Entry{Kind: EntryHeadSelected, Head: &HeadRecord{EntryID: id}}); err != nil {
-		return err
-	}
-	s.needsEnvironment = s.state.Branch.EnvironmentID != ""
-	return nil
-}
-func (s *Session) Fork(ctx context.Context, id string, position ForkPosition, options SessionOptions) (*Session, error) {
-	if err := s.agent.checkOpen(); err != nil {
+	if err = ValidateFork(request); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -79,54 +83,75 @@ func (s *Session) Fork(ctx context.Context, id string, position ForkPosition, op
 		s.mu.Unlock()
 		return nil, protocol.ErrClosed
 	}
-	version := s.state.Version
-	running := s.running
 	s.operations.Add(1)
 	s.mu.Unlock()
 	defer s.operations.Done()
 	forkCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(s.lifetime, cancel)
 	defer func() { stop(); cancel() }()
-	record, err := s.agent.config.Store.Get(forkCtx, s.id, id)
+	// Check an existing creation before reading the source or allocating data.
+	if receipt, lookupErr := s.agent.config.Store.LookupCommit(forkCtx, options.ID, ForkCommitID); lookupErr == nil {
+		digest, digestErr := request.Digest()
+		if digestErr != nil {
+			return nil, digestErr
+		}
+		if receipt.Digest != digest {
+			return nil, ErrConflict
+		}
+		return s.agent.OpenSession(forkCtx, options.ID)
+	} else if !errors.Is(lookupErr, ErrNotFound) {
+		return nil, lookupErr
+	}
+	record, err := s.agent.config.Store.Get(forkCtx, s.rolloutID, id)
 	if err != nil {
 		return nil, err
 	}
-	if record.Projection == nil || record.Entry.Version > version {
-		return nil, ErrNotFound
-	}
-	head := id
-	switch position {
-	case ForkAt:
-	case ForkBefore:
-		if record.Entry.Kind != EntryMessage || record.Entry.Message.Role != protocol.RoleUser {
-			return nil, fmtInvalid("ForkBefore requires a user entry")
-		}
-		head = record.Entry.ParentID
-		record, err = s.agent.config.Store.Get(forkCtx, s.id, head)
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return nil, fmtInvalid("unknown fork position")
-	}
-	if running && !record.Projection.Complete() {
-		return nil, protocol.ErrIncompleteBatch
-	}
-	if options.ID == "" {
-		options.ID = newID()
-	}
-	created := Entry{ID: newID(), Sequence: 1, Version: 1, Time: time.Now().UTC(), Kind: EntryCreated, Created: &CreationRecord{FormatVersion: FormatVersion, SessionID: options.ID, ForkSessionID: s.id, ForkEntryID: id}}
-	request := ForkRequest{SourceID: s.id, TargetID: options.ID, HeadID: head, SourceVersion: version, Creation: created, AllowIncomplete: !running}
-	if options.Environment != nil {
-		snapshot, err := copyJSON(options.Environment)
-		if err != nil {
-			return nil, err
-		}
-		request.Environment = &Entry{ID: newID(), ParentID: head, Sequence: record.Entry.Sequence + 1, Version: 2, Time: time.Now().UTC(), Kind: EntryEnvironment, Environment: snapshot}
-	}
-	state, err := s.agent.config.Store.Fork(forkCtx, request)
+	seed, err := ForkState(request, record)
 	if err != nil {
 		return nil, err
+	}
+	// Admission is bounded by effective context, before any target is published.
+	seed.RolloutID = s.rolloutID
+	window, err := s.loadWindow(forkCtx, seed)
+	if err != nil {
+		return nil, err
+	}
+	if request.Environment != nil {
+		// The Store will assign the actual sequence; reserve its maximum width for
+		// admission so an explicit environment cannot publish an oversized child.
+		draft := Entry{ID: newID(), SessionID: request.TargetID, Sequence: math.MaxInt64, Version: 1, ParentID: id, Time: time.Now().UTC(), Kind: EntryEnvironment, Environment: request.Environment}
+		encoded, err := json.Marshal(draft)
+		if err != nil {
+			return nil, err
+		}
+		size := len(encoded) + 16 // reserve timestamp fractional-width differences
+		for _, entry := range window {
+			raw, err := json.Marshal(entry)
+			if err != nil {
+				return nil, err
+			}
+			size += len(raw)
+		}
+		if size > 2*s.agent.config.MaxContextBytes {
+			return nil, &BudgetError{Input: size, Window: 2 * s.agent.config.MaxContextBytes}
+		}
+	}
+	state, forkErr := s.agent.config.Store.Fork(forkCtx, request)
+	if forkErr != nil {
+		check, done := persistContext(forkCtx)
+		receipt, lookupErr := s.agent.config.Store.LookupCommit(check, options.ID, ForkCommitID)
+		if lookupErr == nil {
+			digest, digestErr := request.Digest()
+			if digestErr != nil || receipt.Digest != digest {
+				done()
+				return nil, ErrConflict
+			}
+			state, lookupErr = s.agent.config.Store.LoadState(check, options.ID)
+		}
+		done()
+		if lookupErr != nil {
+			return nil, forkErr
+		}
 	}
 	return s.agent.adopt(forkCtx, options.ID, state, options.Environment == nil && state.Branch.EnvironmentID != "")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -19,8 +20,6 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 		return nil, err
 	}
 	head := s.state.Branch.HeadID
-	sequence := s.state.Sequence
-	var selection *Projection
 	for i := range entries {
 		e := &entries[i]
 		if e.ID == "" {
@@ -29,8 +28,8 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 		if e.Time.IsZero() {
 			e.Time = time.Now().UTC()
 		}
-		sequence++
-		e.Sequence = sequence
+		e.Sequence = 0
+		e.SessionID = s.id
 		e.Version = s.state.Version + 1
 		if e.IsHistory() {
 			e.ParentID = head
@@ -38,30 +37,9 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 		} else {
 			e.ParentID = ""
 		}
-		if e.Kind == EntryHeadSelected {
-			r, err := s.agent.config.Store.Get(ctx, s.id, e.Head.EntryID)
-			if err != nil {
-				return nil, err
-			}
-			if r.Projection == nil {
-				return nil, ErrNotFound
-			}
-			selection = r.Projection
-			head = e.Head.EntryID
-		}
 	}
-	commit := Commit{ID: newID(), ExpectedVersion: s.state.Version, Entries: entries, Selection: selection}
-	next, _, err := Reduce(s.state, commit)
-	if err != nil {
-		return nil, err
-	}
-	var selectedWindow []Entry
-	if selection != nil {
-		selectedWindow, err = s.loadWindow(ctx, next)
-		if err != nil {
-			return nil, err
-		}
-	}
+	commit := Commit{ID: newID(), ExpectedVersion: s.state.Version, Entries: entries}
+
 	// Context memory is independent of archived history. Reject oversized new
 	// messages before model-declared tools can execute; bounded result admission
 	// handles delivery after an actual tool execution separately.
@@ -69,12 +47,13 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 	compacting := false
 	for _, e := range entries {
 		if e.IsHistory() {
+			e.Sequence = math.MaxInt64 // conservative size before the Store assigns order
 			b, _ := json.Marshal(e)
 			added += len(b)
 		}
 		compacting = compacting || e.Kind == EntryCompaction
 	}
-	if !compacting && selection == nil && s.windowBytes+added > 2*s.agent.config.MaxContextBytes {
+	if !compacting && s.windowBytes+added > 2*s.agent.config.MaxContextBytes {
 		return nil, &BudgetError{Input: s.windowBytes + added, Window: 2 * s.agent.config.MaxContextBytes}
 	}
 	digest, err := commit.Digest()
@@ -90,27 +69,36 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 			return nil, commitErr
 		}
 	}
-	if receipt.CommitID != commit.ID || receipt.Digest != digest || receipt.Version != next.Version {
+	if receipt.CommitID != commit.ID || receipt.Digest != digest || receipt.Version != s.state.Version+1 {
 		return nil, fmt.Errorf("%w: commit receipt mismatch", ErrCorrupt)
 	}
-	if receipt.CurrentVersion != next.Version {
+	if receipt.CurrentVersion != s.state.Version+1 {
 		return nil, fmt.Errorf("%w: another owner advanced this session", ErrConflict)
 	}
-	s.state = next
-	if selection != nil {
-		s.setWindow(selectedWindow)
-	} else {
-		for _, e := range entries {
-			if e.IsHistory() {
-				s.windowIndex[e.ID] = len(s.window)
-				s.window = append(s.window, e)
-			}
-		}
-		if compacting {
-			s.pruneWindow()
-		}
-		s.measureWindow(added, compacting)
+	confirmed, err := commit.Confirmed(receipt)
+	if err != nil {
+		return nil, err
 	}
+	next, _, err := Reduce(s.state, confirmed)
+	if err != nil {
+		return nil, err
+	}
+	entries = confirmed.Entries
+	s.state = next
+	if s.rolloutID == "" {
+		s.rolloutID = next.RolloutID
+	}
+	for _, e := range entries {
+		if e.IsHistory() {
+			s.windowIndex[e.ID] = len(s.window)
+			s.window = append(s.window, e)
+		}
+	}
+	if compacting {
+		s.pruneWindow()
+	}
+	// Store-assigned sequence digits change serialized sizes.
+	s.measureWindow(0, true)
 	close(s.changed)
 	s.changed = make(chan struct{})
 	for _, e := range entries {
@@ -153,6 +141,9 @@ func (s *Session) pruneWindow() {
 	}
 	keep := map[string]bool{p.ConfigurationID: true, p.EnvironmentID: true, p.CompactionID: true, p.ThroughID: true, p.LastMessageID: true, p.BatchConfigurationID: true}
 	out := make([]Entry, 0, len(s.window)-through+len(keep))
+	for _, id := range p.Results {
+		keep[id] = true
+	}
 	for i, e := range s.window {
 		if i > through || keep[e.ID] {
 			out = append(out, e)
@@ -170,7 +161,7 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 	size := 0
 	cursor := ""
 	for {
-		page, err := s.agent.config.Store.Scan(ctx, s.id, Query{PathHead: p.HeadID, StopID: p.ThroughID, Cursor: cursor, Limit: DefaultPageSize, MaxBytes: 2 * s.agent.config.MaxContextBytes})
+		page, err := s.agent.config.Store.Scan(ctx, state.RolloutID, Query{PathHead: p.HeadID, StopID: p.ThroughID, Cursor: cursor, Limit: DefaultPageSize, MaxBytes: 2 * s.agent.config.MaxContextBytes})
 		if err != nil {
 			return nil, err
 		}
@@ -188,11 +179,15 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 		}
 		cursor = page.Next
 	}
-	for _, id := range []string{p.ConfigurationID, p.EnvironmentID, p.CompactionID, p.ThroughID, p.LastMessageID, p.BatchConfigurationID} {
+	references := []string{p.ConfigurationID, p.EnvironmentID, p.CompactionID, p.ThroughID, p.LastMessageID, p.BatchConfigurationID}
+	for _, id := range p.Results {
+		references = append(references, id)
+	}
+	for _, id := range references {
 		if id == "" || seen[id] {
 			continue
 		}
-		r, err := s.agent.config.Store.Get(ctx, s.id, id)
+		r, err := s.agent.config.Store.Get(ctx, state.RolloutID, id)
 		if err != nil {
 			return nil, err
 		}

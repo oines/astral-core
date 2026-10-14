@@ -66,9 +66,11 @@ func TestCloseCancelsEnvironmentDiscoveryBeforeRunStarts(t *testing.T) {
 	}
 	a := newAgent(t, c)
 	s := newSession(t, a, sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "old"}})
-	if err := s.SelectHead(context.Background(), s.Head()); err != nil {
+	child, err := s.Fork(context.Background(), s.Head(), sessions.ForkOptions{ID: "discovery-child"})
+	if err != nil {
 		t.Fatal(err)
 	}
+	s = child
 	finished := make(chan error, 1)
 	go func() { _, err := s.Start(context.Background(), astral.User("hello")); finished <- err }()
 	signal(t, entered)

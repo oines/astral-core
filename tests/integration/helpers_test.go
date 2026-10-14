@@ -225,7 +225,7 @@ func readStore(ctx context.Context, store sessions.Store, id string) (historySna
 	out := historySnapshot{Version: state.Version}
 	cursor := ""
 	for {
-		page, err := store.Scan(ctx, id, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
+		page, err := store.Scan(ctx, state.RolloutID, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
 		if err != nil {
 			return out, err
 		}
@@ -244,7 +244,11 @@ var fixtureCommitID atomic.Uint64
 func makeCommit(state sessions.RuntimeState, version uint64, entries []sessions.Entry) sessions.Commit {
 	batch := append([]sessions.Entry(nil), entries...)
 	for i := range batch {
-		batch[i].Sequence = state.Sequence + uint64(i) + 1
+		batch[i].Sequence = 0
+		batch[i].SessionID = state.SessionID
+		if batch[i].SessionID == "" {
+			batch[i].SessionID = entries[0].Created.SessionID
+		}
 		batch[i].Version = version + 1
 		if batch[i].Time.IsZero() {
 			batch[i].Time = time.Now().UTC()
@@ -258,15 +262,6 @@ func appendStore(ctx context.Context, store sessions.Store, id string, version u
 		return err
 	}
 	commit := makeCommit(state, version, entries)
-	for _, e := range entries {
-		if e.Head != nil {
-			r, err := store.Get(ctx, id, e.Head.EntryID)
-			if err != nil {
-				return err
-			}
-			commit.Selection = r.Projection
-		}
-	}
 	_, err = store.Commit(ctx, id, commit)
 	return err
 }
