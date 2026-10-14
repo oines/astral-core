@@ -117,7 +117,7 @@ SDK 保存协议数据，不包含真实 Chat Completions / Responses 转换器�
 
 prepared 固定 Invocation 与目标；authorized 固定 Hook 决定；started 在派发前确认。completed 保存 Outcome、Artifact 和上下文变更等执行事实，不存储未处理的大输出。无效参数、Skip、Block 可直接产生 not_executed 结果。
 
-Core Invocation 只包含执行标识、参数及不可变 opaque Binding。TargetedTool 可在审批前固定目标。可选 environment 包负责解释 Binding，Core 不依赖该类型。工具产生的 Context 更新是不可被结果 Hook 改写的执行事实；需要声明 Sequential。
+Core Invocation 只包含执行标识、参数及不可变 opaque Binding。TargetedTool 可在审批前固定目标。Binding 的结构、目标解析与授权属于宿主；Core 和 environment 包均不解释其内部结构。工具产生的 Context 更新是不可被结果 Hook 改写的执行事实；需要声明 Sequential。
 
 并行批次受 MaxParallelTools 限制。任一工具声明 Sequential，则整批按调用顺序执行。结果可乱序完成，但下一次 Request 按原 ToolCalls 顺序形成完整批次。工具与 Hook 必须支持并发，返回后不得继续调用 emit。
 
@@ -153,11 +153,26 @@ Subscribe 为尽力投递，缓冲溢出关闭订阅并返回 ErrSlowSubscriber�
 
 ## 环境、历史位置与 Fork
 
-Environment 可选。environment.Snapshot 描述宿主确认的 Runtime / Computer / Workspace、OS、Shell、cwd、能力、资源和 opaque Metadata。环境条目按发生位置进入 Context，不改写 System Prompt。环境切换工具的结果节点本身也保存了快照效果：若 Fork 恰好选在结果节点、尚未包含同批后续环境节点，Projection 会引用结果内的快照，继续执行前仍需宿主重新确认。
+Environment 可选，快照只保存宿主提供的两个值：
 
-标准工具通过 environment.Decode 解释 opaque Binding。已有进程保存原始 Binding；切换当前 Runtime 或 Workspace 不会改变进程目标。审批看到的目标与执行时验证的目标必须一致。
+```go
+type Snapshot struct {
+    Binding json.RawMessage `json:"binding,omitempty"`
+    Context string          `json:"context,omitempty"`
+}
+```
 
-重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。没有环境的纯聊天 / 业务 API Session 不要求环境发现。
+Binding 可以是任意有效 JSON，包括对象、数组、字符串、数字、布尔和 null；nil 或零长度 Binding 表示未提供，与 JSON null 不同。它直接作为 Invocation.Binding 的隔离副本传递，不附加 Snapshot 或 SDK 目标字段。SDK 不解释其身份、路径或权限。快照、历史读取、InspectContext、Provider 的 Request.Previous 和工具回调的可变字节均与内部状态隔离。`InspectContext.Binding` 是 json.RawMessage，SnapshotID 取自保存有效快照的 Rollout Entry ID，宿主无需分配。
+
+Context 是模型可见的宿主文本。环境条目按发生位置投影为 RoleContext / ContextKind=environment，正文精确使用 Snapshot.Context；普通生成和摘要都不自动序列化 Binding。System Prompt 不受环境影响。环境发现、设备列表、Shell、Workspace、Skills Index 以及 AGENTS.md / SOUL.md / SKILL.md 的读取和组织均属于上层产品；引用文件正文是来源材料，不提升为 System 指令。
+
+NewSession 可以接收初始快照，或调用宿主 Provider，第一轮请求即可看到 Context。RefreshEnvironment 只允许空闲且未关闭的 Session，保留原有维护和预算限制。普通 Sequential Tool 可以通过 ToolResult.Context 提交 `json.Marshal(snapshot)`；SDK 将结果与环境节点原子持久化。失败的宿主解析不得返回环境更新；结果 Hook 无权改写已发生的环境效果。
+
+环境切换工具的结果节点本身也保存快照效果：若 Fork 恰好选在结果节点、尚未包含同批后续环境节点，Projection 会引用结果内的快照并投影其 Context；包含后续环境节点时不重复投影。继续执行前仍需宿主重新确认。Compaction 原子重申最新完整快照，执行 Binding 和模型 Context 分开保留。
+
+标准工具只检查 Binding 的 JSON 有效性，将目标解析与授权交给 Backend。已有进程保存原始 Binding；切换当前快照不会改变进程目标。write_stdin 在审批前恢复原始绑定，执行前再次验证所有权和绑定。审批看到的目标与执行时验证的目标必须一致。工具 Schema 固定注册，环境变化不改变工具声明。
+
+重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。Provider 只是宿主回调，SDK 不自行发现环境。没有环境的纯聊天 / 业务 API Session 不要求环境发现。本轮直接调整未发布的 V3 环境契约，不提供旧环境类型或绑定信封的兼容层，不改变 Store 格式版本及 Rollout 协议。
 
 ```go
 type ForkMode uint8

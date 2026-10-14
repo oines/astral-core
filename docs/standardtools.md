@@ -5,7 +5,7 @@
 ```go
 backend, err := local.New(local.Options{
     CWD: preparedWorkspace,
-    RuntimeID: "local", // 默认值；有环境快照时须与 Binding 匹配
+    Shell: "/bin/sh",
 })
 if err != nil { return err }
 set, err := standardtools.New(backend)
@@ -40,7 +40,7 @@ config.Tools = set.Tools()
 - 不提供 Pi 的 `bash`；该位置由命令会话工具替代。没有在模型 schema 中加入 Codex 特定的 `sandbox_permissions` 等宿主策略字段。
 - `edit` 发布当前数组 schema，不接受 Pi 为旧客户端提供的单组 `oldText/newText` 兼容输入。工具定义版本为 `2`；持久 Session 使用的声明必须与宿主实现匹配。当前存储格式不支持旧日志自动迁移。
 - 匹配与修改行为有参考样例验证；Go diff 库可能为重复行选择不同但等价的 diff。Go 图片编码器的字节和压缩质量也不会与 Pi 完全相同。
-- 本地 Shell / PTY 后端目前支持 Unix。非 Unix 调用明确报错；可接入原生或远程 Backend。Windows 目标的命令等待下限仍按其环境快照处理。
+- 本地 Shell / PTY 后端目前支持 Unix。非 Unix 调用明确报错；可接入原生或远程 Backend。标准工具不读取环境中的平台字段，平台要求由宿主 Backend 处理。
 
 ## 文件工具
 
@@ -56,7 +56,7 @@ config.Tools = set.Tools()
 
 `edit` 先验证整组修改，再调用一次 `WriteFile`。所有 `oldText` 都针对原文件，不能依赖同批前一条修改的结果。缺失、歧义、重叠、空 oldText 或整体没有变化都会报错。先精确匹配，再按 Pi 规则处理 NFKC、行末空白、智能引号、横线和特殊空格。模糊匹配只改变涉及的行，其他行保留原字节；BOM 和原始 CRLF 格式恢复后写入。
 
-`write/edit` 通过 `ResolvedPath.Key` 共享进程内变更队列，不强制所有文件工具串行。这个队列不锁住外部编辑器，也不是跨进程文件锁。批次内存在 `switch_environment` 时，Core 仍让整批顺序执行。
+`write/edit` 通过 `ResolvedPath.Key` 共享进程内变更队列，不强制所有文件工具串行。这个队列不锁住外部编辑器，也不是跨进程文件锁。宿主的环境切换工具应声明 Sequential，Core 会让其所在批次顺序执行。
 
 本地路径支持相对 / 绝对路径、`~`、`@file`、`file://`、粘贴的特殊空格，以及截图文件名的 AM/PM、NFD 和弯引号变体。符号链接别名共享队列。写入遵循 Pi 的原地覆盖，跟随符号链接并保留已有权限；不是文件系统事务。所有匹配成功才开始写入，实际 IO 失败仍可能产生部分变更，此时返回未知效果。
 
@@ -72,11 +72,11 @@ config.Tools = set.Tools()
 
 | 参数或限制 | 行为 |
 | --- | --- |
-| `shell` | 优先显式参数，否则使用冻结环境或后端默认 Shell |
+| `shell` | 优先显式参数，否则使用宿主 Backend 为固定 Binding 解析的 Shell |
 | `login` | 默认 true；Unix Shell 使用 `-lc`，false 使用 `-c` |
 | `tty` | 默认 false，使用合并 stdout/stderr 的管道且关闭 stdin；true 分配 PTY |
-| `workdir` | 默认冻结环境的 cwd；相对路径相对该 cwd 解析 |
-| exec 等待 | 默认 10000ms，约束到 250–30000ms；Windows 环境最低 10000ms |
+| `workdir` | 默认 Backend 为固定 Binding 解析的 cwd；相对路径相对该 cwd 解析 |
+| exec 等待 | 默认 10000ms，约束到 250–30000ms |
 | 非空 stdin 等待 | 默认 250ms，约束到 250–30000ms |
 | 空 stdin 轮询 | 最低 5000ms，默认最大 300000ms，可用 `MaxPollWait` 调整 |
 | `max_output_tokens` | 默认 10000，并受 Set 上限约束；显式 0 不返回输出正文 |
@@ -97,7 +97,7 @@ config.Tools = set.Tools()
 
 ## 生命周期与环境绑定
 
-一个 `Set` 可以跨多个 Run、独立 Agent 和持久 Session 复用，每个终端会话有自己的执行所有者。Invocation.Binding 是 opaque JSON；标准工具通过可选 `environment` 包解释其 Binding 和 Snapshot。`write_stdin` 在审批之前找到原始绑定，执行之前再次验证。切换当前 Runtime 或 Workspace 不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
+一个 `Set` 可以跨多个 Run、独立 Agent 和持久 Session 复用，每个终端会话有自己的执行所有者。Invocation.Binding 是宿主定义的 opaque JSON；标准工具只检查 JSON 有效性，将解析和授权交给 Backend。`write_stdin` 在审批之前找到原始绑定，执行之前再次验证。切换当前环境不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
 
 命令不会随着一次工具调用的 Context 结束而被自动杀死。取消等待会返回已经收集的输出和已知的活跃 ID；后续可继续读取。取消一个正在阻塞的 PTY 写入可能已提交部分输入，本地后端会终止该进程并报告未知效果，避免返回后继续暗中写入。
 
@@ -105,7 +105,7 @@ config.Tools = set.Tools()
 
 宿主停止 Agent 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Agent.Close` 不替宿主关闭 Set 或 Backend。本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。
 
-[environments 示例](../examples/environments/main.go) 使用同机上的两个已准备目录模拟两个 Runtime，演示真实 PTY 在环境切换后仍归属原始目标。
+[environments 示例](../examples/environments/main.go) 使用宿主自定义 Binding 和同机上的两个目录模拟两个目标，演示切换后新命令使用新目标，真实 PTY 仍归属原始目标。环境切换是示例中普通的宿主 Sequential Tool，选择 Schema、发现及授权均由示例宿主实现；SDK 不提供 SwitchEnvironment 或设备选择接口。
 
 ## 接入其他 Runtime
 
@@ -120,4 +120,6 @@ StartProcess(ctx, invocation, request) (Process, error)
 
 `Process` 提供合并输出流、一次 Wait、Write、Interrupt 和 Terminate。返回成功后的进程必须独立于启动 Context 生存。非零退出码不是 Go error；无法确认退出状态才是 error。Terminate 必须停止它拥有的进程树并使 Output / Wait 结束，且遵守传入 Context。Set 管理数字 ID、所有权、输出缓冲和轮询，不要求远程后端重新实现整套工具逻辑。
 
-本地 Backend 在创建时固定默认 cwd、Shell 和环境变量；Pinned Environment 可以提供当次 cwd / Shell。外来的 Runtime / Computer 标识必须与创建选项一致，否则拒绝，不能默默回退到本机。授权、路径访问边界、环境发现和 Workspace 准备仍由宿主决定。
+本地 Backend 在创建时固定默认 cwd、Shell 和环境变量。未配置解析回调时，仅空 Binding 可以使用这些默认值，任何非空 Binding（包括 JSON null）都会在 IO 前被拒绝。
+
+宿主可以提供 `local.Options.ResolveBinding`，签名为 `func(context.Context, astral.Invocation) (cwd, shell string, err error)`。该回调接收隔离复制的 Binding，负责解析、授权，并返回完整的执行设置：cwd 必须为已存在的绝对目录，Shell 必须非空。返回错误、缺少字段或目录无效都会拒绝，绝不回退到默认目录和 Shell。显式命令参数的 workdir / shell 保留现有语义，权限及访问边界由宿主检查。Backend 不解释目标身份、发现设备或解析环境描述。

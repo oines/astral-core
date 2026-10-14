@@ -13,7 +13,6 @@ import (
 	astral "github.com/oines/astral-core"
 	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
-	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -147,12 +146,12 @@ func TestEnvironmentSnapshotsRemainInPositionAndHostMutationsAreIsolated(t *test
 	})
 	c := testConfig(m, memory.New())
 	c.SystemPrompt = "stable harness rules"
-	snapshot := environments.Snapshot{RuntimeID: "local", WorkspaceID: "one", CWD: "/one", Skills: []environments.Resource{{Name: "original"}}, Metadata: json.RawMessage(`{"version":1}`)}
+	snapshot := hostSnapshot("local", "one")
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &snapshot})
-	snapshot.Skills[0].Name = "changed"
-	snapshot.Metadata[11] = '9'
+	snapshot.Context = "changed"
+	snapshot.Binding[11] = 'X'
 	waitOK(t, start(t, s, "first"))
-	if err := s.RefreshEnvironment(context.Background(), environments.Snapshot{RuntimeID: "remote", WorkspaceID: "two", CWD: "/two"}); err != nil {
+	if err := s.RefreshEnvironment(context.Background(), hostSnapshot("remote", "two")); err != nil {
 		t.Fatal(err)
 	}
 	waitOK(t, start(t, s, "second"))
@@ -163,39 +162,41 @@ func TestEnvironmentSnapshotsRemainInPositionAndHostMutationsAreIsolated(t *test
 	if requests[0].SystemPrompt != requests[1].SystemPrompt {
 		t.Fatal("environment mutated system prompt")
 	}
-	var snapshots []environments.Snapshot
+	var contexts []string
 	for _, message := range requests[1].Messages {
 		if message.ContextKind == "environment" {
-			var e environments.Snapshot
-			if err := json.Unmarshal([]byte(message.Content[0].Text), &e); err != nil {
-				t.Fatal(err)
-			}
-			snapshots = append(snapshots, e)
+			contexts = append(contexts, message.Content[0].Text)
 		}
 	}
-	if len(snapshots) != 2 || snapshots[0].Skills[0].Name != "original" || snapshots[1].WorkspaceID != "two" {
-		t.Fatalf("snapshot history: %+v", snapshots)
+	if !reflect.DeepEqual(contexts, []string{hostSnapshot("local", "one").Context, hostSnapshot("remote", "two").Context}) {
+		t.Fatalf("context history: %+v", contexts)
+	}
+	for _, e := range entries(s) {
+		if e.Environment != nil && bindingOf(e.Environment.Binding).Target == "local" && e.Environment.Context != hostSnapshot("local", "one").Context {
+			t.Fatal("host mutation changed persistent context")
+		}
 	}
 }
 
 func TestEnvironmentSwitchIsBatchBarrierAndBindsEachCall(t *testing.T) {
 	var mu sync.Mutex
-	var bindings []environments.Binding
+	var bindings []hostBinding
 	inspect := tool("inspect", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
 		mu.Lock()
 		bindings = append(bindings, bindingOf(inv.Binding))
 		mu.Unlock()
-		return astral.ToolResult{Content: astral.Text(bindingOf(inv.Binding).RuntimeID + "/" + bindingOf(inv.Binding).WorkspaceID)}, nil
+		return astral.ToolResult{Content: astral.Text(bindingOf(inv.Binding).Target + "/" + bindingOf(inv.Binding).Location)}, nil
 	})
-	switcher := standardtools.SwitchEnvironment(func(_ context.Context, inv astral.Invocation, selection standardtools.EnvironmentSelection) (environments.Snapshot, error) {
-		if bindingOf(inv.Binding).RuntimeID != "local" {
+	switcher := switchEnvironment(func(_ context.Context, inv astral.Invocation) (environments.Snapshot, error) {
+		if bindingOf(inv.Binding).Target != "local" {
 			return environments.Snapshot{}, errors.New("switch started in wrong environment")
 		}
-		return environments.Snapshot{RuntimeID: selection.Runtime, WorkspaceID: selection.Workspace, CWD: "/remote/project"}, nil
+		selection := bindingOf(inv.Call.Arguments)
+		return hostSnapshot(selection.Target, selection.Location), nil
 	})
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
-			return calls(call("before", "inspect", `{"value":"x"}`), call("switch", "switch_environment", `{"runtime":"ssh","workspace":"project-b"}`), call("after", "inspect", `{"value":"y"}`)), nil
+			return calls(call("before", "inspect", `{"value":"x"}`), call("switch", "switch_environment", `{"target":"ssh","location":"project-b"}`), call("after", "inspect", `{"value":"y"}`)), nil
 		}
 		results := texts(r.Messages, astral.RoleTool)
 		if len(results) != 3 || results[0] != "local/project-a" || results[2] != "ssh/project-b" {
@@ -205,16 +206,17 @@ func TestEnvironmentSwitchIsBatchBarrierAndBindsEachCall(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{inspect, switcher}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "local", WorkspaceID: "project-a"}})
+	initial := hostSnapshot("local", "project-a")
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &initial})
 	waitOK(t, start(t, s, "go"))
-	if len(bindings) != 2 || bindings[0].SnapshotID == bindings[1].SnapshotID {
+	if !reflect.DeepEqual(bindings, []hostBinding{{Target: "local", Location: "project-a"}, {Target: "ssh", Location: "project-b"}}) {
 		t.Fatal("dispatch bindings not pinned")
 	}
 	view, err := s.InspectContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Environment.RuntimeID != "ssh" {
+	if bindingOf(view.Binding).Target != "ssh" || view.SnapshotID == "" {
 		t.Fatal("new environment missing")
 	}
 }
@@ -226,7 +228,8 @@ func TestReopenAndBranchRequireEnvironmentRediscovery(t *testing.T) {
 	})
 	c := testConfig(m, store)
 	a := newAgent(t, c)
-	s := newSession(t, a, sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "old", WorkspaceID: "project"}})
+	initial := hostSnapshot("old", "project")
+	s := newSession(t, a, sessions.SessionOptions{Environment: &initial})
 	first := waitOK(t, start(t, s, "one"))
 	if err := a.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -239,7 +242,7 @@ func TestReopenAndBranchRequireEnvironmentRediscovery(t *testing.T) {
 	if _, err = opened.Start(context.Background(), astral.User("two")); !errors.Is(err, sessions.ErrEnvironmentRefresh) {
 		t.Fatalf("stale environment accepted: %v", err)
 	}
-	if err = opened.RefreshEnvironment(context.Background(), environments.Snapshot{RuntimeID: "fresh", WorkspaceID: "project"}); err != nil {
+	if err = opened.RefreshEnvironment(context.Background(), hostSnapshot("fresh", "project")); err != nil {
 		t.Fatal(err)
 	}
 	waitOK(t, start(t, opened, "two"))
@@ -256,7 +259,7 @@ func TestReopenAndBranchRequireEnvironmentRediscovery(t *testing.T) {
 	var refreshes atomic.Int32
 	c.Environment = func(_ context.Context, r environments.Request) (environments.Snapshot, error) {
 		refreshes.Add(1)
-		return environments.Snapshot{RuntimeID: "host-confirmed", WorkspaceID: "project"}, nil
+		return hostSnapshot("host-confirmed", "project"), nil
 	}
 	opened, err = newAgent(t, c).OpenSession(context.Background(), s.ID())
 	if err != nil {

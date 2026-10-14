@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,12 +30,69 @@ func closeStandard(t *testing.T, set *standardtools.Set) {
 	})
 }
 
+func TestEmptyBindingUsesLocalDefaults(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("optional local process backend requires Unix")
+	}
+	for _, mode := range []string{"core", "session", "context-only-session"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			backend, err := local.New(local.Options{CWD: dir, Shell: "/bin/sh"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			set, err := standardtools.New(backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeStandard(t, set)
+			m := model(func(_ context.Context, n int, request astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+				if n == 1 {
+					return calls(call("pwd", "exec_command", `{"cmd":"pwd","login":false}`)), nil
+				}
+				for _, message := range request.Messages {
+					if message.Role == astral.RoleTool && (message.IsError || !strings.Contains(message.Content[0].Text, dir)) {
+						return astral.Reply{}, errors.New("empty binding did not use configured local defaults")
+					}
+				}
+				return answer("done"), nil
+			})
+			var run *astral.Run
+			if mode == "core" {
+				a, err := astral.New(astral.Config{Model: m, Tools: set.Tools()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer a.Close(context.Background())
+				run, err = a.Start(context.Background(), astral.User("pwd"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				c := testConfig(m, memory.New())
+				c.Tools = set.Tools()
+				options := sessions.SessionOptions{}
+				if mode == "context-only-session" {
+					options.Environment = &environments.Snapshot{Context: "Host context without an execution binding."}
+				}
+				run = start(t, newSession(t, newAgent(t, c), options), "pwd")
+			}
+			waitOK(t, run)
+		})
+	}
+}
+
 func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("optional local process backend requires Unix")
 	}
 	dir := t.TempDir()
-	backend, err := local.New(local.Options{CWD: dir, Shell: "/bin/sh", RuntimeID: "runtime-one"})
+	backend, err := local.New(local.Options{CWD: dir, Shell: "/bin/sh", ResolveBinding: func(_ context.Context, inv astral.Invocation) (string, string, error) {
+		if bindingOf(inv.Binding).Target != "target-one" {
+			return "", "", errors.New("target not authorized")
+		}
+		return dir, "/bin/sh", nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,8 +101,8 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeStandard(t, set)
-	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(context.Context, astral.Invocation, standardtools.EnvironmentSelection) (environments.Snapshot, error) {
-		return environments.Snapshot{RuntimeID: "runtime-two", WorkspaceID: "workspace-two", CWD: "/two"}, nil
+	tools := append(set.Tools(), switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
+		return hostSnapshot("target-two", "location-two"), nil
 	}))
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		switch n {
@@ -59,7 +117,7 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 					}
 					id, _ := strconv.Atoi(match[1])
 					args, _ := json.Marshal(standardtools.StdinRequest{SessionID: id, Chars: "continue\n"})
-					return calls(call("switch", "switch_environment", `{"runtime":"runtime-two"}`), call("poll", "write_stdin", string(args))), nil
+					return calls(call("switch", "switch_environment", `{"target":"target-two"}`), call("poll", "write_stdin", string(args))), nil
 				}
 			}
 			return astral.Reply{}, errors.New("missing exec result")
@@ -69,7 +127,7 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = tools
-	var initial, poll environments.Binding
+	var initial, poll hostBinding
 	c.BeforeToolCall = func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
 		if inv.Call.Name == "exec_command" {
 			initial = bindingOf(inv.Binding)
@@ -79,13 +137,14 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		}
 		return astral.ToolDecision{}, nil
 	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "runtime-one", WorkspaceID: "workspace-one", CWD: dir}})
+	snapshot := hostSnapshot("target-one", "location-one")
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &snapshot})
 	waitOK(t, start(t, s, "work"))
 	view, err := s.InspectContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if initial.RuntimeID != "runtime-one" || poll != initial || view.Binding.RuntimeID != "runtime-two" {
+	if initial.Target != "target-one" || poll != initial || bindingOf(view.Binding).Target != "target-two" {
 		t.Fatalf("wrong target before approval: initial=%+v poll=%+v current=%+v", initial, poll, view.Binding)
 	}
 	results := toolResults(s)

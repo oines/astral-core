@@ -42,7 +42,9 @@ type ExecutionState struct {
 	BatchTools    []ToolDefinition
 	Last          *Frame
 	Calls         map[string]CallState
-	Binding       json.RawMessage
+	// Preserve an absent binding through JSON copies; an explicit JSON null is
+	// a nonempty host binding and must remain distinct.
+	Binding json.RawMessage `json:",omitempty"`
 }
 
 type TransitionKind string

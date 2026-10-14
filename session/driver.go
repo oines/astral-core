@@ -6,7 +6,6 @@ import (
 	"errors"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 type registeredTool struct {
@@ -51,8 +50,11 @@ func (d sessionDriver) Snapshot() protocol.ExecutionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.configurationLocked()
-	env, binding := effectiveEnvironment(s.pathLocked())
-	out := protocol.ExecutionState{ID: s.id, Configuration: protocol.Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools}, Binding: encodeEnvironment(binding, env), Calls: map[string]protocol.CallState{}}
+	env, _ := effectiveEnvironment(s.pathLocked())
+	out := protocol.ExecutionState{ID: s.id, Configuration: protocol.Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools}, Calls: map[string]protocol.CallState{}}
+	if env != nil {
+		out.Binding = env.Binding
+	}
 	if e := s.lastMessageLocked(); e != nil {
 		out.Last = &protocol.Frame{ID: e.ID, TurnID: e.TurnID, Message: *e.Message}
 		if i, ok := s.windowIndex[s.state.Branch.BatchConfigurationID]; ok && s.window[i].Configuration != nil {
@@ -139,13 +141,9 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 		e.Tool = &ToolRecord{Invocation: t.Invocation, Decision: t.Decision, Result: t.Result, NeedsResolution: t.NeedsResolution}
 		entries = append(entries, e)
 		if t.Kind == protocol.TransitionResult && len(t.Result.Context) > 0 {
-			payload, err := targetenv.Decode(t.Result.Context)
+			snapshot, err := decodeEnvironment(t.Result.Context)
 			if err != nil {
 				return err
-			}
-			snapshot := payload.Snapshot
-			if snapshot == nil {
-				return fmtInvalid("environment context update has no snapshot")
 			}
 			entries = append(entries, Entry{Kind: EntryEnvironment, RunID: t.RunID, TurnID: t.TurnID, Environment: snapshot})
 		}
@@ -237,14 +235,3 @@ func (s *Session) commitToolResult(ctx context.Context, inv protocol.Invocation,
 func (s *Session) Subscribe(buffer int) *protocol.Subscription { return s.core.Subscribe(buffer) }
 func (s *Session) publish(e protocol.Event)                    { s.core.Publish(e) }
 func (s *Session) publishLocked(e protocol.Event)              { s.core.Publish(e) }
-
-func encodeEnvironment(binding targetenv.Binding, snapshot *targetenv.Snapshot) json.RawMessage {
-	if snapshot == nil && binding == (targetenv.Binding{}) {
-		return nil
-	}
-	raw, err := targetenv.Encode(binding, snapshot)
-	if err != nil {
-		panic(err)
-	}
-	return raw
-}

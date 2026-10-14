@@ -11,7 +11,6 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 )
 
 type CommandRequest struct {
@@ -43,8 +42,8 @@ type CommandResult struct {
 }
 
 func (t backendTool) Bind(_ context.Context, inv astral.Invocation) (json.RawMessage, error) {
-	if _, err := environments.Decode(inv.Binding); err != nil {
-		return nil, notExecuted("invalid target binding: " + err.Error())
+	if len(inv.Binding) > 0 && !json.Valid(inv.Binding) {
+		return nil, notExecuted("invalid target binding JSON")
 	}
 	if t.definition.Name != "write_stdin" {
 		return append(json.RawMessage(nil), inv.Binding...), nil
@@ -81,13 +80,6 @@ func (t backendTool) execCommand(ctx context.Context, inv astral.Invocation, emi
 	// initial output before the initial exec_command response is assembled.
 	defer p.release()
 	waitMS := min(max(r.YieldTimeMS, 250), 30000)
-	target, err := environments.Decode(inv.Binding)
-	if err != nil {
-		return astral.ToolResult{}, notExecuted("invalid target binding")
-	}
-	if target.Snapshot != nil && strings.EqualFold(target.Snapshot.OS, "windows") {
-		waitMS = max(waitMS, 10000)
-	}
 	return t.set.collect(ctx, p, time.Duration(waitMS)*time.Millisecond, min(r.MaxOutputTokens, t.set.options.MaxOutputTokens), start, emit), nil
 }
 
@@ -165,7 +157,7 @@ func chunkID() string {
 
 func processDefinitions() []astral.ToolDefinition {
 	return []astral.ToolDefinition{
-		{Name: "exec_command", Version: "2", Description: "Run a shell command, returning output or a session ID for ongoing interaction. tty=true allocates a PTY; false uses pipes with closed stdin. Shell defaults to the target's shell. Login defaults to true. Workdir defaults to the bound environment cwd. yield_time_ms defaults to 10000 and is clamped to 250-30000 ms (Windows minimum 10000). Yielding leaves the process running. max_output_tokens defaults to 10000 and may be capped by host policy.", Parameters: json.RawMessage(`{"type":"object","properties":{"cmd":{"type":"string","minLength":1},"workdir":{"type":"string"},"shell":{"type":"string"},"login":{"type":"boolean"},"tty":{"type":"boolean"},"yield_time_ms":{"type":"integer","minimum":0},"max_output_tokens":{"type":"integer","minimum":0}},"required":["cmd"],"additionalProperties":false}`)},
-		{Name: "write_stdin", Version: "2", Description: "Write chars to an existing exec_command session and return recent output. Empty chars polls without writing. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default, returning sooner when the process exits. max_output_tokens defaults to 10000 and may be capped. The session remains bound to its original runtime after environment changes. Send Ctrl-C as \\u0003 to interrupt.", Parameters: json.RawMessage(`{"type":"object","properties":{"session_id":{"type":"integer","minimum":1},"chars":{"type":"string"},"yield_time_ms":{"type":"integer","minimum":0},"max_output_tokens":{"type":"integer","minimum":0}},"required":["session_id"],"additionalProperties":false}`)},
+		{Name: "exec_command", Version: "2", Description: "Run a shell command, returning output or a session ID for ongoing interaction. tty=true allocates a PTY; false uses pipes with closed stdin. Shell and workdir default to the backend's settings for the pinned binding. Login defaults to true. yield_time_ms defaults to 10000 and is clamped to 250-30000 ms. Yielding leaves the process running. max_output_tokens defaults to 10000 and may be capped by host policy.", Parameters: json.RawMessage(`{"type":"object","properties":{"cmd":{"type":"string","minLength":1},"workdir":{"type":"string"},"shell":{"type":"string"},"login":{"type":"boolean"},"tty":{"type":"boolean"},"yield_time_ms":{"type":"integer","minimum":0},"max_output_tokens":{"type":"integer","minimum":0}},"required":["cmd"],"additionalProperties":false}`)},
+		{Name: "write_stdin", Version: "2", Description: "Write chars to an existing exec_command session and return recent output. Empty chars polls without writing. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default, returning sooner when the process exits. max_output_tokens defaults to 10000 and may be capped. The session retains its original binding after environment changes. Send Ctrl-C as \\u0003 to interrupt.", Parameters: json.RawMessage(`{"type":"object","properties":{"session_id":{"type":"integer","minimum":1},"chars":{"type":"string"},"yield_time_ms":{"type":"integer","minimum":0},"max_output_tokens":{"type":"integer","minimum":0}},"required":["session_id"],"additionalProperties":false}`)},
 	}
 }

@@ -12,8 +12,8 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/standardtools"
+	"github.com/oines/astral-core/standardtools/local"
 )
 
 func command(t *testing.T, result astral.ToolResult) standardtools.CommandResult {
@@ -171,21 +171,47 @@ func TestCloseJoinsLiveProcessesAndRejectsFurtherCalls(t *testing.T) {
 	}
 }
 
+type bindingMutatingBackend struct{ standardtools.Backend }
+
+func (b bindingMutatingBackend) StartProcess(ctx context.Context, inv astral.Invocation, request standardtools.ProcessRequest) (standardtools.Process, error) {
+	process, err := b.Backend.StartProcess(ctx, inv, request)
+	if len(inv.Binding) > 0 {
+		inv.Binding[0] = 'X'
+	}
+	return process, err
+}
+
 func TestRunningCommandUsesFrozenEnvironment(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
+	backend, err := local.New(local.Options{CWD: h.dir, Shell: "/bin/sh", ResolveBinding: func(_ context.Context, inv astral.Invocation) (string, string, error) {
+		if string(inv.Binding) != `{"target":"original"}` {
+			return "", "", fmt.Errorf("target not authorized")
+		}
+		return h.dir, "/bin/sh", nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := standardtools.New(bindingMutatingBackend{backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+	for _, tool := range set.Tools() {
+		h.tools[tool.Definition().Name] = tool
+	}
 	args, _ := json.Marshal(map[string]any{"cmd": "printf ready; sleep 0.4; pwd", "yield_time_ms": 0, "login": false})
-	inv := astral.Invocation{SessionID: "owner", Binding: bindingData(t, environments.Binding{RuntimeID: "local", WorkspaceID: "one", SnapshotID: "old"}, &environments.Snapshot{RuntimeID: "local", WorkspaceID: "one", CWD: h.dir}), Call: astral.ToolCall{Arguments: args}}
+	inv := astral.Invocation{SessionID: "owner", Binding: json.RawMessage(`{"target":"original"}`), Call: astral.ToolCall{Arguments: args}}
 	result, err := h.tools["exec_command"].Execute(context.Background(), inv, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := command(t, result)
 	args, _ = json.Marshal(map[string]any{"session_id": r.SessionID})
-	current := astral.Invocation{SessionID: "owner", Binding: bindingData(t, environments.Binding{RuntimeID: "remote", WorkspaceID: "two"}, nil), Call: astral.ToolCall{Arguments: args}}
+	current := astral.Invocation{SessionID: "owner", Binding: json.RawMessage(`{"target":"remote"}`), Call: astral.ToolCall{Arguments: args}}
 	binding, err := h.tools["write_stdin"].(astral.TargetedTool).Bind(context.Background(), current)
-	env, _ := environments.Decode(binding)
-	if err != nil || string(binding) != string(inv.Binding) || env.Snapshot.CWD != h.dir {
+	if err != nil || string(binding) != string(inv.Binding) {
 		t.Fatalf("rebound: %v %v", binding, err)
 	}
 	current.Binding = binding
@@ -196,13 +222,4 @@ func TestRunningCommandUsesFrozenEnvironment(t *testing.T) {
 	if got := command(t, result); got.ExitCode == nil || !strings.Contains(got.Output, h.dir) {
 		t.Fatal(fmt.Sprintf("wrong target: %+v", got))
 	}
-}
-
-func bindingData(t *testing.T, b environments.Binding, s *environments.Snapshot) json.RawMessage {
-	t.Helper()
-	raw, err := environments.Encode(b, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
 }

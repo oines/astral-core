@@ -4,6 +4,7 @@ package local
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,24 +12,26 @@ import (
 	"strings"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/standardtools"
 )
 
 type Options struct {
 	// CWD and Shell are captured at construction, never read from mutable process
-	// defaults during dispatch. A pinned Environment may override either.
+	// defaults during dispatch.
 	CWD, Shell string
-	// Empty RuntimeID defaults to "local". A nonempty incoming target must match.
-	RuntimeID, ComputerID string
+	// ResolveBinding must authorize the invocation and return its absolute,
+	// existing directory and nonempty shell. Without it, nonempty bindings are
+	// rejected. Errors and incomplete resolutions never use the local defaults.
+	ResolveBinding func(context.Context, astral.Invocation) (cwd, shell string, err error)
 	// Env is appended to a captured os.Environ(). Later values override earlier
 	// ones. It is host configuration, never exposed to the model in a snapshot.
 	Env []string
 }
 
 type Backend struct {
-	cwd, shell, home, runtimeID, computerID string
-	env                                     []string
+	cwd, shell, home string
+	env              []string
+	resolveBinding   func(context.Context, astral.Invocation) (cwd, shell string, err error)
 }
 
 func New(options ...Options) (*Backend, error) {
@@ -56,35 +59,41 @@ func New(options ...Options) (*Backend, error) {
 	if o.Shell == "" {
 		o.Shell = defaultShell()
 	}
-	if o.RuntimeID == "" {
-		o.RuntimeID = "local"
-	}
 	home, _ := os.UserHomeDir()
-	return &Backend{cwd: cwd, shell: o.Shell, home: home, runtimeID: o.RuntimeID, computerID: o.ComputerID, env: mergeEnv(os.Environ(), o.Env)}, nil
+	return &Backend{cwd: cwd, shell: o.Shell, home: home, env: mergeEnv(os.Environ(), o.Env), resolveBinding: o.ResolveBinding}, nil
 }
 
 func (b *Backend) target(ctx context.Context, inv astral.Invocation) (string, string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", "", beforeStart(err)
 	}
-	target, err := environments.Decode(inv.Binding)
-	if err != nil {
-		return "", "", beforeStart(err)
-	}
-	if target.Binding.RuntimeID != "" && target.Binding.RuntimeID != b.runtimeID || target.Binding.ComputerID != "" && target.Binding.ComputerID != b.computerID {
-		return "", "", beforeStart(errors.New("local backend cannot serve this runtime/computer binding"))
+	if len(inv.Binding) > 0 && !json.Valid(inv.Binding) {
+		return "", "", beforeStart(errors.New("invalid binding JSON"))
 	}
 	cwd, shell := b.cwd, b.shell
-	if target.Snapshot != nil {
-		if target.Snapshot.CWD != "" {
-			cwd = target.Snapshot.CWD
+	if b.resolveBinding == nil {
+		if len(inv.Binding) > 0 {
+			return "", "", beforeStart(errors.New("local backend requires a host resolver for nonempty bindings"))
 		}
-		if target.Snapshot.Shell != "" {
-			shell = target.Snapshot.Shell
+	} else {
+		inv.Binding = append(json.RawMessage(nil), inv.Binding...)
+		var err error
+		cwd, shell, err = b.resolveBinding(ctx, inv)
+		if err != nil {
+			return "", "", beforeStart(err)
 		}
 	}
 	if !filepath.IsAbs(cwd) {
-		return "", "", beforeStart(errors.New("environment cwd must be absolute"))
+		return "", "", beforeStart(errors.New("resolved cwd must be absolute"))
+	}
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		return "", "", beforeStart(fmt.Errorf("resolved cwd must be an existing directory: %s", cwd))
+	}
+	if strings.TrimSpace(shell) == "" {
+		return "", "", beforeStart(errors.New("resolved shell must not be empty"))
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", beforeStart(err)
 	}
 	return filepath.Clean(cwd), shell, nil
 }

@@ -173,12 +173,40 @@ func texts(messages []astral.Message, role astral.Role) []string {
 	return result
 }
 
-func bindingOf(raw json.RawMessage) environments.Binding {
-	value, err := environments.Decode(raw)
+// These fields belong to this test host, not to the SDK's environment contract.
+type hostBinding struct {
+	Target   string `json:"target"`
+	Location string `json:"location,omitempty"`
+}
+
+func bindingOf(raw json.RawMessage) hostBinding {
+	var value hostBinding
+	if err := json.Unmarshal(raw, &value); err != nil {
+		panic(err)
+	}
+	return value
+}
+
+func hostSnapshot(target, location string) environments.Snapshot {
+	raw, err := json.Marshal(hostBinding{Target: target, Location: location})
 	if err != nil {
 		panic(err)
 	}
-	return value.Binding
+	return environments.Snapshot{Binding: raw, Context: fmt.Sprintf("Target: %s\nLocation: %s", target, location)}
+}
+
+func switchEnvironment(resolve func(context.Context, astral.Invocation) (environments.Snapshot, error)) astral.Tool {
+	return astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object"}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		snapshot, err := resolve(ctx, inv)
+		if err != nil {
+			return astral.ToolResult{}, err
+		}
+		payload, err := json.Marshal(snapshot)
+		if err != nil {
+			return astral.ToolResult{}, err
+		}
+		return astral.ToolResult{Content: astral.Text("Environment updated."), Context: payload}, nil
+	}}
 }
 
 type historySnapshot struct {

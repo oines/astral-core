@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	astral "github.com/oines/astral-core"
 	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
-	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -65,7 +65,8 @@ func TestCloseCancelsEnvironmentDiscoveryBeforeRunStarts(t *testing.T) {
 		return environments.Snapshot{}, ctx.Err()
 	}
 	a := newAgent(t, c)
-	s := newSession(t, a, sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "old"}})
+	initial := hostSnapshot("old", "")
+	s := newSession(t, a, sessions.SessionOptions{Environment: &initial})
 	child, err := s.Fork(context.Background(), s.Head(), sessions.ForkOptions{ID: "discovery-child"})
 	if err != nil {
 		t.Fatal(err)
@@ -276,17 +277,18 @@ func TestAfterHookCannotRewriteEnvironmentEffects(t *testing.T) {
 		return answer("done"), nil
 	})
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{standardtools.SwitchEnvironment(func(context.Context, astral.Invocation, standardtools.EnvironmentSelection) (environments.Snapshot, error) {
-		return environments.Snapshot{RuntimeID: "actual"}, nil
+	c.Tools = []astral.Tool{switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
+		return hostSnapshot("actual", ""), nil
 	})}
 	c.AfterToolCall = func(_ context.Context, _ astral.Invocation, result astral.ToolResult) (astral.ToolResultPatch, error) {
 		result.Outcome = astral.OutcomeFailed
-		payload, err := environments.Decode(result.Context)
-		if err != nil {
+		var payload environments.Snapshot
+		if err := json.Unmarshal(result.Context, &payload); err != nil {
 			t.Fatal(err)
 		}
-		payload.Snapshot.RuntimeID = "invented"
-		result.Context, _ = environments.Encode(payload.Binding, payload.Snapshot)
+		payload.Binding = json.RawMessage(`{"target":"invented"}`)
+		payload.Context = "invented"
+		result.Context, _ = json.Marshal(payload)
 		return astral.ToolResultPatch{Content: astral.Text("processed")}, nil
 	}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
@@ -295,7 +297,7 @@ func TestAfterHookCannotRewriteEnvironmentEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Binding.RuntimeID != "actual" || toolResults(s)[0].Outcome != astral.OutcomeSucceeded {
+	if bindingOf(view.Binding).Target != "actual" || toolResults(s)[0].Outcome != astral.OutcomeSucceeded {
 		t.Fatal("execution facts changed by hook")
 	}
 }

@@ -1,4 +1,4 @@
-// Two host-prepared workspaces on the same machine stand in for two runtimes.
+// Two host-prepared directories on the same machine stand in for two targets.
 // Commands are real; the model is deterministic. Remote transports are host IO.
 package main
 
@@ -25,12 +25,33 @@ import (
 
 type hostRouter map[string]standardtools.Backend
 
+// This JSON shape and all target selection are defined by this example's host.
+type hostBinding struct {
+	Target string `json:"target"`
+}
+
+func targetOf(raw json.RawMessage) (string, error) {
+	var binding hostBinding
+	if err := json.Unmarshal(raw, &binding); err != nil {
+		return "", err
+	}
+	if binding.Target == "" {
+		return "", errors.New("target is required")
+	}
+	return binding.Target, nil
+}
+
+func snapshotFor(id, dir string) environments.Snapshot {
+	binding, _ := json.Marshal(hostBinding{Target: id})
+	return environments.Snapshot{Binding: binding, Context: fmt.Sprintf("Execution target: %s\nWorking directory: %s", id, dir)}
+}
+
 func (r hostRouter) backend(inv astral.Invocation) (standardtools.Backend, error) {
-	target, err := environments.Decode(inv.Binding)
+	target, err := targetOf(inv.Binding)
 	if err != nil {
 		return nil, err
 	}
-	b := r[target.Binding.RuntimeID]
+	b := r[target]
 	if b == nil {
 		return nil, errors.New("target not authorized")
 	}
@@ -63,12 +84,18 @@ func run(ctx context.Context) error {
 	}
 	defer os.RemoveAll(root)
 	router := hostRouter{}
-	for _, id := range []string{"runtime-a", "runtime-b"} {
+	for _, id := range []string{"target-a", "target-b"} {
 		dir := filepath.Join(root, id)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
-		backend, err := local.New(local.Options{CWD: dir, Shell: "/bin/sh", RuntimeID: id})
+		backend, err := local.New(local.Options{CWD: dir, Shell: "/bin/sh", ResolveBinding: func(_ context.Context, inv astral.Invocation) (string, string, error) {
+			target, err := targetOf(inv.Binding)
+			if err != nil || target != id {
+				return "", "", errors.New("target not authorized")
+			}
+			return dir, "/bin/sh", nil
+		}})
 		if err != nil {
 			return err
 		}
@@ -83,18 +110,32 @@ func run(ctx context.Context) error {
 		defer cancel()
 		_ = set.Close(cleanup)
 	}()
-	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(_ context.Context, _ astral.Invocation, selection standardtools.EnvironmentSelection) (environments.Snapshot, error) {
-		if selection.Runtime != "runtime-b" {
-			return environments.Snapshot{}, errors.New("target not authorized")
+	// Environment switching is an ordinary host tool. The SDK supplies neither
+	// its selection schema nor target discovery or authorization.
+	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Description: "Select an authorized execution target.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		target, err := targetOf(inv.Call.Arguments)
+		if err != nil || router[target] == nil {
+			return astral.ToolResult{}, errors.New("target not authorized")
 		}
-		return environments.Snapshot{RuntimeID: "runtime-b", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-b")}, nil
-	}))
+		payload, err := json.Marshal(snapshotFor(target, filepath.Join(root, target)))
+		if err != nil {
+			return astral.ToolResult{}, err
+		}
+		return astral.ToolResult{Content: astral.Text("Environment updated."), Context: payload}, nil
+	}}
+	tools := append(set.Tools(), switcher)
 	model := demo.Model(func(request astral.Request) (astral.Reply, error) {
 		if result := demo.LastTool(request, "write_stdin"); result != nil {
 			if result.IsError {
 				return astral.Reply{}, errors.New(result.Content[0].Text)
 			}
-			return demo.Answer("Completed on the original runtime."), nil
+			if current := demo.LastTool(request, "exec_command"); current != nil && current.ToolCallID == "current" {
+				if current.IsError {
+					return astral.Reply{}, errors.New(current.Content[0].Text)
+				}
+				return demo.Answer("The original process and the new target both completed."), nil
+			}
+			return demo.Calls(demo.Call("current", "exec_command", `{"cmd":"printf 'current cwd: '; pwd","login":false}`)), nil
 		}
 		if result := demo.LastTool(request, "exec_command"); result != nil {
 			match := regexp.MustCompile(`Process running with session ID (\d+)`).FindStringSubmatch(result.Content[0].Text)
@@ -103,18 +144,22 @@ func run(ctx context.Context) error {
 			}
 			id, _ := strconv.Atoi(match[1])
 			args, _ := json.Marshal(standardtools.StdinRequest{SessionID: id, Chars: "continue\n"})
-			return demo.Calls(demo.Call("switch", "switch_environment", `{"runtime":"runtime-b"}`), demo.Call("poll", "write_stdin", string(args))), nil
+			return demo.Calls(demo.Call("switch", "switch_environment", `{"target":"target-b"}`), demo.Call("poll", "write_stdin", string(args))), nil
 		}
 		return demo.Calls(demo.Call("start", "exec_command", `{"cmd":"printf 'ready\\n'; IFS= read -r line; printf 'original cwd: '; pwd","tty":true,"login":false,"yield_time_ms":0}`)), nil
 	})
-	var processRuntime string
+	var processTarget, newCallTarget string
 	agent, err := sessions.New(sessions.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: tools, BeforeToolCall: func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
-		if inv.Call.Name == "write_stdin" {
-			target, err := environments.Decode(inv.Binding)
+		if inv.Call.Name == "write_stdin" || inv.Call.ID == "current" {
+			target, err := targetOf(inv.Binding)
 			if err != nil {
 				return astral.ToolDecision{}, err
 			}
-			processRuntime = target.Binding.RuntimeID
+			if inv.Call.Name == "write_stdin" {
+				processTarget = target
+			} else {
+				newCallTarget = target
+			}
 		}
 		return astral.ToolDecision{}, nil
 	}})
@@ -122,11 +167,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "runtime-a", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-a")}})
+	initial := snapshotFor("target-a", filepath.Join(root, "target-a"))
+	session, err := agent.NewSession(ctx, sessions.SessionOptions{Environment: &initial})
 	if err != nil {
 		return err
 	}
-	run, err := session.Start(ctx, astral.User("Start a command, switch runtime, then finish the original command."))
+	run, err := session.Start(ctx, astral.User("Start a command, switch target, then finish the original command and run on the new target."))
 	if err != nil {
 		return err
 	}
@@ -137,6 +183,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("current runtime: %s\nprocess runtime: %s\nworkspace: %s\n", view.Binding.RuntimeID, processRuntime, view.Binding.WorkspaceID)
+	current, err := targetOf(view.Binding)
+	if err != nil {
+		return err
+	}
+	if current != "target-b" || processTarget != "target-a" || newCallTarget != "target-b" {
+		return errors.New("execution binding was not preserved")
+	}
+	fmt.Printf("current target: %s\noriginal process target: %s\nnew command target: %s\n", current, processTarget, newCallTarget)
 	return nil
 }

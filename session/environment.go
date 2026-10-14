@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	protocol "github.com/oines/astral-core"
@@ -31,7 +32,7 @@ func (s *Session) RefreshEnvironment(ctx context.Context, snapshot targetenv.Sna
 	return nil
 }
 
-func effectiveEnvironment(path []Entry) (*targetenv.Snapshot, targetenv.Binding) {
+func effectiveEnvironment(path []Entry) (*targetenv.Snapshot, string) {
 	for i := len(path) - 1; i >= 0; i-- {
 		e := path[i]
 		snapshot := e.Environment
@@ -39,10 +40,10 @@ func effectiveEnvironment(path []Entry) (*targetenv.Snapshot, targetenv.Binding)
 			snapshot, _ = resultEnvironment(e)
 		}
 		if snapshot != nil {
-			return snapshot, targetenv.Binding{SnapshotID: e.ID, RuntimeID: snapshot.RuntimeID, ComputerID: snapshot.ComputerID, WorkspaceID: snapshot.WorkspaceID}
+			return snapshot, e.ID
 		}
 	}
-	return nil, targetenv.Binding{}
+	return nil, ""
 }
 
 // A result's environment effect belongs to that inclusive history boundary,
@@ -51,9 +52,20 @@ func resultEnvironment(e Entry) (*targetenv.Snapshot, error) {
 	if e.Tool == nil || e.Tool.Result == nil || len(e.Tool.Result.Context) == 0 {
 		return nil, nil
 	}
-	payload, err := targetenv.Decode(e.Tool.Result.Context)
-	if err != nil || payload.Snapshot == nil {
+	snapshot, err := decodeEnvironment(e.Tool.Result.Context)
+	if err != nil {
 		return nil, fmt.Errorf("%w: tool result environment snapshot", ErrCorrupt)
 	}
-	return payload.Snapshot, nil
+	return snapshot, nil
+}
+
+func decodeEnvironment(raw json.RawMessage) (*targetenv.Snapshot, error) {
+	var snapshot *targetenv.Snapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, fmtInvalid("environment context update has no snapshot")
+	}
+	return snapshot, nil
 }

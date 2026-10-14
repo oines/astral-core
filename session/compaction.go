@@ -192,8 +192,8 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	}
 	record := CompactionRecord{ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
 	entries := []Entry{{Kind: EntryCompaction, Compaction: &record}}
-	environment, binding := effectiveEnvironment(path)
-	if environment != nil && indices[binding.SnapshotID] <= through {
+	environment, snapshotID := effectiveEnvironment(path)
+	if environment != nil && indices[snapshotID] <= through {
 		entries = append(entries, Entry{Kind: EntryEnvironment, Environment: environment})
 	}
 	if _, err = s.append(ctx, entries...); err != nil {

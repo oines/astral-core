@@ -8,7 +8,7 @@
 | --- | --- |
 | `github.com/oines/astral-core`，包名 `astral` | 唯一 Agent Loop、Model / Tool 协议、Retry / Fallback、Run、取消、输入边界和事件 |
 | `session` | Manager、Session、审批、分页历史、Context、预算、摘要、精确状态与恢复、Store 契约 |
-| `environment` | 可选 Snapshot、Provider、Binding，以及 opaque 绑定的编解码 |
+| `environment` | 宿主提供的 Snapshot 和可选 Provider，分离模型 Context 与 opaque 执行 Binding |
 | `store/memory` | 进程内存储，适合测试与临时会话 |
 | `store/jsonl` | 版本化校验日志、原子提交与同步落盘；首次打开回放历史 |
 | `store/sqlite` | 纯 Go SQLite、WAL、完整同步、索引、增量状态和分页 Fork |
@@ -97,6 +97,26 @@ History 面向整个 Rollout，包含兄弟 Session 的历史。`Query.SessionID
 - 事件非阻塞。慢订阅者溢出后关闭，持久客户端通过分页历史重建已提交内容。
 
 宿主必须保证同一 Session 只有一个执行所有者；CAS 不代替分布式执行租约。JSONL 目录要求单进程所有权。
+
+## 宿主提供的环境
+
+Environment Snapshot 只有两个字段：
+
+```go
+snapshot := environment.Snapshot{
+    Binding: json.RawMessage(`{"host_target":"build-worker","credential_ref":"internal"}`),
+    Context: "Execution environment: build worker\nProject directory: /project",
+}
+conversation, err := manager.NewSession(ctx, session.SessionOptions{
+    ID: "build", Environment: &snapshot,
+})
+```
+
+第一轮模型请求即可看到 Context。环境变化通过独立的 `RoleContext` / `ContextKind=environment` 消息追加，System Prompt 保持原有规则。Binding 是宿主定义的任意有效 JSON，只传给 Tool Invocation，不会由 SDK 投影到模型或摘要请求。`InspectContext` 向宿主提供完整快照、Binding 和来自 Rollout Entry ID 的 SnapshotID。
+
+环境发现、内容组织及目标授权由宿主实现，包括设备、目录、Shell、Skills 和指令文件。SDK 不读取或解释这些业务内容；Context 中引用的文件正文作为来源材料处理。宿主可以调用 `RefreshEnvironment`，或让普通 Sequential Tool 在 `ToolResult.Context` 中返回 `json.Marshal(snapshot)` 的结果；环境与工具结果原子持久化。切换工具的名称、Schema 和选择方式由宿主定义。
+
+每次工具派发前固定 Binding，已有进程继续使用创建时的绑定。Compaction 重申最新有效快照；重新打开、Reload 和继承历史环境的 Fork 要求宿主 Provider 或 RefreshEnvironment 重新确认。标准工具 Backend 自行解析和授权 Binding；本地 Backend 默认拒绝非空 Binding，宿主可通过 `local.Options.ResolveBinding` 显式授权并解析执行目录和 Shell。
 
 ## 长会话与 Fork
 

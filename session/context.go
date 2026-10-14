@@ -17,7 +17,8 @@ type Context struct {
 	Request         protocol.Request    `json:"request"`
 	Sources         []string            `json:"sources"`
 	Environment     *targetenv.Snapshot `json:"environment,omitempty"`
-	Binding         targetenv.Binding   `json:"binding"`
+	Binding         json.RawMessage     `json:"binding,omitempty"`
+	SnapshotID      string              `json:"snapshot_id,omitempty"`
 	EstimatedInput  int                 `json:"estimated_input"`
 }
 
@@ -83,7 +84,10 @@ func project(path []Entry) (Context, error) {
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
 	}
-	view.Environment, view.Binding = effectiveEnvironment(path)
+	view.Environment, view.SnapshotID = effectiveEnvironment(path)
+	if view.Environment != nil {
+		view.Binding = view.Environment.Binding
+	}
 	start := 0
 	var checkpoint *Entry
 	for i := len(path) - 1; i >= 0; i-- {
@@ -114,7 +118,11 @@ func project(path []Entry) (Context, error) {
 	}
 	results := map[string]Entry{}
 	assistants := map[string]Entry{}
+	environmentParents := map[string]bool{}
 	for _, e := range visible {
+		if e.Kind == EntryEnvironment {
+			environmentParents[e.ParentID] = true
+		}
 		if e.Kind == EntryMessage && e.Message.Role == protocol.RoleAssistant {
 			assistants[e.ID] = e
 		}
@@ -166,11 +174,19 @@ func project(path []Entry) (Context, error) {
 				add(protocol.Message{Role: protocol.RoleTool, Content: content, ToolCallID: call.ID, Name: call.Name, IsError: r.IsError}, result.ID)
 			}
 		case EntryEnvironment:
-			data, err := json.Marshal(e.Environment)
-			if err != nil {
-				return Context{}, err
+			add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(e.Environment.Context)}, e.ID)
+		case EntryToolResult, EntryToolResolution:
+			// An inclusive result boundary can omit the following environment
+			// node from the same atomic commit. Project its effect once here.
+			if !environmentParents[e.ID] {
+				snapshot, err := resultEnvironment(e)
+				if err != nil {
+					return Context{}, err
+				}
+				if snapshot != nil {
+					add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(snapshot.Context)}, e.ID)
+				}
 			}
-			add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(string(data))}, e.ID)
 		}
 	}
 	if err = validateProtocol(view.Request.Messages); err != nil {

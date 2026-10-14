@@ -13,7 +13,6 @@ import (
 	astral "github.com/oines/astral-core"
 	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
-	"github.com/oines/astral-core/standardtools"
 )
 
 func TestForkBoundaryMatrixAndHistoricalResults(t *testing.T) {
@@ -281,7 +280,7 @@ func TestForkIdentityIsolationAndRetryAfterChildAdvances(t *testing.T) {
 				t.Fatalf("retry reset child: %v", err)
 			}
 			changed := options
-			changed.Environment = &environments.Snapshot{RuntimeID: "different"}
+			changed.Environment = &environments.Snapshot{Context: "different"}
 			if _, err = parent.Fork(ctx, boundary, changed); !errors.Is(err, sessions.ErrConflict) {
 				t.Fatalf("different parameters accepted: %v", err)
 			}
@@ -469,7 +468,7 @@ func TestExplicitForkEnvironmentBudgetRejectsBeforePublication(t *testing.T) {
 		parent := newSession(t, a, sessions.SessionOptions{})
 		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
 			id := fmt.Sprintf("oversized-%d", mode)
-			_, err := parent.Fork(ctx, parent.Head(), sessions.ForkOptions{ID: id, Mode: mode, Environment: &environments.Snapshot{RuntimeID: strings.Repeat("x", 10000)}})
+			_, err := parent.Fork(ctx, parent.Head(), sessions.ForkOptions{ID: id, Mode: mode, Environment: &environments.Snapshot{Context: strings.Repeat("x", 10000)}})
 			if !errors.Is(err, sessions.ErrBudget) {
 				t.Fatalf("oversized environment accepted: %v", err)
 			}
@@ -622,9 +621,9 @@ func TestForkAtEnvironmentToolResultRequiresRediscovery(t *testing.T) {
 			return answer("done"), nil
 		})
 		c := testConfig(m, st)
-		c.Tools = []astral.Tool{standardtools.SwitchEnvironment(func(context.Context, astral.Invocation, standardtools.EnvironmentSelection) (environments.Snapshot, error) {
+		c.Tools = []astral.Tool{switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
 			effects.Add(1)
-			return environments.Snapshot{RuntimeID: "switched", WorkspaceID: "workspace"}, nil
+			return hostSnapshot("switched", "workspace"), nil
 		})}
 		a := newAgent(t, c)
 		parent := newSession(t, a, sessions.SessionOptions{})
@@ -642,8 +641,17 @@ func TestForkAtEnvironmentToolResultRequiresRediscovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			view, err := child.InspectContext(ctx)
-			if err != nil || view.Environment == nil || view.Environment.RuntimeID != "switched" {
+			if err != nil || view.Environment == nil || bindingOf(view.Binding).Target != "switched" || view.SnapshotID != boundary {
 				t.Fatalf("result boundary lost environment: %+v %v", view.Environment, err)
+			}
+			var contexts []string
+			for _, message := range view.Request.Messages {
+				if message.ContextKind == "environment" {
+					contexts = append(contexts, message.Content[0].Text)
+				}
+			}
+			if len(contexts) != 1 || contexts[0] != hostSnapshot("switched", "workspace").Context {
+				t.Fatalf("result boundary lost model-visible context: %v", contexts)
 			}
 			if err = child.Close(ctx); err != nil {
 				t.Fatal(err)
@@ -655,7 +663,7 @@ func TestForkAtEnvironmentToolResultRequiresRediscovery(t *testing.T) {
 			if _, err = child.Continue(ctx); !errors.Is(err, sessions.ErrEnvironmentRefresh) {
 				t.Fatalf("result-boundary environment not revalidated: %v", err)
 			}
-			if err = child.RefreshEnvironment(ctx, environments.Snapshot{RuntimeID: "host-confirmed", WorkspaceID: "workspace"}); err != nil {
+			if err = child.RefreshEnvironment(ctx, hostSnapshot("host-confirmed", "workspace")); err != nil {
 				t.Fatal(err)
 			}
 			r, err := child.Continue(ctx)

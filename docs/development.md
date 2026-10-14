@@ -10,7 +10,7 @@ astral-core/
 ├── model.go, message.go, tool.go   # Provider 中立协议
 ├── events.go, config.go           # 非阻塞事件与执行配置
 ├── internal/retry/                # 生成与摘要共用 Retry / Backoff
-├── environment/                   # 可选环境类型和 opaque 编解码
+├── environment/                   # 宿主 Snapshot：模型 Context 与 opaque Binding
 ├── session/
 │   ├── manager.go, session.go     # 持久会话所有权与生命周期
 │   ├── driver.go, run.go          # Core 适配与恢复预检，无第二套循环
@@ -71,6 +71,8 @@ go run ./examples/fork
 | `lifecycle_test.go` | Close / Cancel、创建中的环境发现、卸载与重开、并发上限、Hook 效果不可改写 |
 | `budget_compaction_test.go` | 工具输出与累计预算、完整批次摘要、裁剪副本、环境原子重申 |
 | `history_environment_test.go` | 分支配置隔离、包含式 Fork 边界、不完整批次、环境重新发现 |
+| `environment_contract_test.go` | 任意 JSON Binding、模型 / 摘要不泄露、隔离复制、失败切换、Compaction、Fork 与冷重开 |
+| `standardtools/local/backend_test.go` | 宿主绑定解析、目标拒绝、完整执行设置和回调隔离 |
 | `store_test.go` | 三后端隔离 / CAS / 原子性，JSONL 多句柄、未提交尾部和已提交损坏 |
 | 标准工具包测试 | Pi 样例、真实文件与图片、命令等待、PTY、原目标绑定、进程清理 |
 

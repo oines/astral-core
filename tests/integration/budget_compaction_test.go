@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -163,7 +164,7 @@ func largeHistory(t *testing.T, normal *testModel, summary *testModel, large str
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
 	options := sessions.SessionOptions{}
 	if withEnvironment {
-		options.Environment = &environments.Snapshot{RuntimeID: "runtime", WorkspaceID: "workspace", OS: "linux", Shell: "bash", CWD: "/exact/path", Skills: []environments.Resource{{Name: "build", Path: "/skills/build/SKILL.md"}}}
+		options.Environment = &environments.Snapshot{Binding: json.RawMessage(`{"target":"private-target","cwd":"/exact/path"}`), Context: "Working directory: /exact/path\nBuild guide: /skills/build/SKILL.md"}
 	}
 	s := newSession(t, newAgent(t, c), options)
 	waitOK(t, start(t, s, "work"))
@@ -216,7 +217,7 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Environment.CWD != "/exact/path" || view.Request.Messages[0].ContextKind != "summary" {
+	if view.Environment.Context != "Working directory: /exact/path\nBuild guide: /skills/build/SKILL.md" || view.Request.Messages[0].ContextKind != "summary" {
 		t.Fatal("environment or summary lost")
 	}
 	fork, err := s.Fork(context.Background(), userID, sessions.ForkOptions{ID: "budget-child"})
