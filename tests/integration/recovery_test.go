@@ -9,6 +9,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -29,11 +30,18 @@ func waitApproval(t *testing.T, sub *astral.Subscription) string {
 		}
 	}
 }
-func seedStore(t *testing.T, id string, rollout astral.Rollout) *memory.Store {
+func seedStore(t *testing.T, id string, rollout historySnapshot) *memory.Store {
 	t.Helper()
 	store := memory.New()
-	if err := store.Append(context.Background(), id, 0, rollout.Entries); err != nil {
-		t.Fatal(err)
+	for start := 0; start < len(rollout.Entries); {
+		end := start + 1
+		for end < len(rollout.Entries) && rollout.Entries[end].Version == rollout.Entries[start].Version {
+			end++
+		}
+		if err := appendStore(context.Background(), store, id, rollout.Entries[start].Version-1, rollout.Entries[start:end]); err != nil {
+			t.Fatal(err)
+		}
+		start = end
 	}
 	return store
 }
@@ -49,13 +57,13 @@ func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {
 	store := memory.New()
 	c := testConfig(m, store)
 	c.Tools = []astral.Tool{echoTool(&executed)}
-	c.BeforeToolCall = func(ctx context.Context, inv astral.Invocation) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(ctx context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
 		hookCalls.Add(1)
-		decision, err := inv.AwaitApproval(ctx, astral.ApprovalRequest{Prompt: "Allow this action?"})
+		decision, err := inv.AwaitApproval(ctx, sessions.ApprovalRequest{Prompt: "Allow this action?"})
 		return astral.ToolDecision{Block: !decision.Approved, Reason: decision.Reason}, err
 	}
 	a := newAgent(t, c)
-	s := newSession(t, a, astral.SessionOptions{ID: "approval"})
+	s := newSession(t, a, sessions.SessionOptions{ID: "approval"})
 	sub := s.Subscribe(128)
 	defer sub.Close()
 	run := start(t, s, "go")
@@ -63,7 +71,7 @@ func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {
 	if executed.Load() != 0 {
 		t.Fatal("approval bypassed")
 	}
-	snapshot, err := store.Read(context.Background(), s.ID())
+	snapshot, err := readStore(context.Background(), store, s.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +86,7 @@ func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {
 	if len(resumed.PendingApprovals()) != 1 {
 		t.Fatal("approval was not reconstructed")
 	}
-	if err = resumed.DecideApproval(context.Background(), approvalID, astral.ApprovalDecision{Approved: true}); err != nil {
+	if err = resumed.DecideApproval(context.Background(), approvalID, sessions.ApprovalDecision{Approved: true}); err != nil {
 		t.Fatal(err)
 	}
 	r2, err := resumed.Continue(context.Background())
@@ -89,10 +97,10 @@ func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {
 	if hookCalls.Load() != 2 || executed.Load() != 1 {
 		t.Fatalf("hook=%d execution=%d", hookCalls.Load(), executed.Load())
 	}
-	if err = resumed.DecideApproval(context.Background(), approvalID, astral.ApprovalDecision{Approved: true}); err != nil {
+	if err = resumed.DecideApproval(context.Background(), approvalID, sessions.ApprovalDecision{Approved: true}); err != nil {
 		t.Fatal("idempotent approval rejected")
 	}
-	if err = resumed.DecideApproval(context.Background(), approvalID, astral.ApprovalDecision{Approved: false}); !errors.Is(err, astral.ErrAlreadyResolved) {
+	if err = resumed.DecideApproval(context.Background(), approvalID, sessions.ApprovalDecision{Approved: false}); !errors.Is(err, sessions.ErrAlreadyResolved) {
 		t.Fatalf("conflicting decision: %v", err)
 	}
 }
@@ -115,10 +123,10 @@ func TestInterruptedToolBecomesUnknownAndIsNeverReplayed(t *testing.T) {
 	store := memory.New()
 	c := testConfig(m, store)
 	c.Tools = []astral.Tool{work}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{ID: "unknown"})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{ID: "unknown"})
 	r := start(t, s, "go")
 	signal(t, entered)
-	snapshot, err := store.Read(context.Background(), s.ID())
+	snapshot, err := readStore(context.Background(), store, s.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,34 +169,35 @@ func TestInterruptedToolBecomesUnknownAndIsNeverReplayed(t *testing.T) {
 }
 
 type faultStore struct {
-	astral.Store
-	kind  astral.EntryKind
+	sessions.Store
+	kind  sessions.EntryKind
 	after bool
 	fired atomic.Bool
 }
 
-func (s *faultStore) Append(ctx context.Context, id string, version uint64, entries []astral.Entry) error {
+func (s *faultStore) Commit(ctx context.Context, id string, c sessions.Commit) (sessions.Receipt, error) {
 	fail := false
-	for _, e := range entries {
+	for _, e := range c.Entries {
 		if e.Kind == s.kind && !s.fired.Swap(true) {
 			fail = true
 		}
 	}
 	if fail && !s.after {
-		return errors.New("injected store failure")
+		return sessions.Receipt{}, errors.New("injected store failure")
 	}
-	if err := s.Store.Append(ctx, id, version, entries); err != nil {
-		return err
+	receipt, err := s.Store.Commit(ctx, id, c)
+	if err != nil {
+		return receipt, err
 	}
 	if fail {
-		return errors.New("acknowledgement lost")
+		return sessions.Receipt{}, errors.New("acknowledgement lost")
 	}
-	return nil
+	return receipt, nil
 }
 
 func TestExecutionFactSurvivesMissingFinalResult(t *testing.T) {
 	var effects, afterHooks atomic.Int32
-	storage := &faultStore{Store: memory.New(), kind: astral.EntryToolResult}
+	storage := &faultStore{Store: memory.New(), kind: sessions.EntryToolResult}
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
 			return calls(call("c", "echo", `{"value":"output"}`)), nil
@@ -202,7 +211,7 @@ func TestExecutionFactSurvivesMissingFinalResult(t *testing.T) {
 		return astral.ToolResultPatch{}, nil
 	}
 	a := newAgent(t, c)
-	s := newSession(t, a, astral.SessionOptions{})
+	s := newSession(t, a, sessions.SessionOptions{})
 	if _, err := wait(t, start(t, s, "go")); err == nil {
 		t.Fatal("store failure was hidden")
 	}
@@ -229,7 +238,7 @@ func TestExecutionFactSurvivesMissingFinalResult(t *testing.T) {
 
 func TestDurableAuthorizationIsNotRecomputed(t *testing.T) {
 	var effects, beforeHooks atomic.Int32
-	storage := &faultStore{Store: memory.New(), kind: astral.EntryToolStarted}
+	storage := &faultStore{Store: memory.New(), kind: sessions.EntryToolStarted}
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
 			return calls(call("c", "echo", `{"value":"x"}`)), nil
@@ -238,11 +247,11 @@ func TestDurableAuthorizationIsNotRecomputed(t *testing.T) {
 	})
 	c := testConfig(m, storage)
 	c.Tools = []astral.Tool{echoTool(&effects)}
-	c.BeforeToolCall = func(context.Context, astral.Invocation) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(context.Context, sessions.ToolContext) (astral.ToolDecision, error) {
 		beforeHooks.Add(1)
 		return astral.ToolDecision{}, nil
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	if _, err := wait(t, start(t, s, "go")); err == nil {
 		t.Fatal("expected injected failure")
 	}
@@ -261,7 +270,7 @@ func TestDurableAuthorizationIsNotRecomputed(t *testing.T) {
 
 func TestLostStoreAcknowledgementIsReconciledBeforeExecution(t *testing.T) {
 	var effects atomic.Int32
-	storage := &faultStore{Store: memory.New(), kind: astral.EntryToolStarted, after: true}
+	storage := &faultStore{Store: memory.New(), kind: sessions.EntryToolStarted, after: true}
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
 			return calls(call("c", "echo", `{"value":"x"}`)), nil
@@ -270,7 +279,7 @@ func TestLostStoreAcknowledgementIsReconciledBeforeExecution(t *testing.T) {
 	})
 	c := testConfig(m, storage)
 	c.Tools = []astral.Tool{echoTool(&effects)}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	if effects.Load() != 1 {
 		t.Fatal("ambiguous commit mishandled")
@@ -284,14 +293,14 @@ func TestBlockedToolSkipsAfterHookAndMayTerminate(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&effects)}
-	c.BeforeToolCall = func(context.Context, astral.Invocation) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(context.Context, sessions.ToolContext) (astral.ToolDecision, error) {
 		return astral.ToolDecision{Block: true, Reason: "denied", Terminate: true}, nil
 	}
 	c.AfterToolCall = func(_ context.Context, _ astral.Invocation, r astral.ToolResult) (astral.ToolResultPatch, error) {
 		after.Add(1)
 		return astral.ToolResultPatch{}, nil
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	if effects.Load() != 0 || after.Load() != 0 || len(m.observed()) != 1 {
 		t.Fatal("blocked call crossed a boundary")
@@ -311,7 +320,7 @@ func TestAfterHookFailurePreservesExecutionOutcome(t *testing.T) {
 	c.AfterToolCall = func(context.Context, astral.Invocation, astral.ToolResult) (astral.ToolResultPatch, error) {
 		return astral.ToolResultPatch{}, errors.New("formatting failed")
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	result := toolResults(s)[0]
 	if result.Outcome != astral.OutcomeSucceeded || result.Code != "after_tool_failed" || result.Content[0].Text != "real output" || effects.Load() != 1 {

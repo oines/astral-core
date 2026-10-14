@@ -38,7 +38,7 @@ config.Tools = set.Tools()
 
 - 不内置 Codex 的沙箱、授权策略、网络审批、设备协议或应用 UI。宿主通过 Backend、Hook 和环境提供这些能力。
 - 不提供 Pi 的 `bash`；该位置由命令会话工具替代。没有在模型 schema 中加入 Codex 特定的 `sandbox_permissions` 等宿主策略字段。
-- `edit` 发布当前数组 schema，不接受 Pi 为旧客户端提供的单组 `oldText/newText` 兼容输入。工具定义版本为 `2`，旧历史必须按 Core 的配置规则显式迁移。
+- `edit` 发布当前数组 schema，不接受 Pi 为旧客户端提供的单组 `oldText/newText` 兼容输入。工具定义版本为 `2`；持久 Session 使用的声明必须与宿主实现匹配。当前存储格式不支持旧日志自动迁移。
 - 匹配与修改行为有参考样例验证；Go diff 库可能为重复行选择不同但等价的 diff。Go 图片编码器的字节和压缩质量也不会与 Pi 完全相同。
 - 本地 Shell / PTY 后端目前支持 Unix。非 Unix 调用明确报错；可接入原生或远程 Backend。Windows 目标的命令等待下限仍按其环境快照处理。
 
@@ -83,7 +83,7 @@ config.Tools = set.Tools()
 | 活跃进程数 | 默认最多 64；满时回收最久未用且当前没有交互的会话，全部忙则拒绝新启动 |
 | 输出缓冲 | 每个进程未读输出、每次调用收集输出各默认最多 1 MiB，保留头尾并标记省略 |
 
-等待窗口结束会返回数字 `session_id`，不会终止命令。`write_stdin` 只交付上次取走之后的新输出；各进程可以并行，同一进程的读写串行。完成结果包含 `exit_code`，该 ID 随后不可再次使用。输出正文的 Token 上限采用 Codex 风格的约 4 字节 / Token 估算；截断提示和结果头是额外元数据，精确 Provider 预算仍由 Core 的 Model 适配器检查。
+等待窗口结束会返回数字 `session_id`，不会终止命令。`write_stdin` 只交付上次取走之后的新输出；各进程可以并行，同一进程的读写串行。完成结果包含 `exit_code`，该 ID 随后不可再次使用。输出正文的 Token 上限采用 Codex 风格的约 4 字节 / Token 估算；截断提示和结果头是额外元数据，精确 Provider 预算由 Session 的独立 TokenEstimator 检查。
 
 非 PTY 会话拒绝普通输入，但单独的 Ctrl-C 可向进程组发送中断。PTY 接收输入字节，可用于交互式程序。默认本地 PTY 为 80×24；没有终端 UI 或窗口尺寸同步服务。
 
@@ -97,11 +97,11 @@ config.Tools = set.Tools()
 
 ## 生命周期与环境绑定
 
-一个 `Set` 可以跨多个 Run 和 Agent Session 复用，每个终端会话有自己的所属 Session。`write_stdin` 在审批之前找到原始 Binding，执行之前再次验证。切换当前 Runtime 或 Workspace 不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
+一个 `Set` 可以跨多个 Run、独立 Agent 和持久 Session 复用，每个终端会话有自己的执行所有者。Invocation.Binding 是 opaque JSON；标准工具通过可选 `environment` 包解释其 Binding 和 Snapshot。`write_stdin` 在审批之前找到原始绑定，执行之前再次验证。切换当前 Runtime 或 Workspace 不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
 
 命令不会随着一次工具调用的 Context 结束而被自动杀死。取消等待会返回已经收集的输出和已知的活跃 ID；后续可继续读取。取消一个正在阻塞的 PTY 写入可能已提交部分输入，本地后端会终止该进程并报告未知效果，避免返回后继续暗中写入。
 
-进程会话保存在 Set 内存中。它们不会通过 Rollout 在进程重启后自动重新建立，也不会重跑旧命令。重启后的旧 ID 返回不可用；已开始工具的恢复仍遵循 Core 的未知效果规则。
+进程会话保存在 Set 内存中。它们不会通过持久历史在进程重启后自动重新建立，也不会重跑旧命令。重启后的旧 ID 返回不可用；持久 Session 按 started / completed 事实处理恢复，不自动重跑未知效果的工具。Standalone Core 只保留进程内状态。
 
 宿主停止 Agent 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Agent.Close` 不替宿主关闭 Set 或 Backend。本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/standardtools"
 )
 
@@ -66,16 +67,20 @@ func (b *Backend) target(ctx context.Context, inv astral.Invocation) (string, st
 	if err := ctx.Err(); err != nil {
 		return "", "", beforeStart(err)
 	}
-	if inv.Binding.RuntimeID != "" && inv.Binding.RuntimeID != b.runtimeID || inv.Binding.ComputerID != "" && inv.Binding.ComputerID != b.computerID {
+	target, err := environments.Decode(inv.Binding)
+	if err != nil {
+		return "", "", beforeStart(err)
+	}
+	if target.Binding.RuntimeID != "" && target.Binding.RuntimeID != b.runtimeID || target.Binding.ComputerID != "" && target.Binding.ComputerID != b.computerID {
 		return "", "", beforeStart(errors.New("local backend cannot serve this runtime/computer binding"))
 	}
 	cwd, shell := b.cwd, b.shell
-	if inv.Environment != nil {
-		if inv.Environment.CWD != "" {
-			cwd = inv.Environment.CWD
+	if target.Snapshot != nil {
+		if target.Snapshot.CWD != "" {
+			cwd = target.Snapshot.CWD
 		}
-		if inv.Environment.Shell != "" {
-			shell = inv.Environment.Shell
+		if target.Snapshot.Shell != "" {
+			shell = target.Snapshot.Shell
 		}
 	}
 	if !filepath.IsAbs(cwd) {

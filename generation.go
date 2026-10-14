@@ -3,67 +3,41 @@ package astral
 import (
 	"context"
 	"errors"
-	"time"
+
+	"github.com/oines/astral-core/internal/retry"
 )
 
-func (s *Session) generate(ctx context.Context, run *Run, turnID string) (Entry, error) {
-	policy := s.agent.config.Retry
+func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, error) {
+	p := a.config.Retry
 	override := ""
-	seenFallbacks := map[string]bool{}
-	var lastErr error
-	var lastModelID string
+	seen := map[string]bool{}
 	attempts := 0
-	for fallbackRound := 0; fallbackRound <= policy.MaxFallbacks; fallbackRound++ {
-		for attempt := 0; attempt < policy.MaxAttempts; attempt++ {
-			if err := ctx.Err(); err != nil {
-				return Entry{}, err
-			}
-			s.mu.Lock()
-			preferred := s.configurationLocked().ModelID
-			s.mu.Unlock()
-			id := preferred
-			if override != "" {
-				id = override
-			}
-			model, err := s.agent.model(ctx, id)
-			if err != nil {
-				return Entry{}, err
-			}
-			view, err := s.prepareRequest(ctx, model)
-			if err != nil {
-				return Entry{}, err
-			}
-			// Compaction may await a separate model for a long time. Honor a
-			// selection made during that preparation, with a fresh budget check.
-			// Do not compact again for this attempt if the new window is smaller.
-			s.mu.Lock()
-			current := s.configurationLocked().ModelID
-			s.mu.Unlock()
-			if current != preferred {
+	var lastErr error
+	var lastModel string
+	for round := 0; round <= p.MaxFallbacks; round++ {
+		preferred, attemptID := "", ""
+		fallbackAllowed := false
+		frame, err := retry.Do(ctx, retry.Policy{Attempts: p.MaxAttempts, Initial: p.InitialBackoff, Maximum: p.MaxBackoff}, func(attempt int) (Frame, retry.Decision, error) {
+			fallbackAllowed = false
+			current := a.driver.Snapshot().Configuration.ModelID
+			if attempt > 0 && current != preferred {
 				override = ""
-				id = current
-				model, err = s.agent.model(ctx, id)
-				if err == nil {
-					view, err = s.requestContext(ctx, model)
-				}
-				if err != nil {
-					return Entry{}, err
-				}
 			}
-			lastModelID = id
-			attemptID := newID()
-			record := AttemptRecord{ID: attemptID, ModelID: id, ConfigurationID: view.ConfigurationID, HeadID: view.HeadID, Status: "started", Purpose: "generation"}
-			if _, err = s.append(ctx, Entry{Kind: EntryAttempt, RunID: run.id, TurnID: turnID, Attempt: &record}); err != nil {
-				return Entry{}, err
+			preferred = current
+			model, request, err := a.driver.Prepare(ctx, override)
+			if err != nil {
+				return Frame{}, retry.Decision{}, err
 			}
-			s.publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID, AttemptID: attemptID})
+			lastModel = model.Spec().ID
+			attemptID = newID()
+			a.Publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID, AttemptID: attemptID})
 			requestCtx := ctx
 			cancel := func() {}
-			if policy.RequestTimeout > 0 {
-				requestCtx, cancel = context.WithTimeout(ctx, policy.RequestTimeout)
+			if p.RequestTimeout > 0 {
+				requestCtx, cancel = context.WithTimeout(ctx, p.RequestTimeout)
 			}
-			reply, streamErr := stream(requestCtx, model, view.Request, func(delta ModelEvent) {
-				s.publish(Event{Type: EventMessageUpdate, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Model: &delta})
+			reply, streamErr := stream(requestCtx, model, request, func(e ModelEvent) {
+				a.Publish(Event{Type: EventMessageUpdate, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Model: &e})
 			})
 			streamErr = requestError(ctx, requestCtx, streamErr)
 			cancel()
@@ -71,106 +45,60 @@ func (s *Session) generate(ctx context.Context, run *Run, turnID string) (Entry,
 			if streamErr == nil {
 				streamErr = validateReply(reply)
 			}
-			if streamErr == nil && ctx.Err() != nil {
+			if streamErr == nil {
 				streamErr = ctx.Err()
 			}
 			if streamErr == nil {
-				record.Status = "succeeded"
-				record.Usage = reply.Usage
-				committed, err := s.append(ctx, Entry{Kind: EntryAttempt, RunID: run.id, TurnID: turnID, Attempt: &record}, Entry{Kind: EntryMessage, RunID: run.id, TurnID: turnID, Message: &reply.Message})
-				if err != nil {
-					return Entry{}, err
+				frame := Frame{ID: newID(), TurnID: turnID, Message: reply.Message}
+				if err = a.driver.Commit(ctx, Transition{Kind: TransitionMessage, ID: frame.ID, RunID: run.id, TurnID: turnID, Message: &frame.Message, Usage: reply.Usage}); err != nil {
+					return Frame{}, retry.Decision{}, err
 				}
-				assistant := committed[1]
-				s.publish(Event{Type: EventMessageEnd, RunID: run.id, TurnID: turnID, AttemptID: attemptID, EntryID: assistant.ID})
-				return assistant, nil
+				a.Publish(Event{Type: EventMessageEnd, RunID: run.id, TurnID: turnID, AttemptID: attemptID, EntryID: frame.ID})
+				return frame, retry.Decision{}, nil
 			}
-			lastErr = streamErr
-			record.Status = "failed"
-			record.Error = streamErr.Error()
-			cleanup, done := persistContext(ctx)
-			_, err = s.append(cleanup, Entry{Kind: EntryAttempt, RunID: run.id, TurnID: turnID, Attempt: &record})
-			done()
-			if err != nil {
-				return Entry{}, errors.Join(streamErr, err)
-			}
-			s.publish(Event{Type: EventAttemptFailed, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Error: streamErr.Error()})
-			if ctx.Err() != nil {
-				return Entry{}, ctx.Err()
-			}
+			fallbackAllowed = true
+			a.Publish(Event{Type: EventAttemptFailed, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Error: streamErr.Error()})
 			var classified *ModelError
-			retryable := errors.As(streamErr, &classified) && classified.Transient
-			if !retryable || attempt+1 == policy.MaxAttempts {
-				break
+			decision := retry.Decision{}
+			if errors.As(streamErr, &classified) {
+				decision = retry.Decision{Retry: classified.Transient, After: classified.RetryAfter}
 			}
-			delay := policy.InitialBackoff
-			for n := 0; n < attempt && delay < policy.MaxBackoff; n++ {
-				if delay > policy.MaxBackoff/2 {
-					delay = policy.MaxBackoff
-				} else {
-					delay *= 2
-				}
-			}
-			if classified.RetryAfter > delay {
-				delay = classified.RetryAfter
-			}
-			s.publish(Event{Type: EventRetry, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Error: streamErr.Error()})
-			if err = waitDelay(ctx, delay); err != nil {
-				return Entry{}, err
-			}
-			// A user's explicit selection during a failed request takes precedence
-			// over a temporary fallback on the next retry.
-			s.mu.Lock()
-			changed := s.configurationLocked().ModelID != preferred
-			s.mu.Unlock()
-			if changed {
-				override = ""
-			}
+			return Frame{}, decision, streamErr
+		}, func(err error) {
+			a.Publish(Event{Type: EventRetry, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Error: err.Error()})
+		})
+		if err == nil {
+			return frame, nil
+		}
+		lastErr = err
+		if !fallbackAllowed {
+			return Frame{}, err
 		}
 		if ctx.Err() != nil {
-			return Entry{}, ctx.Err()
+			return Frame{}, ctx.Err()
 		}
-		if s.agent.config.Fallback == nil || fallbackRound == policy.MaxFallbacks {
-			return Entry{}, lastErr
+		if a.config.Fallback == nil || round == p.MaxFallbacks {
+			return Frame{}, lastErr
 		}
-		alternative, err := s.agent.config.Fallback(ctx, ModelFailure{SessionID: s.id, ModelID: lastModelID, Attempts: attempts, Err: lastErr})
+		fallback, err := a.config.Fallback(ctx, ModelFailure{SessionID: a.driver.Snapshot().ID, ModelID: lastModel, Attempts: attempts, Err: lastErr})
 		if err != nil {
-			return Entry{}, err
+			return Frame{}, err
 		}
-		seenFallbacks[lastModelID] = true
-		if alternative.ModelID == "" || seenFallbacks[alternative.ModelID] {
-			return Entry{}, lastErr
+		seen[lastModel] = true
+		if fallback.ModelID == "" || seen[fallback.ModelID] {
+			return Frame{}, lastErr
 		}
-		if alternative.Persistent {
-			if err = s.SelectModel(ctx, alternative.ModelID); err != nil {
-				return Entry{}, err
+		if fallback.Persistent {
+			if err = a.driver.Commit(ctx, Transition{Kind: TransitionSelectModel, ID: newID(), ModelID: fallback.ModelID}); err != nil {
+				return Frame{}, err
 			}
 			override = ""
 		} else {
-			override = alternative.ModelID
+			override = fallback.ModelID
 		}
 	}
-	return Entry{}, lastErr
+	return Frame{}, lastErr
 }
-
-func (s *Session) prepareRequest(ctx context.Context, model Model) (Context, error) {
-	view, err := s.requestContext(ctx, model)
-	near := err == nil && s.agent.config.Budget.AutoCompactAt > 0 && view.EstimatedInput > model.Spec().ContextWindow-view.Request.MaxOutputTokens-s.agent.config.Budget.SafetyMargin-s.agent.config.Budget.AutoCompactAt
-	if (errors.Is(err, ErrBudget) || near) && !s.agent.config.Compaction.Disabled {
-		_, compactErr := s.compact(ctx, "", model)
-		if compactErr != nil {
-			if near && errors.Is(compactErr, ErrCompactionNoProgress) {
-				return view, nil
-			}
-			return Context{}, errors.Join(err, compactErr)
-		}
-		// At most one compaction for this request preparation. This prevents a
-		// summary which makes no useful progress from causing an unbounded loop.
-		return s.requestContext(ctx, model)
-	}
-	return view, err
-}
-
 func requestError(parent, request context.Context, err error) error {
 	if parent.Err() != nil {
 		return parent.Err()
@@ -179,15 +107,4 @@ func requestError(parent, request context.Context, err error) error {
 		return &ModelError{Code: "request_timeout", Transient: true, Cause: context.DeadlineExceeded}
 	}
 	return err
-}
-
-func waitDelay(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

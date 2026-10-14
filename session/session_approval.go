@@ -1,9 +1,19 @@
-package astral
+package session
 
 import (
 	"context"
 	"encoding/json"
+	"sort"
+
+	protocol "github.com/oines/astral-core"
 )
+
+// ToolContext exposes one Session approval gate while retaining the Core invocation.
+type ToolContext struct {
+	protocol.Invocation
+	awaitApproval func(context.Context, ApprovalRequest) (ApprovalDecision, error)
+}
+type BeforeToolCall func(context.Context, ToolContext) (protocol.ToolDecision, error)
 
 type ApprovalRequest struct {
 	Prompt  string          `json:"prompt"`
@@ -17,14 +27,14 @@ type ApprovalDecision struct {
 
 type PendingApproval struct {
 	ID         string
-	Invocation Invocation
+	Invocation protocol.Invocation
 	Request    ApprovalRequest
 }
 
 // AwaitApproval may be used in BeforeToolCall. Re-entering that hook after a
 // restart returns the persisted decision for the same invocation. Hook code
 // outside this gate must be safe to call again. One approval gate per invocation.
-func (i Invocation) AwaitApproval(ctx context.Context, request ApprovalRequest) (ApprovalDecision, error) {
+func (i ToolContext) AwaitApproval(ctx context.Context, request ApprovalRequest) (ApprovalDecision, error) {
 	if i.awaitApproval == nil {
 		return ApprovalDecision{}, fmtInvalid("approval is only available in BeforeToolCall")
 	}
@@ -38,40 +48,21 @@ func (s *Session) PendingApprovals() []PendingApproval {
 }
 
 func (s *Session) pendingApprovalsLocked() []PendingApproval {
-	decided := map[string]bool{}
-	for _, e := range s.rollout.Entries {
-		if e.Kind == EntryApprovalDecided {
-			decided[e.Approval.ID] = true
-		}
-	}
-	active := map[string]Entry{}
-	for _, e := range s.pathLocked() {
-		if e.Kind == EntryMessage && e.Message.Role == RoleAssistant {
-			active[e.ID] = e
-		}
-	}
 	var out []PendingApproval
-	for _, e := range s.rollout.Entries {
-		if e.Kind != EntryApprovalRequested || decided[e.Approval.ID] {
+	for execution, record := range s.state.Approvals {
+		if record.Decision != nil {
 			continue
 		}
-		for _, p := range s.rollout.Entries {
-			if p.Kind != EntryToolPrepared || p.Tool.Invocation.ExecutionID != e.Approval.ExecutionID {
+		for _, work := range s.state.Tools {
+			if work.Prepared == nil || work.Prepared.Tool.Invocation.ExecutionID != execution || work.Result != nil {
 				continue
 			}
-			inv := p.Tool.Invocation
-			if _, ok := active[inv.AssistantID]; !ok {
-				continue
-			}
-			if s.toolStateLocked(inv.AssistantID, inv.Call.ID).result != nil {
-				continue
-			}
-			out = append(out, PendingApproval{ID: e.Approval.ID, Invocation: inv, Request: e.Approval.Request})
+			out = append(out, PendingApproval{ID: record.ID, Invocation: work.Prepared.Tool.Invocation, Request: record.Request})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
-
 func (s *Session) DecideApproval(ctx context.Context, id string, decision ApprovalDecision) error {
 	if err := s.agent.checkOpen(); err != nil {
 		return err
@@ -79,15 +70,17 @@ func (s *Session) DecideApproval(ctx context.Context, id string, decision Approv
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return ErrClosed
+		return protocol.ErrClosed
 	}
-	for _, e := range s.rollout.Entries {
-		if e.Kind == EntryApprovalDecided && e.Approval.ID == id {
-			if sameJSON(*e.Approval.Decision, decision) {
-				return nil
-			}
-			return ErrAlreadyResolved
+	page, err := s.agent.config.Store.Scan(ctx, s.id, Query{Kind: EntryApprovalDecided, Reference: id, Reverse: true, Limit: 1})
+	if err != nil {
+		return err
+	}
+	if len(page.Records) > 0 {
+		if sameJSON(*page.Records[0].Entry.Approval.Decision, decision) {
+			return nil
 		}
+		return ErrAlreadyResolved
 	}
 	for _, p := range s.pendingApprovalsLocked() {
 		if p.ID == id {
@@ -97,38 +90,32 @@ func (s *Session) DecideApproval(ctx context.Context, id string, decision Approv
 	}
 	return ErrNotFound
 }
-
-func (s *Session) awaitApproval(ctx context.Context, inv Invocation, request ApprovalRequest) (ApprovalDecision, error) {
+func (s *Session) awaitApproval(ctx context.Context, inv protocol.Invocation, request ApprovalRequest) (ApprovalDecision, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return ApprovalDecision{}, err
 		}
 		s.mu.Lock()
-		id := ""
-		for _, e := range s.rollout.Entries {
-			if e.Approval != nil && e.Approval.ExecutionID == inv.ExecutionID {
-				if e.Kind == EntryApprovalDecided {
-					decision := *e.Approval.Decision
-					s.mu.Unlock()
-					return decision, nil
-				}
-				if e.Kind == EntryApprovalRequested {
-					id = e.Approval.ID
-					if !sameJSON(e.Approval.Request, request) {
-						s.mu.Unlock()
-						return ApprovalDecision{}, fmtInvalid("approval request changed after persistence")
-					}
-				}
+		record, exists := s.state.Approvals[inv.ExecutionID]
+		if exists {
+			if !sameJSON(record.Request, request) {
+				s.mu.Unlock()
+				return ApprovalDecision{}, fmtInvalid("approval request changed after persistence")
+			}
+			if record.Decision != nil {
+				decision := *record.Decision
+				s.mu.Unlock()
+				return decision, nil
 			}
 		}
-		if id == "" {
-			id = newID()
+		if !exists {
+			id := newID()
 			_, err := s.appendLocked(ctx, Entry{Kind: EntryApprovalRequested, RunID: inv.RunID, TurnID: inv.TurnID, Approval: &ApprovalRecord{ID: id, ExecutionID: inv.ExecutionID, Request: request}})
 			if err != nil {
 				s.mu.Unlock()
 				return ApprovalDecision{}, err
 			}
-			s.publishLocked(Event{Type: EventApproval, ApprovalID: id, RunID: inv.RunID, TurnID: inv.TurnID, ExecutionID: inv.ExecutionID, ToolCallID: inv.Call.ID})
+			s.publishLocked(protocol.Event{Type: protocol.EventApproval, ApprovalID: id, RunID: inv.RunID, TurnID: inv.TurnID, ExecutionID: inv.ExecutionID, ToolCallID: inv.Call.ID})
 		}
 		changed := s.changed
 		s.mu.Unlock()

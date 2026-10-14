@@ -11,29 +11,40 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/jsonl"
 	"github.com/oines/astral-core/store/memory"
+	"github.com/oines/astral-core/store/sqlite"
 )
 
-func storeHeader() []astral.Entry {
-	return []astral.Entry{
-		{ID: "created", Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: 1, SessionID: "session"}},
-		{ID: "config", Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{ModelID: "model"}},
+func storeHeader() []sessions.Entry {
+	return []sessions.Entry{
+		{ID: "created", Kind: sessions.EntryCreated, Created: &sessions.CreationRecord{FormatVersion: sessions.FormatVersion, SessionID: "session"}},
+		{ID: "config", Kind: sessions.EntryConfiguration, Configuration: &sessions.Configuration{ModelID: "model"}},
 	}
 }
-func storeMessage(id, parent string) astral.Entry {
+func storeMessage(id, parent string) sessions.Entry {
 	m := astral.User(id)
-	return astral.Entry{ID: id, ParentID: parent, Kind: astral.EntryMessage, Message: &m}
+	return sessions.Entry{ID: id, ParentID: parent, Kind: sessions.EntryMessage, Message: &m}
 }
 
 func TestStoreConformance(t *testing.T) {
-	factories := map[string]func(*testing.T) astral.Store{
-		"memory": func(*testing.T) astral.Store { return memory.New() },
-		"jsonl": func(t *testing.T) astral.Store {
+	factories := map[string]func(*testing.T) sessions.Store{
+		"sqlite": func(t *testing.T) sessions.Store {
+			store, err := sqlite.Open(filepath.Join(t.TempDir(), "history.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { store.Close() })
+			return store
+		},
+		"memory": func(*testing.T) sessions.Store { return memory.New() },
+		"jsonl": func(t *testing.T) sessions.Store {
 			s, err := jsonl.Open(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { s.Close() })
 			return s
 		},
 	}
@@ -41,15 +52,15 @@ func TestStoreConformance(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
 			ctx := context.Background()
-			if _, err := s.Read(ctx, "session"); !errors.Is(err, astral.ErrNotFound) {
+			if _, err := readStore(ctx, s, "session"); !errors.Is(err, sessions.ErrNotFound) {
 				t.Fatalf("absent: %v", err)
 			}
 			batch := storeHeader()
-			if err := s.Append(ctx, "session", 0, batch); err != nil {
+			if err := appendStore(ctx, s, "session", 0, batch); err != nil {
 				t.Fatal(err)
 			}
 			batch[1].Configuration.ModelID = "mutated"
-			r, err := s.Read(ctx, "session")
+			r, err := readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,31 +68,31 @@ func TestStoreConformance(t *testing.T) {
 				t.Fatalf("append isolation: %+v", r)
 			}
 			r.Entries[1].Configuration.ModelID = "mutated read"
-			original, err := s.Read(ctx, "session")
+			original, err := readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if original.Entries[1].Configuration.ModelID != "model" {
 				t.Fatal("read alias")
 			}
-			if err = s.Append(ctx, "session", 0, []astral.Entry{storeMessage("conflict", "config")}); !errors.Is(err, astral.ErrConflict) {
+			if err = appendStore(ctx, s, "session", 0, []sessions.Entry{storeMessage("conflict", "config")}); !errors.Is(err, sessions.ErrConflict) {
 				t.Fatalf("CAS: %v", err)
 			}
-			bad := []astral.Entry{storeMessage("one", "config"), storeMessage("two", "missing-parent")}
-			if err = s.Append(ctx, "session", 1, bad); err == nil {
+			bad := []sessions.Entry{storeMessage("one", "config"), storeMessage("two", "missing-parent")}
+			if err = appendStore(ctx, s, "session", 1, bad); err == nil {
 				t.Fatal("invalid batch accepted")
 			}
-			after, err := s.Read(ctx, "session")
+			after, err := readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !reflect.DeepEqual(original, after) {
 				t.Fatal("partial batch committed")
 			}
-			if err = s.Append(ctx, "session", 1, []astral.Entry{storeMessage("one", "config"), storeMessage("two", "one")}); err != nil {
+			if err = appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage("one", "config"), storeMessage("two", "one")}); err != nil {
 				t.Fatal(err)
 			}
-			after, err = s.Read(ctx, "session")
+			after, err = readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -90,7 +101,7 @@ func TestStoreConformance(t *testing.T) {
 			}
 			cancelled, cancel := context.WithCancel(ctx)
 			cancel()
-			if err = s.Append(cancelled, "session", 2, []astral.Entry{storeMessage("cancelled", "two")}); !errors.Is(err, context.Canceled) {
+			if err = appendStore(cancelled, s, "session", 2, []sessions.Entry{storeMessage("cancelled", "two")}); !errors.Is(err, context.Canceled) {
 				t.Fatalf("cancel: %v", err)
 			}
 		})
@@ -112,7 +123,7 @@ func TestJSONLSeparateHandlesShareAtomicCompareAndAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err = first.Append(ctx, "session", 0, storeHeader()); err != nil {
+	if err = appendStore(ctx, first, "session", 0, storeHeader()); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -123,7 +134,7 @@ func TestJSONLSeparateHandlesShareAtomicCompareAndAppend(t *testing.T) {
 		go func(i int, s *jsonl.Store) {
 			defer wg.Done()
 			<-start
-			errs <- s.Append(ctx, "session", 1, []astral.Entry{storeMessage(string(rune('a'+i)), "config")})
+			errs <- appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage(string(rune('a'+i)), "config")})
 		}(i, store)
 	}
 	close(start)
@@ -133,7 +144,7 @@ func TestJSONLSeparateHandlesShareAtomicCompareAndAppend(t *testing.T) {
 	for err := range errs {
 		if err == nil {
 			success++
-		} else if errors.Is(err, astral.ErrConflict) {
+		} else if errors.Is(err, sessions.ErrConflict) {
 			conflicts++
 		} else {
 			t.Fatal(err)
@@ -146,7 +157,7 @@ func TestJSONLSeparateHandlesShareAtomicCompareAndAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := reopened.Read(ctx, "session")
+	r, err := readStore(ctx, reopened, "session")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +173,7 @@ func TestJSONLRecoversOnlyUnterminatedTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err = s.Append(ctx, "session", 0, storeHeader()); err != nil {
+	if err = appendStore(ctx, s, "session", 0, storeHeader()); err != nil {
 		t.Fatal(err)
 	}
 	files, err := os.ReadDir(directory)
@@ -174,24 +185,32 @@ func TestJSONLRecoversOnlyUnterminatedTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Append(ctx, "session", 1, []astral.Entry{storeMessage("lost", "config"), storeMessage("lost-too", "lost")}); err != nil {
+	if err = appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage("lost", "config"), storeMessage("lost-too", "lost")}); err != nil {
 		t.Fatal(err)
 	}
 	complete, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err = os.Truncate(filename, int64(len(prefix)+(len(complete)-len(prefix))/2)); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.Read(ctx, "session")
+	s, err = jsonl.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	r, err := readStore(ctx, s, "session")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.Version != 1 || len(r.Entries) != 2 {
 		t.Fatal("partial commit exposed")
 	}
-	if err = s.Append(ctx, "session", 1, []astral.Entry{storeMessage("replacement", "config")}); err != nil {
+	if err = appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage("replacement", "config")}); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := os.ReadFile(filename)
@@ -201,7 +220,7 @@ func TestJSONLRecoversOnlyUnterminatedTail(t *testing.T) {
 	if !bytes.HasPrefix(recovered, prefix) || bytes.Contains(recovered, []byte("lost-too")) {
 		t.Fatal("committed prefix changed or crash tail survived")
 	}
-	r, err = s.Read(ctx, "session")
+	r, err = readStore(ctx, s, "session")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +236,7 @@ func TestJSONLRejectsCommittedCorruptionWithoutRepairingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err = s.Append(ctx, "session", 0, storeHeader()); err != nil {
+	if err = appendStore(ctx, s, "session", 0, storeHeader()); err != nil {
 		t.Fatal(err)
 	}
 	files, err := os.ReadDir(directory)
@@ -233,13 +252,21 @@ func TestJSONLRejectsCommittedCorruptionWithoutRepairingIt(t *testing.T) {
 	if bytes.Equal(data, corrupt) {
 		t.Fatal("fixture did not change")
 	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err = os.WriteFile(filename, corrupt, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Read(ctx, "session"); !errors.Is(err, astral.ErrCorrupt) {
+	s, err = jsonl.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err = readStore(ctx, s, "session"); !errors.Is(err, sessions.ErrCorrupt) {
 		t.Fatalf("read corruption: %v", err)
 	}
-	if err = s.Append(ctx, "session", 1, []astral.Entry{storeMessage("one", "config")}); !errors.Is(err, astral.ErrCorrupt) {
+	if err = appendStore(ctx, s, "session", 1, []sessions.Entry{storeMessage("one", "config")}); !errors.Is(err, sessions.ErrCorrupt) {
 		t.Fatalf("append corruption: %v", err)
 	}
 	after, err := os.ReadFile(filename)
@@ -257,23 +284,12 @@ func TestContextRejectsMessageInsertedBeforeToolBatchFinishes(t *testing.T) {
 	assistant := calls(toolCall).Message
 	inv := astral.Invocation{SessionID: "session", AssistantID: "assistant", ExecutionID: "execution", Call: toolCall}
 	result := astral.ToolResult{Content: astral.Text("done"), Outcome: astral.OutcomeSucceeded}
-	batch = append(batch, astral.Entry{ID: "assistant", ParentID: "config", Kind: astral.EntryMessage, Message: &assistant}, storeMessage("interleaved", "assistant"), astral.Entry{ID: "result", ParentID: "interleaved", Kind: astral.EntryToolResult, Tool: &astral.ToolRecord{Invocation: inv, Result: &result}})
+	batch = append(batch, sessions.Entry{ID: "assistant", ParentID: "config", Kind: sessions.EntryMessage, Message: &assistant}, storeMessage("interleaved", "assistant"), sessions.Entry{ID: "result", ParentID: "interleaved", Kind: sessions.EntryToolResult, Tool: &sessions.ToolRecord{Invocation: inv, Result: &result}})
 	store := memory.New()
-	if err := store.Append(context.Background(), "session", 0, batch); err != nil {
-		t.Fatal(err)
+	if err := appendStore(context.Background(), store, "session", 0, batch); !errors.Is(err, astral.ErrIncompleteBatch) {
+		t.Fatalf("malformed chronology accepted: %v", err)
 	}
-	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-		return answer("unexpected"), nil
-	})
-	m.spec.ID = "model"
-	s, err := newAgent(t, testConfig(m, store)).OpenSession(context.Background(), "session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = s.InspectContext(context.Background()); !errors.Is(err, astral.ErrIncompleteBatch) {
-		t.Fatalf("malformed chronology silently repaired: %v", err)
-	}
-	if len(m.observed()) != 0 {
-		t.Fatal("invalid request streamed")
+	if _, err := store.LoadState(context.Background(), "session"); !errors.Is(err, sessions.ErrNotFound) {
+		t.Fatalf("partial invalid batch: %v", err)
 	}
 }

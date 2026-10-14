@@ -11,6 +11,8 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -41,8 +43,8 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeStandard(t, set)
-	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(context.Context, astral.Invocation, standardtools.EnvironmentSelection) (astral.EnvironmentSnapshot, error) {
-		return astral.EnvironmentSnapshot{RuntimeID: "runtime-two", WorkspaceID: "workspace-two", CWD: "/two"}, nil
+	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(context.Context, astral.Invocation, standardtools.EnvironmentSelection) (environments.Snapshot, error) {
+		return environments.Snapshot{RuntimeID: "runtime-two", WorkspaceID: "workspace-two", CWD: "/two"}, nil
 	}))
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		switch n {
@@ -67,17 +69,17 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = tools
-	var initial, poll astral.Binding
-	c.BeforeToolCall = func(_ context.Context, inv astral.Invocation) (astral.ToolDecision, error) {
+	var initial, poll environments.Binding
+	c.BeforeToolCall = func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
 		if inv.Call.Name == "exec_command" {
-			initial = inv.Binding
+			initial = bindingOf(inv.Binding)
 		}
 		if inv.Call.Name == "write_stdin" {
-			poll = inv.Binding
+			poll = bindingOf(inv.Binding)
 		}
 		return astral.ToolDecision{}, nil
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{Environment: &astral.EnvironmentSnapshot{RuntimeID: "runtime-one", WorkspaceID: "workspace-one", CWD: dir}})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "runtime-one", WorkspaceID: "workspace-one", CWD: dir}})
 	waitOK(t, start(t, s, "work"))
 	view, err := s.InspectContext(context.Background())
 	if err != nil {
@@ -130,7 +132,7 @@ func TestBackendCanReportUncertainRemoteEffects(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = set.Tools()
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	if _, err = wait(t, start(t, s, "go")); !errors.Is(err, astral.ErrOutcomeUnknown) {
 		t.Fatalf("unknown effect: %v", err)
 	}

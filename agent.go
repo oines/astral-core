@@ -2,31 +2,38 @@ package astral
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Agent freezes defaults and tool declarations at construction. It owns no
-// provider credentials, network connections, runtime or workspace lifecycle.
+// Agent owns one executor and its process-local lifecycle. It never closes
+// host-owned models, tools, runtimes, or driver dependencies.
 type Agent struct {
-	mu       sync.Mutex
-	config   Config
-	defaults Configuration
-	modelID  string
-	tools    map[string]registeredTool
-	sessions map[string]*Session
-	closed   bool
+	mu      sync.Mutex
+	config  Config
+	modelID string
+	tools   map[string]registeredTool
+	driver  Driver
+	active  *Run
+	closed  bool
+	events  eventHub
 }
 
 func New(config Config) (*Agent, error) {
-	if config.Model == nil || config.Store == nil {
-		return nil, fmtInvalid("Model and Store are required")
+	if config.Model == nil {
+		return nil, fmtInvalid("Model is required")
 	}
-	spec := config.Model.Spec()
-	if err := validateModelSpec(spec); err != nil {
+	if err := validateModelSpec(config.Model.Spec()); err != nil {
 		return nil, err
+	}
+	ownedBinding, err := copyJSON(config.Binding)
+	if err != nil {
+		return nil, fmtInvalid("binding: %v", err)
+	}
+	config.Binding = ownedBinding
+	if config.ID == "" {
+		config.ID = newID()
 	}
 	if config.Retry.MaxAttempts == 0 {
 		config.Retry.MaxAttempts = 3
@@ -40,163 +47,142 @@ func New(config Config) (*Agent, error) {
 	if config.Retry.MaxFallbacks == 0 {
 		config.Retry.MaxFallbacks = 1
 	}
-	if config.Retry.MaxAttempts < 1 || config.Retry.InitialBackoff < 0 || config.Retry.MaxBackoff < config.Retry.InitialBackoff || config.Retry.RequestTimeout < 0 || config.Retry.MaxFallbacks < 0 {
-		return nil, fmtInvalid("invalid retry policy")
-	}
 	if config.MaxParallelTools == 0 {
 		config.MaxParallelTools = 8
 	}
-	if config.Budget.OutputTokens < 0 || config.Budget.SafetyMargin < 0 || config.Budget.AutoCompactAt < 0 || config.MaxTurns < 0 || config.MaxParallelTools < 1 {
-		return nil, fmtInvalid("negative budget or turn limit")
+	if config.MaxTurns < 0 || config.MaxParallelTools < 1 || config.Retry.MaxAttempts < 1 || config.Retry.InitialBackoff < 0 || config.Retry.MaxBackoff < config.Retry.InitialBackoff || config.Retry.RequestTimeout < 0 || config.Retry.MaxFallbacks < 0 {
+		return nil, fmtInvalid("invalid execution policy")
 	}
-	if config.Compaction.KeepRecentTokens == 0 {
-		config.Compaction.KeepRecentTokens = 20000
-	}
-	if config.Compaction.OutputTokens < 0 || config.Compaction.KeepRecentTokens < 0 {
-		return nil, fmtInvalid("invalid compaction policy")
-	}
-	if config.Compaction.SystemPrompt == "" {
-		config.Compaction.SystemPrompt = defaultSummaryPrompt
-	}
-	a := &Agent{config: config, modelID: spec.ID, tools: map[string]registeredTool{}, sessions: map[string]*Session{}, defaults: Configuration{SystemPrompt: config.SystemPrompt, ModelID: spec.ID}}
-	for _, tool := range config.Tools {
-		if tool == nil {
+	a := &Agent{config: config, modelID: config.Model.Spec().ID, tools: map[string]registeredTool{}}
+	configuration := Configuration{SystemPrompt: config.SystemPrompt, ModelID: a.modelID}
+	for _, t := range config.Tools {
+		if t == nil {
 			return nil, fmtInvalid("nil tool")
 		}
-		def, err := copyJSON(tool.Definition())
-		if err != nil {
-			return nil, fmtInvalid("tool declaration: %v", err)
-		}
-		if def.Name == "" || strings.TrimSpace(def.Name) != def.Name {
-			return nil, fmtInvalid("invalid tool name")
-		}
-		if _, exists := a.tools[def.Name]; exists {
-			return nil, fmtInvalid("duplicate tool %q", def.Name)
-		}
-		validator, err := compileSchema(def.Parameters)
-		if err != nil {
-			return nil, fmtInvalid("tool %s schema: %v", def.Name, err)
-		}
-		a.tools[def.Name] = registeredTool{tool: tool, definition: def, schema: validator}
-		a.defaults.Tools = append(a.defaults.Tools, def)
-	}
-	// The slice itself must not follow later caller mutations.
-	a.config.Tools = nil
-	return a, nil
-}
-
-func (a *Agent) NewSession(ctx context.Context, options SessionOptions) (*Session, error) {
-	if err := a.checkOpen(); err != nil {
-		return nil, err
-	}
-	if options.ID == "" {
-		options.ID = newID()
-	}
-	if options.Environment == nil && a.config.Environment != nil {
-		snapshot, err := a.config.Environment(ctx, EnvironmentRequest{SessionID: options.ID})
+		d, err := copyJSON(t.Definition())
 		if err != nil {
 			return nil, err
 		}
-		options.Environment = &snapshot
+		if d.Name == "" || strings.TrimSpace(d.Name) != d.Name {
+			return nil, fmtInvalid("invalid tool name")
+		}
+		if _, ok := a.tools[d.Name]; ok {
+			return nil, fmtInvalid("duplicate tool %q", d.Name)
+		}
+		validator, err := compileSchema(d.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		a.tools[d.Name] = registeredTool{tool: t, definition: d, schema: validator}
+		configuration.Tools = append(configuration.Tools, d)
 	}
-	entries := []Entry{{Kind: EntryCreated, Created: &CreationRecord{FormatVersion: 1, SessionID: options.ID}}, {Kind: EntryConfiguration, Configuration: &a.defaults}}
-	if options.Environment != nil {
-		entries = append(entries, Entry{Kind: EntryEnvironment, Environment: options.Environment})
+	a.config.Tools = nil
+	a.events.init(config.ID)
+	a.driver = config.Driver
+	if a.driver == nil {
+		a.driver = newMemoryDriver(a, configuration)
 	}
-	return a.create(ctx, options.ID, entries, false)
+	return a, nil
 }
 
-func (a *Agent) create(ctx context.Context, id string, entries []Entry, needsRefresh bool) (*Session, error) {
+func (a *Agent) Start(ctx context.Context, message Message) (*Run, error) {
+	if err := validateUser(message); err != nil {
+		return nil, err
+	}
+	owned, err := copyJSON(message)
+	if err != nil {
+		return nil, err
+	}
+	return a.begin(ctx, &owned)
+}
+func (a *Agent) Continue(ctx context.Context) (*Run, error) { return a.begin(ctx, nil) }
+func (a *Agent) begin(ctx context.Context, input *Message) (*Run, error) {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil, ErrClosed
+	}
+	if a.active != nil {
+		a.mu.Unlock()
+		return nil, ErrBusy
+	}
+	if err := ctx.Err(); err != nil {
+		a.mu.Unlock()
+		return nil, err
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	r := &Run{id: newID(), ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+	// Reserve ownership before awaiting the driver, without holding the
+	// lifecycle lock across host IO. Close can cancel and join this start too.
+	a.active = r
+	a.mu.Unlock()
+	if err := a.driver.Commit(runCtx, Transition{Kind: TransitionRunStart, ID: newID(), RunID: r.id, Message: input}); err != nil {
+		cancel()
+		a.mu.Lock()
+		a.active = nil
+		a.mu.Unlock()
+		close(r.done)
+		return nil, err
+	}
+	a.Publish(Event{Type: EventRunStart, RunID: r.id})
+	go a.drive(runCtx, r)
+	return r, nil
+}
+
+// Steer and FollowUp are available with the default in-memory driver. A custom
+// driver exposes its own enqueue API so queue persistence and boundaries agree.
+func (a *Agent) Steer(ctx context.Context, m Message) (string, error) {
+	return a.queue(ctx, "steer", m)
+}
+func (a *Agent) FollowUp(ctx context.Context, m Message) (string, error) {
+	return a.queue(ctx, "follow_up", m)
+}
+func (a *Agent) queue(ctx context.Context, kind string, m Message) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
-		return nil, ErrClosed
+		return "", ErrClosed
 	}
-	if _, ok := a.sessions[id]; ok {
-		return nil, ErrConflict
+	d, ok := a.driver.(*memoryDriver)
+	if !ok {
+		return "", fmtInvalid("enqueue through the custom driver's owner")
 	}
-	s := newSession(a, id, Rollout{})
-	s.needsEnvironment = needsRefresh
-	s.mu.Lock()
-	_, err := s.appendLocked(ctx, entries...)
-	s.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	a.sessions[id] = s
-	return s, nil
+	return d.queue(ctx, kind, m)
 }
-
-func (a *Agent) OpenSession(ctx context.Context, id string) (*Session, error) {
+func (a *Agent) Cancel() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.closed {
-		return nil, ErrClosed
+	if a.active != nil {
+		a.active.cancel()
 	}
-	if s, ok := a.sessions[id]; ok {
-		return s, nil
-	}
-	r, err := a.config.Store.Read(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	r, err = copyJSON(r)
-	if err != nil {
-		return nil, err
-	}
-	if err = ValidateRollout(r); err != nil {
-		return nil, err
-	}
-	if len(r.Entries) == 0 || r.Entries[0].Created.SessionID != id {
-		return nil, ErrCorrupt
-	}
-	s := newSession(a, id, r)
-	env, _ := effectiveEnvironment(s.pathLocked())
-	s.needsEnvironment = env != nil
-	a.sessions[id] = s
-	return s, nil
 }
-
-// Close cancels and joins active work but does not close host-owned dependencies.
 func (a *Agent) Close(ctx context.Context) error {
 	a.mu.Lock()
 	a.closed = true
-	sessions := make([]*Session, 0, len(a.sessions))
-	for _, s := range a.sessions {
-		sessions = append(sessions, s)
+	r := a.active
+	if r != nil {
+		r.cancel()
 	}
 	a.mu.Unlock()
-	var pending []<-chan struct{}
-	for _, s := range sessions {
-		s.mu.Lock()
-		s.closed = true
-		if s.active != nil {
-			s.active.cancel()
-			pending = append(pending, s.active.done)
-		}
-		if s.maintenanceCancel != nil {
-			s.maintenanceCancel()
-			pending = append(pending, s.maintenanceDone)
-		}
-		s.closeSubscribersLocked(ErrClosed)
-		s.mu.Unlock()
-	}
-	var errs []error
-	for _, done := range pending {
+	a.events.close(ErrClosed)
+	if r != nil {
 		select {
-		case <-done:
+		case <-r.done:
 		case <-ctx.Done():
-			errs = append(errs, ctx.Err())
+			return ctx.Err()
 		}
 	}
-	return errors.Join(errs...)
-}
-
-func (a *Agent) checkOpen() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return ErrClosed
+	if d, ok := a.driver.(*memoryDriver); ok {
+		d.mu.Lock()
+		d.messages = nil
+		d.inputs = nil
+		d.state = ExecutionState{}
+		d.mu.Unlock()
 	}
 	return nil
 }
+func (a *Agent) Subscribe(buffer int) *Subscription { return a.events.subscribe(buffer) }
+
+// Publish lets a driver's owner publish policy events into the same ordered,
+// nonblocking stream. Events are observations, never execution acknowledgements.
+func (a *Agent) Publish(e Event) { a.events.publish(e) }

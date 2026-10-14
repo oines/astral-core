@@ -1,6 +1,7 @@
 package standardtools
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
 )
 
 type CommandRequest struct {
@@ -40,35 +42,22 @@ type CommandResult struct {
 	Output             string  `json:"output"`
 }
 
-func (t backendTool) Bind(_ context.Context, inv astral.Invocation) (astral.Binding, *astral.EnvironmentSnapshot, error) {
+func (t backendTool) Bind(_ context.Context, inv astral.Invocation) (json.RawMessage, error) {
+	if _, err := environments.Decode(inv.Binding); err != nil {
+		return nil, notExecuted("invalid target binding: " + err.Error())
+	}
 	if t.definition.Name != "write_stdin" {
-		return inv.Binding, inv.Environment, nil
+		return append(json.RawMessage(nil), inv.Binding...), nil
 	}
 	r := StdinRequest{YieldTimeMS: 250, MaxOutputTokens: 10000}
 	if err := decodeArguments(inv.Call.Arguments, &r); err != nil {
-		return astral.Binding{}, nil, err
+		return nil, err
 	}
 	p, err := t.set.lookup(r.SessionID, inv.SessionID)
 	if err != nil {
-		return astral.Binding{}, nil, err
-	}
-	environment, err := copyEnvironment(p.invocation.Environment)
-	return p.invocation.Binding, environment, err
-}
-
-func copyEnvironment(environment *astral.EnvironmentSnapshot) (*astral.EnvironmentSnapshot, error) {
-	if environment == nil {
-		return nil, nil
-	}
-	data, err := json.Marshal(environment)
-	if err != nil {
-		return nil, notExecuted("invalid environment snapshot: " + err.Error())
-	}
-	var copy astral.EnvironmentSnapshot
-	if err := json.Unmarshal(data, &copy); err != nil {
 		return nil, err
 	}
-	return &copy, nil
+	return append(json.RawMessage(nil), p.invocation.Binding...), nil
 }
 
 func (t backendTool) execCommand(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolResult, error) {
@@ -92,7 +81,11 @@ func (t backendTool) execCommand(ctx context.Context, inv astral.Invocation, emi
 	// initial output before the initial exec_command response is assembled.
 	defer p.release()
 	waitMS := min(max(r.YieldTimeMS, 250), 30000)
-	if inv.Environment != nil && strings.EqualFold(inv.Environment.OS, "windows") {
+	target, err := environments.Decode(inv.Binding)
+	if err != nil {
+		return astral.ToolResult{}, notExecuted("invalid target binding")
+	}
+	if target.Snapshot != nil && strings.EqualFold(target.Snapshot.OS, "windows") {
 		waitMS = max(waitMS, 10000)
 	}
 	return t.set.collect(ctx, p, time.Duration(waitMS)*time.Millisecond, min(r.MaxOutputTokens, t.set.options.MaxOutputTokens), start, emit), nil
@@ -110,7 +103,7 @@ func (t backendTool) writeStdin(ctx context.Context, inv astral.Invocation, emit
 	if err != nil {
 		return astral.ToolResult{}, err
 	}
-	if p.invocation.Binding != inv.Binding {
+	if !bytes.Equal(p.invocation.Binding, inv.Binding) {
 		return astral.ToolResult{}, notExecuted("process binding does not match its original target")
 	}
 	if err := p.acquire(ctx); err != nil {

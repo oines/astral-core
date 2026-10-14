@@ -1,4 +1,4 @@
-package astral
+package session
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	protocol "github.com/oines/astral-core"
 )
 
 // Compact is an idle-session operation. Automatic compaction uses the same
@@ -19,7 +21,7 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	s.mu.Lock()
 	if len(s.unresolvedLocked()) > 0 {
 		s.mu.Unlock()
-		return CompactionRecord{}, ErrOutcomeUnknown
+		return CompactionRecord{}, protocol.ErrOutcomeUnknown
 	}
 	id := s.configurationLocked().ModelID
 	s.mu.Unlock()
@@ -35,7 +37,7 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	return record, err
 }
 
-func (s *Session) compact(ctx context.Context, instructions string, normalModel Model) (CompactionRecord, error) {
+func (s *Session) compact(ctx context.Context, instructions string, normalModel protocol.Model) (CompactionRecord, error) {
 	s.mu.Lock()
 	path := clone(s.pathLocked())
 	s.mu.Unlock()
@@ -50,7 +52,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	keepStart := len(view.Request.Messages)
 	for i := len(groups) - 1; i >= 0; i-- {
 		keepStart = groups[i].start
-		request := Request{ModelID: normalModel.Spec().ID, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, normalModel.Spec())}
+		request := protocol.Request{ModelID: normalModel.Spec().ID, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, normalModel.Spec())}
 		count, err := estimate(ctx, normalModel, request)
 		if err != nil {
 			return CompactionRecord{}, err
@@ -89,7 +91,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	// Moving a whole tool batch before its environment messages in Context can
 	// put an environment's source before this raw boundary. Include every such
 	// covered message in the summary input rather than silently losing it.
-	var selected []Message
+	var selected []protocol.Message
 	var sourceIDs []string
 	for i, message := range view.Request.Messages {
 		source := view.Sources[i]
@@ -117,14 +119,14 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 		output = 4096
 	}
 	output = outputReservation(output, summaryModel.Spec())
-	request := Request{ModelID: summaryModelID, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output}
-	build := func(messages []Message) (Request, error) {
+	request := protocol.Request{ModelID: summaryModelID, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output}
+	build := func(messages []protocol.Message) (protocol.Request, error) {
 		text, err := summaryText(messages, sourceIDs, path, instructions)
 		if err != nil {
-			return Request{}, err
+			return protocol.Request{}, err
 		}
 		candidate := request
-		candidate.Messages = []Message{User(text)}
+		candidate.Messages = []protocol.Message{protocol.User(text)}
 		return candidate, nil
 	}
 	request, err = build(selected)
@@ -137,7 +139,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	if errors.Is(fitErr, ErrBudget) {
 		cap := 0
 		for _, message := range selected {
-			if message.Role == RoleTool {
+			if message.Role == protocol.RoleTool {
 				for _, part := range message.Content {
 					if n := utf8.RuneCountInString(part.Text); n > cap {
 						cap = n
@@ -149,14 +151,14 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 			cap /= 2
 			trimmed := clone(selected)
 			for i := range trimmed {
-				if trimmed[i].Role != RoleTool {
+				if trimmed[i].Role != protocol.RoleTool {
 					continue
 				}
 				for j := range trimmed[i].Content {
 					text := trimmed[i].Content[j].Text
 					if utf8.RuneCountInString(text) > cap {
 						runes := []rune(text)
-						trimmed[i].Content[j].Text = string(runes[:cap]) + "\n[tool output shortened for summary; original preserved in rollout]"
+						trimmed[i].Content[j].Text = string(runes[:cap]) + "\n[tool output shortened for summary; original preserved in history]"
 					}
 				}
 			}
@@ -173,7 +175,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 		}
 		return CompactionRecord{}, fitErr
 	}
-	reply, err := s.summarize(ctx, summaryModel, request, view)
+	reply, err := s.summarize(ctx, summaryModel, request)
 	if err != nil {
 		return CompactionRecord{}, err
 	}
@@ -202,7 +204,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 
 type messageGroup struct{ start, end int }
 
-func contextGroups(messages []Message) []messageGroup {
+func contextGroups(messages []protocol.Message) []messageGroup {
 	var groups []messageGroup
 	for i := 0; i < len(messages); {
 		end := i + 1

@@ -3,12 +3,16 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
+	sessions "github.com/oines/astral-core/session"
 )
 
 type testModel struct {
@@ -78,13 +82,17 @@ func echoTool(counter *atomic.Int32) astral.Tool {
 	})
 }
 
-func testConfig(m astral.Model, store astral.Store) astral.Config {
-	return astral.Config{Model: m, Store: store, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: astral.CompactionPolicy{Disabled: true}}
+func testConfig(m astral.Model, store sessions.Store) sessions.Config {
+	return sessions.Config{EstimateTokens: func(ctx context.Context, m astral.Model, r astral.Request) (int, error) {
+		return m.(interface {
+			EstimateTokens(context.Context, astral.Request) (int, error)
+		}).EstimateTokens(ctx, r)
+	}, Model: m, Store: store, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: sessions.CompactionPolicy{Disabled: true}}
 }
 
-func newAgent(t *testing.T, c astral.Config) *astral.Agent {
+func newAgent(t *testing.T, c sessions.Config) *sessions.Manager {
 	t.Helper()
-	a, err := astral.New(c)
+	a, err := sessions.New(c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +106,7 @@ func newAgent(t *testing.T, c astral.Config) *astral.Agent {
 	return a
 }
 
-func newSession(t *testing.T, a *astral.Agent, options astral.SessionOptions) *astral.Session {
+func newSession(t *testing.T, a *sessions.Manager, options sessions.SessionOptions) *sessions.Session {
 	t.Helper()
 	s, err := a.NewSession(context.Background(), options)
 	if err != nil {
@@ -107,7 +115,7 @@ func newSession(t *testing.T, a *astral.Agent, options astral.SessionOptions) *a
 	return s
 }
 
-func start(t *testing.T, s *astral.Session, text string) *astral.Run {
+func start(t *testing.T, s *sessions.Session, text string) *astral.Run {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -143,10 +151,10 @@ func signal(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-func toolResults(s *astral.Session) []astral.ToolResult {
+func toolResults(s *sessions.Session) []astral.ToolResult {
 	var results []astral.ToolResult
-	for _, e := range s.Entries() {
-		if e.Kind == astral.EntryToolResult {
+	for _, e := range entries(s) {
+		if e.Kind == sessions.EntryToolResult {
 			results = append(results, *e.Tool.Result)
 		}
 	}
@@ -163,4 +171,102 @@ func texts(messages []astral.Message, role astral.Role) []string {
 		}
 	}
 	return result
+}
+
+func bindingOf(raw json.RawMessage) environments.Binding {
+	value, err := environments.Decode(raw)
+	if err != nil {
+		panic(err)
+	}
+	return value.Binding
+}
+
+type historySnapshot struct {
+	Version uint64
+	Entries []sessions.Entry
+}
+
+func entries(s *sessions.Session) []sessions.Entry {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var out []sessions.Entry
+	cursor := ""
+	for {
+		page, err := s.History().Scan(ctx, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, page.Entries...)
+		if page.NextCursor == "" {
+			return out
+		}
+		cursor = page.NextCursor
+	}
+}
+func historyOf(s *sessions.Session) historySnapshot {
+	return historySnapshot{Version: s.State().Version, Entries: entries(s)}
+}
+func entry(s *sessions.Session, id string) (sessions.Entry, bool) {
+	e, err := s.History().Get(context.Background(), id)
+	return e, err == nil
+}
+func children(s *sessions.Session, id string) []sessions.Entry {
+	p, err := s.History().Children(context.Background(), id, sessions.Query{})
+	if err != nil {
+		panic(err)
+	}
+	return p.Entries
+}
+func readStore(ctx context.Context, store sessions.Store, id string) (historySnapshot, error) {
+	state, err := store.LoadState(ctx, id)
+	if err != nil {
+		return historySnapshot{}, err
+	}
+	out := historySnapshot{Version: state.Version}
+	cursor := ""
+	for {
+		page, err := store.Scan(ctx, id, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
+		if err != nil {
+			return out, err
+		}
+		for _, r := range page.Records {
+			out.Entries = append(out.Entries, r.Entry)
+		}
+		if page.Next == "" {
+			return out, nil
+		}
+		cursor = page.Next
+	}
+}
+
+var fixtureCommitID atomic.Uint64
+
+func makeCommit(state sessions.RuntimeState, version uint64, entries []sessions.Entry) sessions.Commit {
+	batch := append([]sessions.Entry(nil), entries...)
+	for i := range batch {
+		batch[i].Sequence = state.Sequence + uint64(i) + 1
+		batch[i].Version = version + 1
+		if batch[i].Time.IsZero() {
+			batch[i].Time = time.Now().UTC()
+		}
+	}
+	return sessions.Commit{ID: fmt.Sprintf("fixture-%d", fixtureCommitID.Add(1)), ExpectedVersion: version, Entries: batch}
+}
+func appendStore(ctx context.Context, store sessions.Store, id string, version uint64, entries []sessions.Entry) error {
+	state, err := store.LoadState(ctx, id)
+	if err != nil && !errors.Is(err, sessions.ErrNotFound) {
+		return err
+	}
+	commit := makeCommit(state, version, entries)
+	for _, e := range entries {
+		if e.Head != nil {
+			r, err := store.Get(ctx, id, e.Head.EntryID)
+			if err != nil {
+				return err
+			}
+			commit.Selection = r.Projection
+		}
+	}
+	_, err = store.Commit(ctx, id, commit)
+	return err
 }

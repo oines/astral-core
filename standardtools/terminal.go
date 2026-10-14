@@ -119,11 +119,7 @@ func (s *Set) reserve() (int, *terminal, error) {
 }
 
 func (s *Set) start(ctx context.Context, inv astral.Invocation, request ProcessRequest) (*terminal, error) {
-	var err error
-	inv.Environment, err = copyEnvironment(inv.Environment)
-	if err != nil {
-		return nil, err
-	}
+	inv.Binding = append([]byte(nil), inv.Binding...)
 	id, evicted, err := s.reserve()
 	if err != nil {
 		return nil, err
@@ -153,7 +149,7 @@ func (s *Set) start(ctx context.Context, inv astral.Invocation, request ProcessR
 	if process == nil {
 		return nil, &astral.ToolError{Outcome: astral.OutcomeUnknown, Code: "invalid_process", Cause: errors.New("backend returned no process after startup")}
 	}
-	owner := astral.Invocation{SessionID: inv.SessionID, Binding: inv.Binding, Environment: inv.Environment}
+	owner := astral.Invocation{SessionID: inv.SessionID, Binding: inv.Binding}
 	p := &terminal{id: id, invocation: owner, process: process, tty: request.TTY, lastUsed: time.Now(), interaction: make(chan struct{}, 1), pending: headTailBuffer{limit: s.options.MaxBufferedBytes}, notify: make(chan struct{}, 1)}
 	s.mu.Lock()
 	closed := s.closed

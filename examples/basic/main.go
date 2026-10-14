@@ -10,7 +10,6 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	"github.com/oines/astral-core/store/memory"
 )
 
 func main() {
@@ -38,16 +37,12 @@ func run(ctx context.Context) error {
 		}
 		return demo.Calls(demo.Call("lookup-1", "lookup_order", `{"id":"order-42"}`)), nil
 	})
-	agent, err := astral.New(astral.Config{Model: model, Store: memory.New(), SystemPrompt: "Answer using the application's tools.", Tools: []astral.Tool{lookup}})
+	agent, err := astral.New(astral.Config{Model: model, SystemPrompt: "Answer using the application's tools.", Tools: []astral.Tool{lookup}})
 	if err != nil {
 		return err
 	}
 	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, astral.SessionOptions{})
-	if err != nil {
-		return err
-	}
-	activity, err := session.Start(ctx, astral.User("Where is order-42?"))
+	activity, err := agent.Start(ctx, astral.User("Where is order-42?"))
 	if err != nil {
 		return err
 	}
@@ -56,10 +51,6 @@ func run(ctx context.Context) error {
 		return err
 	}
 	fmt.Println(result.LastMessage.Content[0].Text)
-	view, err := session.InspectContext(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("committed messages: %d\n", len(view.Request.Messages))
+	fmt.Println("standalone core: no store or token estimator")
 	return nil
 }

@@ -13,10 +13,6 @@ import (
 func Model(reply func(astral.Request) (astral.Reply, error)) astral.Model {
 	return astral.ModelFunc{
 		Specification: astral.ModelSpec{ID: "demo", ContextWindow: 128000, MaxOutputTokens: 1024},
-		Estimate: func(_ context.Context, request astral.Request) (int, error) {
-			encoded, err := json.Marshal(request)
-			return (len(encoded) + 3) / 4, err
-		},
 		Generate: func(ctx context.Context, request astral.Request, emit func(astral.ModelEvent)) (astral.Reply, error) {
 			if err := ctx.Err(); err != nil {
 				return astral.Reply{}, err
@@ -49,4 +45,9 @@ func LastTool(request astral.Request, name string) *astral.Message {
 		}
 	}
 	return nil
+}
+
+func EstimateTokens(_ context.Context, _ astral.Model, request astral.Request) (int, error) {
+	encoded, err := json.Marshal(request)
+	return (len(encoded) + 3) / 4, err
 }

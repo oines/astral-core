@@ -20,6 +20,9 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 func copyJSON[T any](value T) (T, error) {
+	if raw, ok := any(value).(json.RawMessage); ok && raw == nil {
+		return value, nil
+	}
 	var out T
 	b, err := json.Marshal(value)
 	if err != nil {

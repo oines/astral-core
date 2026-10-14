@@ -16,7 +16,7 @@ type Tool interface {
 // whose runtime differs from the session's currently selected environment.
 // The host must validate resource ownership; a Binding is not an authorization.
 type TargetedTool interface {
-	Bind(context.Context, Invocation) (Binding, *EnvironmentSnapshot, error)
+	Bind(context.Context, Invocation) (json.RawMessage, error)
 }
 
 // ToolFunc is a small adapter for host functions.
@@ -43,15 +43,13 @@ type ToolCall struct {
 }
 
 type Invocation struct {
-	SessionID     string               `json:"session_id"`
-	RunID         string               `json:"run_id"`
-	TurnID        string               `json:"turn_id"`
-	AssistantID   string               `json:"assistant_id"`
-	ExecutionID   string               `json:"execution_id"`
-	Call          ToolCall             `json:"call"`
-	Binding       Binding              `json:"binding"`
-	Environment   *EnvironmentSnapshot `json:"environment,omitempty"`
-	awaitApproval func(context.Context, ApprovalRequest) (ApprovalDecision, error)
+	SessionID   string          `json:"session_id"`
+	RunID       string          `json:"run_id"`
+	TurnID      string          `json:"turn_id"`
+	AssistantID string          `json:"assistant_id"`
+	ExecutionID string          `json:"execution_id"`
+	Call        ToolCall        `json:"call"`
+	Binding     json.RawMessage `json:"binding,omitempty"`
 }
 
 type ToolResult struct {
@@ -62,9 +60,9 @@ type ToolResult struct {
 	Outcome   Outcome         `json:"outcome"`
 	Artifact  string          `json:"artifact,omitempty"`
 	Terminate bool            `json:"terminate,omitempty"`
-	// Only a sequential tool may return an environment change. Core commits the
-	// result and the new complete snapshot atomically before the next dispatch.
-	Environment *EnvironmentSnapshot `json:"environment,omitempty"`
+	// Only a sequential tool may return an context update. Core commits the
+	// result and the opaque context update atomically before the next dispatch.
+	Context json.RawMessage `json:"context,omitempty"`
 }
 
 type ToolProgress struct {
@@ -103,15 +101,15 @@ func (a *Agent) toolFor(def ToolDefinition) (registeredTool, error) {
 	return t, nil
 }
 
-func bindTool(ctx context.Context, tool TargetedTool, inv Invocation) (binding Binding, environment *EnvironmentSnapshot, err error) {
+func bindTool(ctx context.Context, tool TargetedTool, inv Invocation) (binding json.RawMessage, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("tool binding panicked: %v", p)
 		}
 	}()
-	binding, environment, err = tool.Bind(ctx, clone(inv))
+	binding, err = tool.Bind(ctx, clone(inv))
 	if err == nil {
-		environment, err = copyJSON(environment)
+		binding, err = copyJSON(binding)
 	}
 	return
 }

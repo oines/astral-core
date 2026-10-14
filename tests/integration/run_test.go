@@ -7,6 +7,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -18,7 +19,7 @@ func TestChatPersistsAndDefaultsDoNotRewriteSessions(t *testing.T) {
 	c := testConfig(m, store)
 	c.SystemPrompt = "original rules"
 	a := newAgent(t, c)
-	s := newSession(t, a, astral.SessionOptions{ID: "chat"})
+	s := newSession(t, a, sessions.SessionOptions{ID: "chat"})
 	r := waitOK(t, start(t, s, "hello"))
 	if r.LastMessage == nil || r.LastMessage.Content[0].Text != "hello" {
 		t.Fatalf("result: %+v", r)
@@ -43,7 +44,7 @@ func TestChatPersistsAndDefaultsDoNotRewriteSessions(t *testing.T) {
 	if len(m.observed()[1].Messages) != 3 {
 		t.Fatal("history not continued")
 	}
-	copy := opened.Entries()
+	copy := entries(opened)
 	copy[1].Configuration.SystemPrompt = "mutated"
 	if opened.Configuration().SystemPrompt != "original rules" {
 		t.Fatal("history alias escaped")
@@ -64,7 +65,7 @@ func TestSteeringAndFollowupsAtSafeBoundaries(t *testing.T) {
 		}
 		return answer("answer"), nil
 	})
-	s := newSession(t, newAgent(t, testConfig(m, memory.New())), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, testConfig(m, memory.New())), sessions.SessionOptions{})
 	r := start(t, s, "initial")
 	signal(t, entered)
 	for _, text := range []string{"steer one", "steer two"} {
@@ -97,7 +98,7 @@ func TestSlowSubscriberDoesNotBlockRun(t *testing.T) {
 		}
 		return answer("done"), nil
 	})
-	s := newSession(t, newAgent(t, testConfig(m, memory.New())), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, testConfig(m, memory.New())), sessions.SessionOptions{})
 	sub := s.Subscribe(1)
 	waitOK(t, start(t, s, "go"))
 	for range sub.C {
@@ -119,7 +120,7 @@ func TestOneActiveWriterAndCancelRetryWait(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Retry.MaxAttempts = 3
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
 	if _, err := s.Start(context.Background(), astral.User("other")); !errors.Is(err, astral.ErrBusy) {

@@ -15,7 +15,9 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/examples/internal/demo"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -24,7 +26,11 @@ import (
 type hostRouter map[string]standardtools.Backend
 
 func (r hostRouter) backend(inv astral.Invocation) (standardtools.Backend, error) {
-	b := r[inv.Binding.RuntimeID]
+	target, err := environments.Decode(inv.Binding)
+	if err != nil {
+		return nil, err
+	}
+	b := r[target.Binding.RuntimeID]
 	if b == nil {
 		return nil, errors.New("target not authorized")
 	}
@@ -77,11 +83,11 @@ func run(ctx context.Context) error {
 		defer cancel()
 		_ = set.Close(cleanup)
 	}()
-	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(_ context.Context, _ astral.Invocation, selection standardtools.EnvironmentSelection) (astral.EnvironmentSnapshot, error) {
+	tools := append(set.Tools(), standardtools.SwitchEnvironment(func(_ context.Context, _ astral.Invocation, selection standardtools.EnvironmentSelection) (environments.Snapshot, error) {
 		if selection.Runtime != "runtime-b" {
-			return astral.EnvironmentSnapshot{}, errors.New("target not authorized")
+			return environments.Snapshot{}, errors.New("target not authorized")
 		}
-		return astral.EnvironmentSnapshot{RuntimeID: "runtime-b", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-b")}, nil
+		return environments.Snapshot{RuntimeID: "runtime-b", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-b")}, nil
 	}))
 	model := demo.Model(func(request astral.Request) (astral.Reply, error) {
 		if result := demo.LastTool(request, "write_stdin"); result != nil {
@@ -102,9 +108,13 @@ func run(ctx context.Context) error {
 		return demo.Calls(demo.Call("start", "exec_command", `{"cmd":"printf 'ready\\n'; IFS= read -r line; printf 'original cwd: '; pwd","tty":true,"login":false,"yield_time_ms":0}`)), nil
 	})
 	var processRuntime string
-	agent, err := astral.New(astral.Config{Model: model, Store: memory.New(), Tools: tools, BeforeToolCall: func(_ context.Context, inv astral.Invocation) (astral.ToolDecision, error) {
+	agent, err := sessions.New(sessions.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: tools, BeforeToolCall: func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
 		if inv.Call.Name == "write_stdin" {
-			processRuntime = inv.Binding.RuntimeID
+			target, err := environments.Decode(inv.Binding)
+			if err != nil {
+				return astral.ToolDecision{}, err
+			}
+			processRuntime = target.Binding.RuntimeID
 		}
 		return astral.ToolDecision{}, nil
 	}})
@@ -112,7 +122,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, astral.SessionOptions{Environment: &astral.EnvironmentSnapshot{RuntimeID: "runtime-a", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-a")}})
+	session, err := agent.NewSession(ctx, sessions.SessionOptions{Environment: &environments.Snapshot{RuntimeID: "runtime-a", WorkspaceID: "project-one", CWD: filepath.Join(root, "runtime-a")}})
 	if err != nil {
 		return err
 	}

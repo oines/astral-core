@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -36,7 +37,7 @@ func TestParallelResultsArePresentedInCallOrder(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{parallel}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	r := start(t, s, "work")
 	signal(t, bothStarted)
 	signal(t, bothStarted)
@@ -62,11 +63,11 @@ func TestValidationAndMissingToolsProducePairedResults(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
-	c.BeforeToolCall = func(context.Context, astral.Invocation) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(context.Context, sessions.ToolContext) (astral.ToolDecision, error) {
 		hooks.Add(1)
 		return astral.ToolDecision{}, nil
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "work"))
 	if executed.Load() != 0 || hooks.Load() != 0 {
 		t.Fatal("invalid call reached execution/hook")
@@ -97,7 +98,7 @@ func TestTerminateRequiresEveryResultAndStillDrainsSteer(t *testing.T) {
 				terminate := all || inv.Call.ID == "a"
 				return astral.ToolResultPatch{Content: astral.Text("processed"), Terminate: &terminate}, nil
 			}
-			s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+			s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 			waitOK(t, start(t, s, "go"))
 			want := 2
 			if all {
@@ -121,7 +122,7 @@ func TestSchemaReferencesCannotReadHostFiles(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{astral.ToolFunc{Spec: astral.ToolDefinition{Name: "bad", Parameters: json.RawMessage(`{"$ref":"file:///etc/passwd"}`)}}}
-	if _, err := astral.New(c); err == nil {
+	if _, err := sessions.New(c); err == nil {
 		t.Fatal("external schema accepted")
 	}
 }

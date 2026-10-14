@@ -6,20 +6,18 @@ import (
 	"fmt"
 )
 
-// Model must count the complete request input, including system prompt, tools
-// and provider protocol overhead. Output reservation is accounted for by Core.
+// Model supplies protocol-neutral generation. Token estimation is a separate
+// policy dependency in the session package.
 // A Stream implementation must stop calling emit before returning. Opaque
 // reasoning/signature/part metadata must round-trip through Request and Reply.
 type Model interface {
 	Spec() ModelSpec
-	EstimateTokens(context.Context, Request) (int, error)
 	Stream(context.Context, Request, func(ModelEvent)) (Reply, error)
 }
 
 // ModelFunc adapts host functions without a provider-specific SDK dependency.
 type ModelFunc struct {
 	Specification ModelSpec
-	Estimate      func(context.Context, Request) (int, error)
 	Generate      func(context.Context, Request, func(ModelEvent)) (Reply, error)
 }
 
@@ -77,13 +75,6 @@ type Fallback struct {
 }
 
 func (m ModelFunc) Spec() ModelSpec { return m.Specification }
-
-func (m ModelFunc) EstimateTokens(ctx context.Context, request Request) (int, error) {
-	if m.Estimate == nil {
-		return 0, fmtInvalid("missing model token estimator")
-	}
-	return m.Estimate(ctx, request)
-}
 
 func (m ModelFunc) Stream(ctx context.Context, request Request, emit func(ModelEvent)) (Reply, error) {
 	if m.Generate == nil {

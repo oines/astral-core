@@ -1,25 +1,32 @@
-package astral
+package session
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	protocol "github.com/oines/astral-core"
+	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Context is the effective request plus provenance in the active branch. Its
-// messages may cover much less history than Rollout after explicit compaction.
+// messages contain only the active window and its provenance.
 type Context struct {
-	HeadID          string               `json:"head_id"`
-	ConfigurationID string               `json:"configuration_id"`
-	Request         Request              `json:"request"`
-	Sources         []string             `json:"sources"`
-	Environment     *EnvironmentSnapshot `json:"environment,omitempty"`
-	Binding         Binding              `json:"binding"`
-	EstimatedInput  int                  `json:"estimated_input"`
+	HeadID          string              `json:"head_id"`
+	ConfigurationID string              `json:"configuration_id"`
+	Request         protocol.Request    `json:"request"`
+	Sources         []string            `json:"sources"`
+	Environment     *targetenv.Snapshot `json:"environment,omitempty"`
+	Binding         targetenv.Binding   `json:"binding"`
+	EstimatedInput  int                 `json:"estimated_input"`
 }
 
 func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return Context{}, protocol.ErrClosed
+	}
 	path := clone(s.pathLocked())
 	s.mu.Unlock()
 	view, err := project(path)
@@ -35,7 +42,7 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 	return view, err
 }
 
-func (s *Session) requestContext(ctx context.Context, model Model) (Context, error) {
+func (s *Session) requestContext(ctx context.Context, model protocol.Model) (Context, error) {
 	s.mu.Lock()
 	path := clone(s.pathLocked())
 	s.mu.Unlock()
@@ -49,6 +56,15 @@ func (s *Session) requestContext(ctx context.Context, model Model) (Context, err
 	view.Request.ModelID = model.Spec().ID
 	view.Request.MaxOutputTokens = outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())
 	view.EstimatedInput, err = checkBudget(ctx, model, view.Request, s.agent.config.Budget.SafetyMargin)
+	if err == nil {
+		raw, encodeErr := json.Marshal(view.Request)
+		if encodeErr != nil {
+			return Context{}, encodeErr
+		}
+		if len(raw) > s.agent.config.MaxContextBytes {
+			err = fmt.Errorf("%w: context has %d bytes (limit %d)", ErrBudget, len(raw), s.agent.config.MaxContextBytes)
+		}
+	}
 	return view, err
 }
 
@@ -63,7 +79,7 @@ func project(path []Entry) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	view := Context{ConfigurationID: configurationID, Request: Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools}}
+	view := Context{ConfigurationID: configurationID, Request: protocol.Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools}}
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
 	}
@@ -89,7 +105,7 @@ func project(path []Entry) (Context, error) {
 		if !found {
 			return Context{}, fmt.Errorf("%w: compaction boundary missing", ErrCorrupt)
 		}
-		view.Request.Messages = append(view.Request.Messages, Message{Role: RoleContext, ContextKind: "summary", Content: Text(checkpoint.Compaction.Summary)})
+		view.Request.Messages = append(view.Request.Messages, protocol.Message{Role: protocol.RoleContext, ContextKind: "summary", Content: protocol.Text(checkpoint.Compaction.Summary)})
 		view.Sources = append(view.Sources, checkpoint.ID)
 	}
 	visible := path[start:]
@@ -99,7 +115,7 @@ func project(path []Entry) (Context, error) {
 	results := map[string]Entry{}
 	assistants := map[string]Entry{}
 	for _, e := range visible {
-		if e.Kind == EntryMessage && e.Message.Role == RoleAssistant {
+		if e.Kind == EntryMessage && e.Message.Role == protocol.RoleAssistant {
 			assistants[e.ID] = e
 		}
 		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution {
@@ -113,7 +129,7 @@ func project(path []Entry) (Context, error) {
 	for _, e := range results {
 		assistant, ok := assistants[e.Tool.Invocation.AssistantID]
 		if !ok {
-			return Context{}, fmt.Errorf("%w: result without visible assistant", ErrIncompleteBatch)
+			return Context{}, fmt.Errorf("%w: result without visible assistant", protocol.ErrIncompleteBatch)
 		}
 		matched := false
 		for _, call := range assistant.Message.ToolCalls {
@@ -123,38 +139,38 @@ func project(path []Entry) (Context, error) {
 			}
 		}
 		if !matched {
-			return Context{}, fmt.Errorf("%w: unmatched tool result", ErrIncompleteBatch)
+			return Context{}, fmt.Errorf("%w: unmatched tool result", protocol.ErrIncompleteBatch)
 		}
 	}
-	add := func(message Message, id string) {
+	add := func(message protocol.Message, id string) {
 		view.Request.Messages = append(view.Request.Messages, message)
 		view.Sources = append(view.Sources, id)
 	}
 	for _, e := range visible {
 		switch e.Kind {
 		case EntryMessage:
-			if e.Message.Role == RoleTool {
+			if e.Message.Role == protocol.RoleTool {
 				return Context{}, fmt.Errorf("%w: tool messages require a tool result entry", ErrCorrupt)
 			}
 			add(*e.Message, e.ID)
 			for _, call := range e.Message.ToolCalls {
 				result, ok := results[resultKey(e.ID, call.ID)]
 				if !ok {
-					return Context{}, fmt.Errorf("%w: %s", ErrIncompleteBatch, call.ID)
+					return Context{}, fmt.Errorf("%w: %s", protocol.ErrIncompleteBatch, call.ID)
 				}
 				r := result.Tool.Result
 				content := r.Content
 				if len(content) == 0 {
-					content = Text("")
+					content = protocol.Text("")
 				}
-				add(Message{Role: RoleTool, Content: content, ToolCallID: call.ID, Name: call.Name, IsError: r.IsError}, result.ID)
+				add(protocol.Message{Role: protocol.RoleTool, Content: content, ToolCallID: call.ID, Name: call.Name, IsError: r.IsError}, result.ID)
 			}
 		case EntryEnvironment:
 			data, err := json.Marshal(e.Environment)
 			if err != nil {
 				return Context{}, err
 			}
-			add(Message{Role: RoleContext, ContextKind: "environment", Content: Text(string(data))}, e.ID)
+			add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(string(data))}, e.ID)
 		}
 	}
 	if err = validateProtocol(view.Request.Messages); err != nil {
@@ -166,13 +182,13 @@ func project(path []Entry) (Context, error) {
 // Results may commit out of order within a batch, but a later message must
 // never move ahead of an unfinished batch merely because projection sorts it.
 func validateToolTimeline(path []Entry) error {
-	pending := map[string]ToolCall{}
+	pending := map[string]protocol.ToolCall{}
 	completed := map[string]Entry{}
 	for _, e := range path {
 		switch e.Kind {
 		case EntryMessage:
 			if len(pending) > 0 {
-				return fmt.Errorf("%w: message precedes outstanding tool results", ErrIncompleteBatch)
+				return fmt.Errorf("%w: message precedes outstanding tool results", protocol.ErrIncompleteBatch)
 			}
 			for _, call := range e.Message.ToolCalls {
 				pending[resultKey(e.ID, call.ID)] = call
@@ -181,7 +197,7 @@ func validateToolTimeline(path []Entry) error {
 			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
 			call, ok := pending[key]
 			if !ok || !sameJSON(call, e.Tool.Invocation.Call) {
-				return fmt.Errorf("%w: out-of-sequence tool result", ErrIncompleteBatch)
+				return fmt.Errorf("%w: out-of-sequence tool result", protocol.ErrIncompleteBatch)
 			}
 			delete(pending, key)
 			completed[key] = e
@@ -189,39 +205,39 @@ func validateToolTimeline(path []Entry) error {
 			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
 			previous, ok := completed[key]
 			if !ok || !previous.Tool.NeedsResolution || !sameJSON(previous.Tool.Invocation, e.Tool.Invocation) {
-				return fmt.Errorf("%w: resolution without unresolved result", ErrIncompleteBatch)
+				return fmt.Errorf("%w: resolution without unresolved result", protocol.ErrIncompleteBatch)
 			}
 			completed[key] = e
 		}
 	}
 	if len(pending) > 0 {
-		return ErrIncompleteBatch
+		return protocol.ErrIncompleteBatch
 	}
 	return nil
 }
 
-func validateProtocol(messages []Message) error {
-	var pending []ToolCall
+func validateProtocol(messages []protocol.Message) error {
+	var pending []protocol.ToolCall
 	for _, message := range messages {
 		if err := validateMessage(message); err != nil {
 			return err
 		}
 		if len(pending) > 0 {
-			if message.Role != RoleTool || message.ToolCallID != pending[0].ID {
-				return fmt.Errorf("%w: expected result %s", ErrIncompleteBatch, pending[0].ID)
+			if message.Role != protocol.RoleTool || message.ToolCallID != pending[0].ID {
+				return fmt.Errorf("%w: expected result %s", protocol.ErrIncompleteBatch, pending[0].ID)
 			}
 			pending = pending[1:]
 			continue
 		}
-		if message.Role == RoleTool {
-			return fmt.Errorf("%w: orphan tool result", ErrIncompleteBatch)
+		if message.Role == protocol.RoleTool {
+			return fmt.Errorf("%w: orphan tool result", protocol.ErrIncompleteBatch)
 		}
-		if message.Role == RoleAssistant && len(message.ToolCalls) > 0 {
+		if message.Role == protocol.RoleAssistant && len(message.ToolCalls) > 0 {
 			pending = message.ToolCalls
 		}
 	}
 	if len(pending) > 0 {
-		return ErrIncompleteBatch
+		return protocol.ErrIncompleteBatch
 	}
 	return nil
 }

@@ -1,8 +1,11 @@
-package astral
+package session
 
 import (
 	"context"
 	"errors"
+	"sort"
+
+	protocol "github.com/oines/astral-core"
 )
 
 // UnresolvedTools returns durable terminal markers that require a host decision.
@@ -13,30 +16,18 @@ func (s *Session) UnresolvedTools() []ToolRecord {
 }
 
 func (s *Session) unresolvedLocked() []ToolRecord {
-	latest := map[string]ToolRecord{}
-	var order []string
-	for _, e := range s.pathLocked() {
-		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution {
-			id := e.Tool.Invocation.ExecutionID
-			if _, ok := latest[id]; !ok {
-				order = append(order, id)
-			}
-			latest[id] = *e.Tool
-		}
-	}
 	var out []ToolRecord
-	for _, id := range order {
-		if latest[id].NeedsResolution {
-			out = append(out, latest[id])
-		}
+	for _, r := range s.state.Branch.Unresolved {
+		out = append(out, r)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Invocation.ExecutionID < out[j].Invocation.ExecutionID })
 	return out
 }
 
 // ResolveTool appends the host's reconciled result. OutcomeUnknown is permitted
 // as an explicit acknowledgement to continue while preserving uncertainty.
 // It never executes the tool. Historical entries remain readable unchanged.
-func (s *Session) ResolveTool(ctx context.Context, executionID string, result ToolResult) error {
+func (s *Session) ResolveTool(ctx context.Context, executionID string, result protocol.ToolResult) error {
 	owned, err := copyJSON(result)
 	if err != nil {
 		return err
@@ -45,7 +36,7 @@ func (s *Session) ResolveTool(ctx context.Context, executionID string, result To
 	if !validOutcome(result.Outcome) {
 		return fmtInvalid("explicit outcome required")
 	}
-	if result.Environment != nil {
+	if result.Context != nil {
 		return fmtInvalid("refresh environment separately while reconciling a tool")
 	}
 	result = normalizeResult(result)
@@ -78,7 +69,10 @@ func (s *Session) ResolveTool(ctx context.Context, executionID string, result To
 // Prepared/authorized calls may still execute; started calls are never replayed.
 func (s *Session) recoverInterrupted(ctx context.Context) error {
 	s.mu.Lock()
-	path := clone(s.pathLocked())
+	var path []Entry
+	if last := s.lastMessageLocked(); last != nil {
+		path = []Entry{clone(*last)}
+	}
 	s.mu.Unlock()
 	var unknown error
 	for _, assistant := range path {
@@ -93,23 +87,23 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 				continue
 			}
 			inv := clone(state.started.Tool.Invocation)
-			result := toolFailure("outcome_unknown", "Execution started before interruption; the operation may have partially or fully completed. The host must reconcile its effects. Do not automatically repeat it.", OutcomeUnknown)
+			result := toolFailure("outcome_unknown", "Execution started before interruption; the operation may have partially or fully completed. The host must reconcile its effects. Do not automatically repeat it.", protocol.OutcomeUnknown)
 			needsResolution := true
 			if state.completed != nil {
 				fact := state.completed.Tool.Result
 				result = toolFailure("result_unavailable", "Execution finished before interruption, but its final output was not committed. Do not repeat the operation to retrieve output.", fact.Outcome)
 				result.Artifact = fact.Artifact
-				result.Environment = fact.Environment
-				needsResolution = fact.Outcome == OutcomeUnknown
+				result.Context = fact.Context
+				needsResolution = fact.Outcome == protocol.OutcomeUnknown
 			}
 			_, err := s.commitToolResult(ctx, inv, result, needsResolution)
-			if result.Environment != nil {
+			if result.Context != nil {
 				s.mu.Lock()
 				s.needsEnvironment = true
 				s.mu.Unlock()
 			}
 			if err != nil {
-				if errors.Is(err, ErrOutcomeUnknown) {
+				if errors.Is(err, protocol.ErrOutcomeUnknown) {
 					unknown = err
 				} else {
 					return err
@@ -125,28 +119,9 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 type toolState struct{ prepared, authorized, started, completed, result *Entry }
 
 func (s *Session) toolStateLocked(assistantID, callID string) toolState {
-	var state toolState
-	for _, e := range s.rollout.Entries {
-		if e.Tool == nil || e.Tool.Invocation.AssistantID != assistantID || e.Tool.Invocation.Call.ID != callID {
-			continue
-		}
-		v := e
-		switch e.Kind {
-		case EntryToolPrepared:
-			state.prepared = &v
-		case EntryToolAuthorized:
-			state.authorized = &v
-		case EntryToolStarted:
-			state.started = &v
-		case EntryToolCompleted:
-			state.completed = &v
-		}
+	if assistantID != s.state.Branch.LastMessageID {
+		return toolState{}
 	}
-	for _, e := range s.pathLocked() {
-		if (e.Kind == EntryToolResult || e.Kind == EntryToolResolution) && e.Tool.Invocation.AssistantID == assistantID && e.Tool.Invocation.Call.ID == callID {
-			v := e
-			state.result = &v
-		}
-	}
-	return state
+	v := s.state.Tools[callID]
+	return toolState{prepared: v.Prepared, authorized: v.Authorized, started: v.Started, completed: v.Completed, result: v.Result}
 }

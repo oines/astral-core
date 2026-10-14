@@ -15,6 +15,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 )
@@ -159,7 +160,7 @@ func TestLocalRejectsForeignBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.FileSystem(context.Background(), astral.Invocation{Binding: astral.Binding{RuntimeID: "remote"}})
+	_, err = b.FileSystem(context.Background(), astral.Invocation{Binding: bindingData(t, environments.Binding{RuntimeID: "remote"}, nil)})
 	if err == nil {
 		t.Fatal("foreign target silently routed locally")
 	}

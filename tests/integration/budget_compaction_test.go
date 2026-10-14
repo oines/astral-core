@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
+	environments "github.com/oines/astral-core/environment"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -28,12 +30,12 @@ func TestHugeSingleResultReportsDeliveryFailureWithoutCompacting(t *testing.T) {
 	m.spec.ContextWindow = 2500
 	m.spec.MaxOutputTokens = 100
 	c := testConfig(m, memory.New())
-	c.Compaction = astral.CompactionPolicy{SystemPrompt: "summarize", KeepRecentTokens: 1}
+	c.Compaction = sessions.CompactionPolicy{SystemPrompt: "summarize", KeepRecentTokens: 1}
 	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
 		effects.Add(1)
 		return astral.ToolResult{Content: astral.Text(large), Artifact: "artifact://output"}, nil
 	})}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	results := toolResults(s)
 	if len(results) != 1 || results[0].Code != "result_too_large" || results[0].Outcome != astral.OutcomeSucceeded || !results[0].IsError || results[0].Artifact != "artifact://output" {
@@ -72,9 +74,9 @@ func TestAggregateResultPressureDoesNotRelabelIndividualSuccess(t *testing.T) {
 	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
 		return astral.ToolResult{Content: astral.Text(strings.Repeat("x", 1000))}, nil
 	})}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	_, err := wait(t, start(t, s, "go"))
-	if !errors.Is(err, astral.ErrBudget) {
+	if !errors.Is(err, sessions.ErrBudget) {
 		t.Fatalf("expected aggregate budget error: %v", err)
 	}
 	if len(m.observed()) != 1 {
@@ -114,13 +116,13 @@ func TestAutomaticCompactionUsesCompleteBatchAndRechecksBudget(t *testing.T) {
 			summary.spec.ID = "summary"
 			c := testConfig(m, memory.New())
 			c.Tools = []astral.Tool{echoTool(nil)}
-			c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100}
+			c.Compaction = sessions.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100}
 			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-			s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+			s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 			waitOK(t, start(t, s, strings.Repeat("a", 400)))
 			_, err := wait(t, start(t, s, strings.Repeat("b", 400)))
 			if oversize {
-				if !errors.Is(err, astral.ErrBudget) {
+				if !errors.Is(err, sessions.ErrBudget) {
 					t.Fatalf("summary budget not rechecked: %v", err)
 				}
 				if normalCalls.Load() != 2 {
@@ -151,22 +153,22 @@ func TestAutomaticCompactionUsesCompleteBatchAndRechecksBudget(t *testing.T) {
 	}
 }
 
-func largeHistory(t *testing.T, normal *testModel, summary *testModel, large string, withEnvironment bool) (*astral.Session, string) {
+func largeHistory(t *testing.T, normal *testModel, summary *testModel, large string, withEnvironment bool) (*sessions.Session, string) {
 	t.Helper()
 	c := testConfig(normal, memory.New())
 	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
 		return astral.ToolResult{Content: astral.Text(large)}, nil
 	})}
-	c.Compaction = astral.CompactionPolicy{ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
+	c.Compaction = sessions.CompactionPolicy{ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-	options := astral.SessionOptions{}
+	options := sessions.SessionOptions{}
 	if withEnvironment {
-		options.Environment = &astral.EnvironmentSnapshot{RuntimeID: "runtime", WorkspaceID: "workspace", OS: "linux", Shell: "bash", CWD: "/exact/path", Skills: []astral.Resource{{Name: "build", Path: "/skills/build/SKILL.md"}}}
+		options.Environment = &environments.Snapshot{RuntimeID: "runtime", WorkspaceID: "workspace", OS: "linux", Shell: "bash", CWD: "/exact/path", Skills: []environments.Resource{{Name: "build", Path: "/skills/build/SKILL.md"}}}
 	}
 	s := newSession(t, newAgent(t, c), options)
 	waitOK(t, start(t, s, "work"))
 	var userID string
-	for _, e := range s.Entries() {
+	for _, e := range entries(s) {
 		if e.Message != nil && e.Message.Role == astral.RoleUser {
 			userID = e.ID
 			break
@@ -191,23 +193,23 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 	})
 	summary.spec.ID = "summary"
 	s, userID := largeHistory(t, normal, summary, large, true)
-	before := s.Rollout()
+	before := historyOf(s)
 	record, err := s.Compact(context.Background(), "preserve exact identifiers")
 	if err != nil {
 		t.Fatal(err)
 	}
-	after := s.Rollout()
+	after := historyOf(s)
 	if !reflect.DeepEqual(before.Entries, after.Entries[:len(before.Entries)]) {
 		t.Fatal("raw history rewritten")
 	}
 	if record.Summary != "summary of completed work" {
 		t.Fatal("wrong summary")
 	}
-	if after.Version != before.Version+3 {
+	if after.Version != before.Version+1 {
 		t.Fatalf("checkpoint/environment were not one commit: %d -> %d", before.Version, after.Version)
 	}
 	end := after.Entries[len(after.Entries)-2:]
-	if end[0].Kind != astral.EntryCompaction || end[1].Kind != astral.EntryEnvironment || end[1].ParentID != end[0].ID {
+	if end[0].Kind != sessions.EntryCompaction || end[1].Kind != sessions.EntryEnvironment || end[1].ParentID != end[0].ID {
 		t.Fatal("environment reassertion missing")
 	}
 	view, err := s.InspectContext(context.Background())
@@ -217,7 +219,7 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 	if view.Environment.CWD != "/exact/path" || view.Request.Messages[0].ContextKind != "summary" {
 		t.Fatal("environment or summary lost")
 	}
-	fork, err := s.Fork(context.Background(), userID, astral.ForkAt, astral.SessionOptions{})
+	fork, err := s.Fork(context.Background(), userID, sessions.ForkAt, sessions.SessionOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,15 +269,15 @@ func TestUntrimmableSummaryInputFailsWithoutChangingHistory(t *testing.T) {
 	})
 	summary.spec = astral.ModelSpec{ID: "small", ContextWindow: 1000, MaxOutputTokens: 100}
 	c := testConfig(normal, memory.New())
-	c.Compaction = astral.CompactionPolicy{ModelID: "small", KeepRecentTokens: 1, OutputTokens: 100}
+	c.Compaction = sessions.CompactionPolicy{ModelID: "small", KeepRecentTokens: 1, OutputTokens: 100}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, strings.Repeat("user input", 10000)))
-	before := s.Rollout()
-	if _, err := s.Compact(context.Background(), ""); !errors.Is(err, astral.ErrCompactionInputTooLarge) {
+	before := historyOf(s)
+	if _, err := s.Compact(context.Background(), ""); !errors.Is(err, sessions.ErrCompactionInputTooLarge) {
 		t.Fatalf("error: %v", err)
 	}
-	if !reflect.DeepEqual(before, s.Rollout()) || len(summary.observed()) != 0 {
+	if !reflect.DeepEqual(before, historyOf(s)) || len(summary.observed()) != 0 {
 		t.Fatal("oversized summary request changed state or reached provider")
 	}
 }
@@ -301,8 +303,8 @@ func TestFailedSummaryDoesNotCommitCheckpoint(t *testing.T) {
 	if s.Head() != head {
 		t.Fatal("failed summary changed history head")
 	}
-	for _, e := range s.Entries() {
-		if e.Kind == astral.EntryCompaction {
+	for _, e := range entries(s) {
+		if e.Kind == sessions.EntryCompaction {
 			t.Fatal("failed summary checkpoint committed")
 		}
 	}

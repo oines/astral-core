@@ -10,6 +10,7 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -51,12 +52,12 @@ func run(ctx context.Context) error {
 		}
 		return demo.Calls(demo.Call("write", "write", `{"path":"hello.txt","content":"Hello\n"}`)), nil
 	})
-	agent, err := astral.New(astral.Config{Model: model, Store: memory.New(), Tools: set.Tools()})
+	agent, err := sessions.New(sessions.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: set.Tools()})
 	if err != nil {
 		return err
 	}
 	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, astral.SessionOptions{})
+	session, err := agent.NewSession(ctx, sessions.SessionOptions{})
 	if err != nil {
 		return err
 	}

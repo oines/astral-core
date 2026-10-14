@@ -10,6 +10,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
+	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -29,14 +30,14 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
 	c.Retry = astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	sub := s.Subscribe(256)
 	defer sub.Close()
 	waitOK(t, start(t, s, "go"))
 	if executed.Load() != 1 || len(m.observed()) != 3 {
 		t.Fatal("wrong retry behavior")
 	}
-	b, _ := json.Marshal(s.Rollout())
+	b, _ := json.Marshal(historyOf(s))
 	if strings.Contains(string(b), "discard me") {
 		t.Fatal("partial delta became durable")
 	}
@@ -65,13 +66,13 @@ func TestLengthFinishNeverExecutesEvenValidToolJSON(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	_, err := wait(t, start(t, s, "go"))
 	if !errors.Is(err, astral.ErrIncompleteResponse) || executed.Load() != 0 {
 		t.Fatalf("truncated output executed: %v", err)
 	}
-	for _, entry := range s.Entries() {
-		if entry.Kind == astral.EntryMessage && entry.Message.Role == astral.RoleAssistant {
+	for _, entry := range entries(s) {
+		if entry.Kind == sessions.EntryMessage && entry.Message.Role == astral.RoleAssistant {
 			t.Fatal("incomplete assistant committed")
 		}
 	}
@@ -112,7 +113,7 @@ func TestFallbackAndOpaqueMetadata(t *testing.T) {
 	c.Fallback = func(context.Context, astral.ModelFailure) (astral.Fallback, error) {
 		return astral.Fallback{ModelID: "fallback"}, nil
 	}
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	if effects.Load() != 1 || s.Configuration().ModelID != "test" {
 		t.Fatal("fallback replayed tools or changed preference")
@@ -138,7 +139,7 @@ func TestModelSelectionTakesEffectOnNextRequest(t *testing.T) {
 	c := testConfig(first, memory.New())
 	c.Tools = []astral.Tool{echoTool(nil)}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return second, nil }
-	s := newSession(t, newAgent(t, c), astral.SessionOptions{})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
 	if err := s.SelectModel(context.Background(), "second"); err != nil {

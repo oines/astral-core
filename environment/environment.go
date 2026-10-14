@@ -1,13 +1,14 @@
-package astral
+// Package environment supplies optional typed target snapshots over opaque Core bindings.
+package environment
 
 import (
 	"context"
 	"encoding/json"
 )
 
-// EnvironmentSnapshot describes what the model was told, not a filesystem or
+// Snapshot describes what the model was told, not a filesystem or
 // process snapshot. Runtime/workspace creation and discovery belong to the host.
-type EnvironmentSnapshot struct {
+type Snapshot struct {
 	RuntimeID    string          `json:"runtime_id,omitempty"`
 	ComputerID   string          `json:"computer_id,omitempty"`
 	WorkspaceID  string          `json:"workspace_id,omitempty"`
@@ -27,12 +28,12 @@ type Resource struct {
 	Description string `json:"description,omitempty"`
 }
 
-type EnvironmentRequest struct {
+type Request struct {
 	SessionID string
-	Previous  *EnvironmentSnapshot
+	Previous  *Snapshot
 }
 
-type EnvironmentProvider func(context.Context, EnvironmentRequest) (EnvironmentSnapshot, error)
+type Provider func(context.Context, Request) (Snapshot, error)
 
 type Binding struct {
 	SnapshotID  string `json:"snapshot_id,omitempty"`
@@ -41,35 +42,23 @@ type Binding struct {
 	WorkspaceID string `json:"workspace_id,omitempty"`
 }
 
-func (s *Session) RefreshEnvironment(ctx context.Context, snapshot EnvironmentSnapshot) error {
-	if err := s.agent.checkOpen(); err != nil {
-		return err
-	}
-	owned, err := copyJSON(snapshot)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrClosed
-	}
-	if s.busyLocked() {
-		return ErrBusy
-	}
-	if _, err = s.appendLocked(ctx, Entry{Kind: EntryEnvironment, Environment: &owned}); err != nil {
-		return err
-	}
-	s.needsEnvironment = false
-	return nil
+// Context is the optional environment payload carried in Invocation.Binding.
+type Context struct {
+	Binding  Binding   `json:"binding"`
+	Snapshot *Snapshot `json:"snapshot,omitempty"`
 }
 
-func effectiveEnvironment(path []Entry) (*EnvironmentSnapshot, Binding) {
-	for i := len(path) - 1; i >= 0; i-- {
-		e := path[i]
-		if e.Kind == EntryEnvironment {
-			return e.Environment, Binding{SnapshotID: e.ID, RuntimeID: e.Environment.RuntimeID, ComputerID: e.Environment.ComputerID, WorkspaceID: e.Environment.WorkspaceID}
-		}
+// Encode creates an isolated, protocol-neutral binding or tool context update.
+func Encode(binding Binding, snapshot *Snapshot) (json.RawMessage, error) {
+	return json.Marshal(Context{Binding: binding, Snapshot: snapshot})
+}
+
+// Decode rejects malformed bindings before a backend can choose a target.
+func Decode(raw json.RawMessage) (Context, error) {
+	var c Context
+	if len(raw) == 0 {
+		return c, nil
 	}
-	return nil, Binding{}
+	err := json.Unmarshal(raw, &c)
+	return c, err
 }

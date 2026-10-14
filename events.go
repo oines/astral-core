@@ -1,6 +1,8 @@
 package astral
 
-import "sync"
+import (
+	"sync"
+)
 
 type EventType string
 
@@ -37,75 +39,73 @@ type Event struct {
 	Error       string        `json:"error,omitempty"`
 }
 
-// Subscription closes with ErrSlowSubscriber on overflow. Subscribe before
-// reading Rollout, then deduplicate committed entries by ID. Delta events cannot
-// be reconstructed from durable history and are never a correctness dependency.
+// Subscription closes on overflow; emitting never blocks the executor.
 type Subscription struct {
 	C       <-chan Event
 	channel chan Event
-	session *Session
+	hub     *eventHub
 	mu      sync.Mutex
 	err     error
-	closed  bool
 }
 
-func (sub *Subscription) Err() error {
-	sub.mu.Lock()
-	defer sub.mu.Unlock()
-	return sub.err
+func (s *Subscription) Err() error { s.mu.Lock(); defer s.mu.Unlock(); return s.err }
+func (s *Subscription) Close()     { s.hub.mu.Lock(); defer s.hub.mu.Unlock(); s.hub.remove(s, nil) }
+
+type eventHub struct {
+	mu          sync.Mutex
+	id          string
+	sequence    uint64
+	closed      bool
+	subscribers map[*Subscription]struct{}
 }
-func (sub *Subscription) Close() {
-	s := sub.session
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removeSubscriberLocked(sub, nil)
-}
-func (s *Session) Subscribe(buffer int) *Subscription {
+
+func (h *eventHub) init(id string) { h.id = id; h.subscribers = map[*Subscription]struct{}{} }
+func (h *eventHub) subscribe(buffer int) *Subscription {
 	if buffer < 1 {
 		buffer = 128
 	}
 	ch := make(chan Event, buffer)
-	sub := &Subscription{C: ch, channel: ch, session: s}
-	s.agent.mu.Lock()
-	defer s.agent.mu.Unlock()
-	s.mu.Lock()
-	s.subscribers[sub] = struct{}{}
-	if s.agent.closed {
-		s.removeSubscriberLocked(sub, ErrClosed)
+	s := &Subscription{C: ch, channel: ch, hub: h}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subscribers[s] = struct{}{}
+	if h.closed {
+		h.remove(s, ErrClosed)
 	}
-	s.mu.Unlock()
-	return sub
+	return s
 }
-func (s *Session) removeSubscriberLocked(sub *Subscription, err error) {
-	if _, ok := s.subscribers[sub]; !ok {
+func (h *eventHub) remove(s *Subscription, err error) {
+	if _, ok := h.subscribers[s]; !ok {
 		return
 	}
-	delete(s.subscribers, sub)
-	sub.mu.Lock()
-	sub.err = err
-	sub.closed = true
-	close(sub.channel)
-	sub.mu.Unlock()
+	delete(h.subscribers, s)
+	s.mu.Lock()
+	s.err = err
+	close(s.channel)
+	s.mu.Unlock()
 }
-func (s *Session) closeSubscribersLocked(err error) {
-	for sub := range s.subscribers {
-		s.removeSubscriberLocked(sub, err)
+func (h *eventHub) publish(e Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
 	}
-}
-func (s *Session) publishLocked(event Event) {
-	s.sequence++
-	event.Sequence = s.sequence
-	event.SessionID = s.id
-	for sub := range s.subscribers {
+	h.sequence++
+	e.Sequence = h.sequence
+	e.SessionID = h.id
+	for s := range h.subscribers {
 		select {
-		case sub.channel <- clone(event):
+		case s.channel <- clone(e):
 		default:
-			s.removeSubscriberLocked(sub, ErrSlowSubscriber)
+			h.remove(s, ErrSlowSubscriber)
 		}
 	}
 }
-func (s *Session) publish(event Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.publishLocked(event)
+func (h *eventHub) close(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for s := range h.subscribers {
+		h.remove(s, err)
+	}
 }
