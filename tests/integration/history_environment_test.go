@@ -128,7 +128,7 @@ func TestHistoricalPartialToolBatchCannotExecute(t *testing.T) {
 	waitOK(t, start(t, s, "go"))
 	var boundary string
 	for _, entry := range entries(s) {
-		if entry.Message != nil && len(entry.Message.ToolCalls) > 0 {
+		if entry.Message != nil && len(entry.Message.ToolCalls()) > 0 {
 			boundary = entry.ID
 		}
 	}

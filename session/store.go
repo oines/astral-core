@@ -11,7 +11,7 @@ import (
 	targetenv "github.com/oines/astral-core/environment"
 )
 
-const FormatVersion = 3
+const FormatVersion = 4
 const ForkCommitID = "session-fork-created"
 const DefaultPageSize = 256
 const DefaultPageBytes = 4 << 20

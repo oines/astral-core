@@ -47,7 +47,7 @@ func TestForkBoundaryMatrixAndHistoricalResults(t *testing.T) {
 						if e.Message != nil && e.Message.Role == astral.RoleUser {
 							user = e.ID
 						}
-						if e.Message != nil && len(e.Message.ToolCalls) > 0 {
+						if e.Message != nil && len(e.Message.ToolCalls()) > 0 {
 							partial = e.ID
 						}
 						if e.Kind == sessions.EntryToolResult {

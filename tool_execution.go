@@ -18,14 +18,15 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (bo
 		definitions[d.Name] = d
 	}
 	sequential := false
-	for _, c := range assistant.Message.ToolCalls {
+	calls := assistant.Message.ToolCalls()
+	for _, c := range calls {
 		sequential = sequential || definitions[c.Name].Sequential
 	}
-	results := make([]ToolResult, len(assistant.Message.ToolCalls))
+	results := make([]ToolResult, len(calls))
 	errs := make([]error, len(results))
 	if sequential {
 		interrupted := false
-		for i, c := range assistant.Message.ToolCalls {
+		for i, c := range calls {
 			if interrupted {
 				results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], true)
 			} else {
@@ -41,7 +42,7 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (bo
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					c := assistant.Message.ToolCalls[i]
+					c := calls[i]
 					results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false)
 				}
 			}()

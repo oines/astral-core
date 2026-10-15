@@ -62,7 +62,7 @@ func (s *Session) summarize(ctx context.Context, model protocol.Model, request p
 		if err == nil {
 			err = validateReply(reply)
 		}
-		if err == nil && len(reply.Message.ToolCalls) > 0 {
+		if err == nil && len(reply.Message.ToolCalls()) > 0 {
 			err = fmtInvalid("summarizer returned tool calls")
 		}
 		if err == nil {

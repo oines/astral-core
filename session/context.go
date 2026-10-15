@@ -140,7 +140,7 @@ func project(path []Entry) (Context, error) {
 			return Context{}, fmt.Errorf("%w: result without visible assistant", protocol.ErrIncompleteBatch)
 		}
 		matched := false
-		for _, call := range assistant.Message.ToolCalls {
+		for _, call := range assistant.Message.ToolCalls() {
 			if call.ID == e.Tool.Invocation.Call.ID && sameJSON(call, e.Tool.Invocation.Call) {
 				matched = true
 				break
@@ -161,7 +161,7 @@ func project(path []Entry) (Context, error) {
 				return Context{}, fmt.Errorf("%w: tool messages require a tool result entry", ErrCorrupt)
 			}
 			add(*e.Message, e.ID)
-			for _, call := range e.Message.ToolCalls {
+			for _, call := range e.Message.ToolCalls() {
 				result, ok := results[resultKey(e.ID, call.ID)]
 				if !ok {
 					return Context{}, fmt.Errorf("%w: %s", protocol.ErrIncompleteBatch, call.ID)
@@ -206,7 +206,7 @@ func validateToolTimeline(path []Entry) error {
 			if len(pending) > 0 {
 				return fmt.Errorf("%w: message precedes outstanding tool results", protocol.ErrIncompleteBatch)
 			}
-			for _, call := range e.Message.ToolCalls {
+			for _, call := range e.Message.ToolCalls() {
 				pending[resultKey(e.ID, call.ID)] = call
 			}
 		case EntryToolResult:
@@ -248,8 +248,8 @@ func validateProtocol(messages []protocol.Message) error {
 		if message.Role == protocol.RoleTool {
 			return fmt.Errorf("%w: orphan tool result", protocol.ErrIncompleteBatch)
 		}
-		if message.Role == protocol.RoleAssistant && len(message.ToolCalls) > 0 {
-			pending = message.ToolCalls
+		if message.Role == protocol.RoleAssistant {
+			pending = message.ToolCalls()
 		}
 	}
 	if len(pending) > 0 {

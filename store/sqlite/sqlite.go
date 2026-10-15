@@ -43,7 +43,7 @@ func (st *Store) Close() error { return st.db.Close() }
 
 const schema = `
 CREATE TABLE format(version INTEGER NOT NULL);
-INSERT INTO format VALUES(3);
+INSERT INTO format VALUES(4);
 CREATE TABLE rollouts(id TEXT PRIMARY KEY,status TEXT NOT NULL,seq INTEGER NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY,rollout_id TEXT NOT NULL,ready INTEGER NOT NULL,state BLOB NOT NULL,fork_digest TEXT NOT NULL DEFAULT '');
 CREATE INDEX session_rollout ON sessions(rollout_id,id);
@@ -59,7 +59,7 @@ CREATE TABLE pending(rollout_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT
 CREATE INDEX pending_order ON pending(session_id,kind,input_kind,seq);
 CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 `
 
 // CROSS JOIN keeps the bounded chain on the outside of each indexed lookup.

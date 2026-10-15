@@ -92,7 +92,7 @@ func TestCoreAndPersistentSessionShareExecutionBehavior(t *testing.T) {
 		var count atomic.Int32
 		m := model(func(_ context.Context, n int, _ astral.Request, emit func(astral.ModelEvent)) (astral.Reply, error) {
 			if n == 1 {
-				emit(astral.ModelEvent{Type: "text_delta", Text: "discarded"})
+				emit(astral.ModelEvent{Type: "text_delta", ContentIndex: contentIndex(0), Text: "discarded"})
 				return astral.Reply{}, &astral.ModelError{Transient: true, Message: "retry"}
 			}
 			if n == 2 {

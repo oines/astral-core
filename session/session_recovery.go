@@ -76,10 +76,11 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 	s.mu.Unlock()
 	var unknown error
 	for _, assistant := range path {
-		if assistant.Kind != EntryMessage || len(assistant.Message.ToolCalls) == 0 {
+		if assistant.Kind != EntryMessage {
 			continue
 		}
-		for _, call := range assistant.Message.ToolCalls {
+		calls := assistant.Message.ToolCalls()
+		for _, call := range calls {
 			s.mu.Lock()
 			state := s.toolStateLocked(assistant.ID, call.ID)
 			s.mu.Unlock()

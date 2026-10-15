@@ -94,7 +94,7 @@ func TestSteeringAndFollowupsAtSafeBoundaries(t *testing.T) {
 func TestSlowSubscriberDoesNotBlockRun(t *testing.T) {
 	m := model(func(_ context.Context, _ int, _ astral.Request, emit func(astral.ModelEvent)) (astral.Reply, error) {
 		for i := 0; i < 1000; i++ {
-			emit(astral.ModelEvent{Type: "text_delta", Text: "x"})
+			emit(astral.ModelEvent{Type: "text_delta", ContentIndex: contentIndex(0), Text: "x"})
 		}
 		return answer("done"), nil
 	})

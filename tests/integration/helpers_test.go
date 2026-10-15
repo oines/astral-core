@@ -56,8 +56,14 @@ func answer(text string) astral.Reply {
 }
 
 func calls(calls ...astral.ToolCall) astral.Reply {
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, ToolCalls: calls}, FinishReason: astral.FinishToolCalls}
+	content := make([]astral.Content, len(calls))
+	for i := range calls {
+		content[i] = astral.Content{Type: "tool_call", ToolCall: &calls[i]}
+	}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content}, FinishReason: astral.FinishToolCalls}
 }
+
+func contentIndex(i int) *int { return &i }
 
 func call(id, name, args string) astral.ToolCall {
 	return astral.ToolCall{ID: id, Name: name, Arguments: json.RawMessage(args)}

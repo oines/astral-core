@@ -37,7 +37,7 @@ type Store interface {
 }
 ```
 
-格式版本为 3。旧 API 和旧日志没有兼容层或自动迁移；不支持的格式返回 `ErrUnsupportedFormat`，不改写原文件。
+格式版本为 4。V4 将 Assistant 的工具调用放入唯一有序 Content 数组。V3 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供静默迁移或旧消息字段兼容层。
 
 `Get` / `Scan` 的第一个字符串参数是 **RolloutID**。`LoadState` / `Pending` / `Commit` / `LookupCommit` 的第一个字符串参数是 **SessionID**；SessionID 在 Store 内唯一。
 
@@ -70,7 +70,7 @@ rollouts 保存状态与顺序计数；entries 按 Rollout / ID、Rollout / Sequ
 
 ### JSONL 与 Memory
 
-JSONL 目录包含版本 3 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本头和带 SHA-256 校验和的批次。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
+JSONL 目录包含版本 4 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 4 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 4，RuntimeState 与创建记录也使用 4。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
 
 未以换行结束的最后一行视为未提交尾部，读取忽略它，下一次 Commit 仅截去这段。完整行损坏、校验和失败或非法状态转换返回 ErrCorrupt，不自动修复已提交历史。确认恢复在采用新读到的完整提交前执行同步。
 
@@ -91,6 +91,36 @@ RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head�
 ## Model 与协议
 
 Model 只包含 Spec / Stream；TokenEstimator 是 Session 的独立依赖。Spec 的 ID 必须稳定，窗口和输出 Token 限额为正。ResolveModel 返回的 ID 必须与请求一致。
+
+### 唯一有序消息内容
+
+`Message.Content []Content` 是消息内容的唯一来源，按原始位置同时保存 Reasoning、Text、多模态、Provider 扩展块和工具调用。`Message.ToolCalls` 字段已删除；`message.ToolCalls()` 只按 Content 顺序派生调用批次，不缓存另一份列表。
+
+```go
+type Content struct {
+    Type      string          `json:"type"`
+    Text      string          `json:"text,omitempty"`
+    MediaType string          `json:"media_type,omitempty"`
+    URL       string          `json:"url,omitempty"`
+    Data      json.RawMessage `json:"data,omitempty"`
+    Metadata  json.RawMessage `json:"metadata,omitempty"`
+    ToolCall  *ToolCall       `json:"tool_call,omitempty"`
+}
+```
+
+只有 `Type="tool_call"` 的 Assistant 块可以携带 ToolCall，且必须提供该字段；其他类型携带 ToolCall 会被拒绝。同一消息内调用 ID 唯一，名称非空，Arguments 必须是单个完整有效 JSON 值，继续允许对象以外的 JSON 值。工具参数是否符合声明的 Schema 仍在派发前检查。
+
+Core、Session 和 Reduce 使用同一个 `Message.Validate()` 校验角色、块结构、调用身份和 JSON。类型保持开放：未知类型及其 Data / Metadata 完整保留，不被 SDK 当作工具执行；适配器不支持时必须明确报错。消息、内容块及调用各层 Metadata、加密 Reasoning、签名和大整数不经有损解析。JSON 消息入口明确拒绝旧的顶层 `tool_calls` 字段，包括空数组和 null，避免静默丢弃操作。
+
+投影保留 Assistant.Content 的内部顺序。所有调用对应的 RoleTool 消息在完整 Assistant 消息之后，按调用块出现顺序组成批次，使用 ToolCallID 配对。Compaction 接收相同的有序消息，只能按原有策略压缩输入副本；原始块及 opaque 数据始终留在历史中。Fork、Reload、冷重开和恢复使用这些持久化事实，不从流式片段重建消息。
+
+### 流式观察
+
+ModelEvent 支持 `ContentIndex *int`（JSON `content_index`）与 `Metadata json.RawMessage`。标准类型为 `text_delta`、`reasoning_delta`、`tool_call_delta`，Text 保存对应增量。工具参数的增量可以是尚未闭合的 JSON 字符串，不触发参数执行。
+
+标准 Delta 必须携带非负索引，0 也必须序列化，指向本次 Attempt 最终 Reply.Message.Content 的位置；不是工具列表中的序号。没有 Delta 的块也占据数组位置。Provider 控制事件可以省略索引，Data 和 Metadata 原样隔离复制并转发。事件保持到达顺序，由 Event.Sequence、TurnID 和 AttemptID 标识。
+
+SDK 只保存已观察索引、类型和可选 ToolCallID，验证它们与最终成功 Reply 一致；缺失或非法索引、冲突块类型、调用 ID 不一致和非法 JSON 元数据都会使 Attempt 失败。每次 Retry / Fallback 的校验独立；客户端应按 AttemptID 区分并丢弃失败尝试的展示内容。SDK 不累积 Delta、不维护第二份消息，也不合并流式签名到最终回复：适配器必须把需要重放的数据放入完整 Reply。
 
 适配器必须：
 
@@ -119,7 +149,7 @@ prepared 固定 Invocation 与目标；authorized 固定 Hook 决定；started �
 
 Core Invocation 只包含执行标识、参数及不可变 opaque Binding。TargetedTool 可在审批前固定目标。Binding 的结构、目标解析与授权属于宿主；Core 和 environment 包均不解释其内部结构。工具产生的 Context 更新是不可被结果 Hook 改写的执行事实；需要声明 Sequential。
 
-并行批次受 MaxParallelTools 限制。任一工具声明 Sequential，则整批按调用顺序执行。结果可乱序完成，但下一次 Request 按原 ToolCalls 顺序形成完整批次。工具与 Hook 必须支持并发，返回后不得继续调用 emit。
+并行批次受 MaxParallelTools 限制。任一工具声明 Sequential，则整批按调用顺序执行。结果可乱序完成，但下一次 Request 按 Content 中 tool_call 块的先后顺序形成完整批次。只有完整 Reply 校验成功、Assistant 消息提交确认后才允许派发工具；参数流式生成不执行工具。工具与 Hook 必须支持并发，返回后不得继续调用 emit。
 
 Outcome 表达执行效果；IsError / Code 也可表达交付失败。普通错误默认 failed，不保证没有部分效果。已知未派发用 OutcomeNotExecuted；确认丢失、取消或未知部分效果用 OutcomeUnknown。Core 不重试工具。超大输出变为 result_too_large，保留真实 Outcome 与 Artifact，清除超大的 Details；原始大输出由宿主管理。
 
@@ -172,7 +202,7 @@ NewSession 可以接收初始快照，或调用宿主 Provider，第一轮请求
 
 标准工具只检查 Binding 的 JSON 有效性，将目标解析与授权交给 Backend。已有进程保存原始 Binding；切换当前快照不会改变进程目标。write_stdin 在审批前恢复原始绑定，执行前再次验证所有权和绑定。审批看到的目标与执行时验证的目标必须一致。工具 Schema 固定注册，环境变化不改变工具声明。
 
-重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。Provider 只是宿主回调，SDK 不自行发现环境。没有环境的纯聊天 / 业务 API Session 不要求环境发现。本轮直接调整未发布的 V3 环境契约，不提供旧环境类型或绑定信封的兼容层，不改变 Store 格式版本及 Rollout 协议。
+重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。Provider 只是宿主回调，SDK 不自行发现环境。没有环境的纯聊天 / 业务 API Session 不要求环境发现。环境快照继续只包含 Binding 和 Context，不提供旧环境类型或绑定信封的兼容层；有序消息使用前述 V4 存储格式。
 
 ```go
 type ForkMode uint8

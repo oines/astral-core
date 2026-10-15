@@ -60,7 +60,7 @@ func (d sessionDriver) Snapshot() protocol.ExecutionState {
 		if i, ok := s.windowIndex[s.state.Branch.BatchConfigurationID]; ok && s.window[i].Configuration != nil {
 			out.BatchTools = s.window[i].Configuration.Tools
 		}
-		for _, call := range e.Message.ToolCalls {
+		for _, call := range e.Message.ToolCalls() {
 			st := s.toolStateLocked(e.ID, call.ID)
 			v := protocol.CallState{}
 			if st.prepared != nil {

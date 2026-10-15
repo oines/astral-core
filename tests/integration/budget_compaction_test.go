@@ -54,7 +54,7 @@ func contentEstimate(r astral.Request) (int, error) {
 		for _, part := range m.Content {
 			count += len(part.Text)
 		}
-		for _, call := range m.ToolCalls {
+		for _, call := range m.ToolCalls() {
 			count += len(call.Arguments) + 10
 		}
 	}

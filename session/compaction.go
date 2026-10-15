@@ -207,10 +207,7 @@ type messageGroup struct{ start, end int }
 func contextGroups(messages []protocol.Message) []messageGroup {
 	var groups []messageGroup
 	for i := 0; i < len(messages); {
-		end := i + 1
-		if len(messages[i].ToolCalls) > 0 {
-			end += len(messages[i].ToolCalls)
-		}
+		end := i + 1 + len(messages[i].ToolCalls())
 		groups = append(groups, messageGroup{i, end})
 		i = end
 	}

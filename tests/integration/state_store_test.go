@@ -279,6 +279,117 @@ func TestOldFormatsAreRejectedWithoutMutation(t *testing.T) {
 	})
 }
 
+func TestVersionThreeOrderedProtocolUpgradeDoesNotMigrateData(t *testing.T) {
+	for _, backend := range []string{"jsonl", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			dir := t.TempDir()
+			legacy := []byte(`{"role":"assistant","content":[{"type":"text","text":"old"}],"tool_calls":[{"id":"old-call","name":"work","arguments":{}}]}`)
+			path := filepath.Join(dir, "old.db")
+			if backend == "jsonl" {
+				for name, data := range map[string][]byte{
+					"format.json":         []byte(`{"format_version":3,"rollout_id":""}`),
+					"old.jsonl":           legacy,
+					"unpublished.pending": []byte("unpublished V3 data"),
+				} {
+					if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = db.Exec("CREATE TABLE format(version INTEGER); INSERT INTO format VALUES(3); CREATE TABLE entries(payload BLOB); PRAGMA user_version=3;")
+				if err == nil {
+					_, err = db.Exec("INSERT INTO entries VALUES(?)", legacy)
+				}
+				db.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := func() map[string]string {
+				out := map[string]string{}
+				files, err := os.ReadDir(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, file := range files {
+					data, err := os.ReadFile(filepath.Join(dir, file.Name()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					out[file.Name()] = string(data)
+				}
+				return out
+			}
+			before := snapshot()
+			var err error
+			if backend == "jsonl" {
+				_, err = jsonl.Open(dir)
+			} else {
+				_, err = sqlite.Open(path)
+			}
+			if !errors.Is(err, sessions.ErrUnsupportedFormat) || !reflect.DeepEqual(before, snapshot()) {
+				t.Fatalf("V3 data changed or was silently migrated: %v", err)
+			}
+		})
+	}
+}
+
+func TestVersionFourMarkersAgreeWithRuntimeState(t *testing.T) {
+	if sessions.FormatVersion != 4 {
+		t.Fatalf("ordered message format must be version 4, got %d", sessions.FormatVersion)
+	}
+	for _, backend := range []string{"jsonl", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			dir := t.TempDir()
+			store, closeStore := durableStore(t, backend, dir)
+			m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
+				return answer("done"), nil
+			})
+			a := newAgent(t, testConfig(m, store))
+			s := newSession(t, a, sessions.SessionOptions{})
+			if s.State().FormatVersion != 4 || s.State().Creation.FormatVersion != 4 {
+				t.Fatal("runtime state and creation did not adopt V4")
+			}
+			if err := a.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			closeStore()
+			if backend == "jsonl" {
+				data, err := os.ReadFile(filepath.Join(dir, "journal", "format.json"))
+				var marker struct {
+					Format int `json:"format_version"`
+				}
+				if err != nil || json.Unmarshal(data, &marker) != nil || marker.Format != 4 {
+					t.Fatalf("JSONL marker: %s %v", data, err)
+				}
+				sum := sha256.Sum256([]byte(s.RolloutID()))
+				data, err = os.ReadFile(filepath.Join(dir, "journal", hex.EncodeToString(sum[:])+".jsonl"))
+				first := bytes.SplitN(data, []byte("\n"), 2)[0]
+				if err != nil || json.Unmarshal(first, &marker) != nil || marker.Format != 4 {
+					t.Fatalf("JSONL rollout header: %s %v", first, err)
+				}
+			} else {
+				db, err := sql.Open("sqlite", filepath.Join(dir, "history.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				var format, userVersion int
+				if err := db.QueryRow("SELECT version FROM format").Scan(&format); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != 4 || userVersion != 4 {
+					t.Fatalf("SQLite markers: format=%d user_version=%d %v", format, userVersion, err)
+				}
+			}
+		})
+	}
+}
+
 func TestProtocolPayloadsSurviveColdReopenAndFork(t *testing.T) {
 	for _, backend := range []string{"sqlite", "jsonl"} {
 		t.Run(backend, func(t *testing.T) {
@@ -287,9 +398,9 @@ func TestProtocolPayloadsSurviveColdReopenAndFork(t *testing.T) {
 			opaque := json.RawMessage(`{"signature":"opaque","counter":900719925474099312345,"encrypted":"AA=="}`)
 			input := astral.Message{Role: astral.RoleUser, Metadata: opaque, Content: []astral.Content{{Type: "text", Text: "first"}, {Type: "image", MediaType: "image/png", Data: json.RawMessage(`{"base64":"AA=="}`), Metadata: opaque}, {Type: "audio", URL: "https://example.invalid/audio", Metadata: opaque}, {Type: "text", Text: "last"}}}
 			assistant := calls(call("provider-call-id", "echo", `{"value":"output"}`))
-			assistant.Message.Content = []astral.Content{{Type: "reasoning", Data: json.RawMessage(`{"encrypted_content":"AAA"}`), Metadata: opaque}, {Type: "text", Text: "work"}}
+			assistant.Message.Content[0].ToolCall.Metadata = opaque
+			assistant.Message.Content = append([]astral.Content{{Type: "reasoning", Data: json.RawMessage(`{"encrypted_content":"AAA"}`), Metadata: opaque}, {Type: "text", Text: "work"}}, assistant.Message.Content...)
 			assistant.Message.Metadata = opaque
-			assistant.Message.ToolCalls[0].Metadata = opaque
 			m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 				if n == 1 {
 					return assistant, nil

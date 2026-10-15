@@ -153,6 +153,27 @@ Fork 不会回滚已经改过的文件、撤销 API 调用或复制正在运行�
 
 **工具 Schema 是固定注册的；当前机器上有哪些 Skills、项目说明或可用资源，是环境上下文，不是新的工具定义。**
 
+## 一次回复，保留全部内容顺序
+
+Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，例如：
+
+```json
+{"role":"assistant","content":[
+  {"type":"reasoning","text":"先检查第一项"},
+  {"type":"text","text":"正在查询"},
+  {"type":"tool_call","tool_call":{"id":"a","name":"lookup","arguments":{"key":"a"}}},
+  {"type":"reasoning","text":"再检查第二项"},
+  {"type":"text","text":"继续查询"},
+  {"type":"tool_call","tool_call":{"id":"b","name":"lookup","arguments":{"key":"b"}}}
+]}
+```
+
+没有独立的 `Message.ToolCalls` 字段；`message.ToolCalls()` 按块顺序提取调用。并行工具可以乱序完成，下一轮模型上下文仍按调用块顺序排列结果。Reasoning 签名、各层 Metadata、多模态和 Provider 扩展数据随原始消息保存，重新打开或 Fork 后保留相同顺序。
+
+流式 `text_delta`、`reasoning_delta` 和 `tool_call_delta` 使用 `content_index` 对应最终 Content 数组；事件按 AttemptID 区分重试。增量用于展示，完整回复提交成功后才派发工具。协议细节见 [宿主契约](docs/contracts.md)。
+
+当前 Rollout 格式为 **4**。V3 及更早的持久数据会被明确拒绝并保持原样，本轮不提供自动迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
+
 ## 环境由宿主定义
 
 `astral-core` 不知道什么是 Computer、Workspace、`AGENTS.md` 或 `SOUL.md`。应用可以提供一个 Environment Snapshot：

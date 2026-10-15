@@ -94,7 +94,7 @@ func (d *memoryDriver) addMessage(id, turn string, m Message) {
 	d.state.Calls = map[string]CallState{}
 	d.state.BatchTools = clone(d.state.Configuration.Tools)
 	d.rendered = false
-	for _, c := range m.ToolCalls {
+	for _, c := range m.ToolCalls() {
 		d.state.Calls[c.ID] = CallState{}
 	}
 	d.messages = append(d.messages, clone(m))
@@ -103,16 +103,17 @@ func (d *memoryDriver) renderResults() {
 	if d.rendered || d.state.Last == nil {
 		return
 	}
-	for _, c := range d.state.Last.Message.ToolCalls {
+	calls := d.state.Last.Message.ToolCalls()
+	for _, c := range calls {
 		if d.state.Calls[c.ID].Result == nil {
 			return
 		}
 	}
-	for _, c := range d.state.Last.Message.ToolCalls {
+	for _, c := range calls {
 		r := d.state.Calls[c.ID].Result
 		d.messages = append(d.messages, Message{Role: RoleTool, ToolCallID: c.ID, Name: c.Name, Content: clone(r.Content), IsError: r.IsError})
 	}
-	for _, c := range d.state.Last.Message.ToolCalls {
+	for _, c := range calls {
 		r := d.state.Calls[c.ID].Result
 		if len(r.Context) > 0 {
 			d.messages = append(d.messages, Message{Role: RoleContext, ContextKind: "tool_context", Content: Text(string(r.Context))})

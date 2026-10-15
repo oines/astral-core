@@ -98,7 +98,7 @@ func durableStore(t *testing.T, backend, dir string) (sessions.Store, func()) {
 func crashConfig(st sessions.Store, dir, stage string) sessions.Config {
 	m := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		for _, msg := range r.Messages {
-			if len(msg.ToolCalls) > 0 {
+			if len(msg.ToolCalls()) > 0 {
 				return answer("recovered"), nil
 			}
 		}

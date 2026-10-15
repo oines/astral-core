@@ -3,7 +3,11 @@ package astral
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
+
+	"github.com/oines/astral-core/internal/streamcheck"
 )
 
 // Model supplies protocol-neutral generation. Token estimation is a separate
@@ -56,11 +60,17 @@ const (
 	FinishCancelled FinishReason = "cancelled"
 )
 
+// ModelEvent is an observation, never a partial durable message. Standard
+// text_delta, reasoning_delta and tool_call_delta events require ContentIndex,
+// an index in this attempt's final Reply.Message.Content. Text may contain an
+// incomplete tool-argument JSON fragment; Data and Metadata remain opaque.
 type ModelEvent struct {
-	Type       string          `json:"type"`
-	Text       string          `json:"text,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
-	Data       json.RawMessage `json:"data,omitempty"`
+	Type         string          `json:"type"`
+	ContentIndex *int            `json:"content_index,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	ToolCallID   string          `json:"tool_call_id,omitempty"`
+	Data         json.RawMessage `json:"data,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
 type ModelFailure struct {
@@ -122,14 +132,38 @@ func stream(ctx context.Context, model Model, request Request, emit func(ModelEv
 			err = fmt.Errorf("model stream panicked: %v", p)
 		}
 	}()
+	var check streamcheck.Check
+	var mu sync.Mutex
 	reply, err = model.Stream(ctx, clone(request), func(event ModelEvent) {
+		mu.Lock()
+		defer mu.Unlock()
 		owned, copyErr := copyJSON(event)
-		if copyErr == nil {
-			emit(owned)
+		if copyErr != nil {
+			check.Fail(copyErr)
+			return
 		}
+		if check.Observe(owned.Type, owned.ContentIndex, owned.ToolCallID) != nil {
+			return
+		}
+		emit(owned)
 	})
+	if check.Err() != nil {
+		err = errors.Join(err, fmtInvalid("model event: %v", check.Err()))
+	}
 	if err == nil {
 		reply, err = copyJSON(reply)
+	}
+	if err == nil && (reply.FinishReason == FinishStop || reply.FinishReason == FinishToolCalls) {
+		if checkErr := check.Finish(len(reply.Message.Content), func(i int) (string, string) {
+			part := reply.Message.Content[i]
+			callID := ""
+			if part.ToolCall != nil {
+				callID = part.ToolCall.ID
+			}
+			return part.Type, callID
+		}); checkErr != nil {
+			err = fmtInvalid("model event: %v", checkErr)
+		}
 	}
 	return
 }
@@ -141,7 +175,7 @@ func validateReply(reply Reply) error {
 	if reply.Message.Role != RoleAssistant {
 		return fmtInvalid("model reply must be an assistant message")
 	}
-	if reply.FinishReason == FinishToolCalls && len(reply.Message.ToolCalls) == 0 {
+	if reply.FinishReason == FinishToolCalls && len(reply.Message.ToolCalls()) == 0 {
 		return fmtInvalid("tool_calls finish reason without calls")
 	}
 	return validateMessage(reply.Message)

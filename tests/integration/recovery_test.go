@@ -33,6 +33,12 @@ func waitApproval(t *testing.T, sub *astral.Subscription) string {
 func seedStore(t *testing.T, id string, rollout historySnapshot) *memory.Store {
 	t.Helper()
 	store := memory.New()
+	seedHistory(t, store, id, rollout)
+	return store
+}
+
+func seedHistory(t *testing.T, store sessions.Store, id string, rollout historySnapshot) {
+	t.Helper()
 	for start := 0; start < len(rollout.Entries); {
 		end := start + 1
 		for end < len(rollout.Entries) && rollout.Entries[end].Version == rollout.Entries[start].Version {
@@ -43,7 +49,6 @@ func seedStore(t *testing.T, id string, rollout historySnapshot) *memory.Store {
 		}
 		start = end
 	}
-	return store
 }
 
 func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {

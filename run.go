@@ -74,7 +74,7 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 	state := a.driver.Snapshot()
 	natural := state.Last == nil
 	if state.Last != nil && state.Last.Message.Role == RoleAssistant {
-		if len(state.Last.Message.ToolCalls) > 0 {
+		if len(state.Last.Message.ToolCalls()) > 0 {
 			natural, runErr = a.executeBatch(ctx, r, *state.Last)
 			if runErr != nil {
 				return
@@ -109,7 +109,7 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 		if runErr != nil {
 			return
 		}
-		if len(assistant.Message.ToolCalls) > 0 {
+		if len(assistant.Message.ToolCalls()) > 0 {
 			natural, runErr = a.executeBatch(ctx, r, assistant)
 			if runErr != nil {
 				return

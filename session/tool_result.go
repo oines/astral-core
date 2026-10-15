@@ -39,7 +39,7 @@ func (s *Session) boundResult(ctx context.Context, inv protocol.Invocation, resu
 	// messages are deliberately excluded when deciding whether one result alone
 	// is impossible to deliver. Aggregate pressure is handled by compaction.
 	request.Messages = append(request.Messages, *assistant)
-	for _, call := range assistant.ToolCalls {
+	for _, call := range assistant.ToolCalls() {
 		message := protocol.Message{Role: protocol.RoleTool, ToolCallID: call.ID, Name: call.Name, Content: protocol.Text("")}
 		if call.ID == inv.Call.ID {
 			message.Content = result.Content

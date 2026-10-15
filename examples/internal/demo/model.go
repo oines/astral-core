@@ -19,8 +19,23 @@ func Model(reply func(astral.Request) (astral.Reply, error)) astral.Model {
 			}
 			result, err := reply(request)
 			if err == nil {
-				for _, part := range result.Message.Content {
-					emit(astral.ModelEvent{Type: "text_delta", Text: part.Text})
+				for i, part := range result.Message.Content {
+					event := astral.ModelEvent{ContentIndex: &i, Text: part.Text, Data: part.Data, Metadata: part.Metadata}
+					switch part.Type {
+					case "text":
+						event.Type = "text_delta"
+					case "reasoning":
+						event.Type = "reasoning_delta"
+					case "tool_call":
+						event.Type = "tool_call_delta"
+						if part.ToolCall != nil {
+							event.ToolCallID = part.ToolCall.ID
+							event.Text = string(part.ToolCall.Arguments)
+						}
+					default:
+						event.Type = "provider_content"
+					}
+					emit(event)
 				}
 			}
 			return result, err
@@ -32,7 +47,11 @@ func Answer(text string) astral.Reply {
 	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: astral.Text(text)}, FinishReason: astral.FinishStop}
 }
 func Calls(calls ...astral.ToolCall) astral.Reply {
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, ToolCalls: calls}, FinishReason: astral.FinishToolCalls}
+	content := make([]astral.Content, len(calls))
+	for i := range calls {
+		content[i] = astral.Content{Type: "tool_call", ToolCall: &calls[i]}
+	}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content}, FinishReason: astral.FinishToolCalls}
 }
 func Call(id, name, arguments string) astral.ToolCall {
 	return astral.ToolCall{ID: id, Name: name, Arguments: json.RawMessage(arguments)}

@@ -21,7 +21,7 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 		case 1:
 			return calls(call("c1", "echo", `{"value":"result"}`)), nil
 		case 2:
-			emit(astral.ModelEvent{Type: "text_delta", Text: "discard me"})
+			emit(astral.ModelEvent{Type: "text_delta", ContentIndex: contentIndex(0), Text: "discard me"})
 			return astral.Reply{}, &astral.ModelError{Transient: true, Message: "network"}
 		default:
 			return answer("final"), nil
@@ -85,8 +85,8 @@ func TestFallbackAndOpaqueMetadata(t *testing.T) {
 		if n == 1 {
 			reply := calls(call("signed", "echo", `{"value":"result"}`))
 			reply.Message.Metadata = opaque
-			reply.Message.Content = []astral.Content{{Type: "reasoning", Text: "reasoning", Metadata: opaque}}
-			reply.Message.ToolCalls[0].Metadata = opaque
+			reply.Message.Content[0].ToolCall.Metadata = opaque
+			reply.Message.Content = append([]astral.Content{{Type: "reasoning", Text: "reasoning", Metadata: opaque}}, reply.Message.Content...)
 			return reply, nil
 		}
 		return astral.Reply{}, &astral.ModelError{Transient: true, Message: "unavailable"}
@@ -95,7 +95,7 @@ func TestFallbackAndOpaqueMetadata(t *testing.T) {
 		found := false
 		for _, m := range r.Messages {
 			if m.Role == astral.RoleAssistant {
-				found = string(m.Metadata) == string(opaque) && string(m.ToolCalls[0].Metadata) == string(opaque) && string(m.Content[0].Metadata) == string(opaque)
+				found = string(m.Metadata) == string(opaque) && string(m.ToolCalls()[0].Metadata) == string(opaque) && string(m.Content[0].Metadata) == string(opaque)
 			}
 		}
 		if !found {

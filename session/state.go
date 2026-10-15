@@ -126,9 +126,9 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.Results = nil
 			state.Tools = nil
 			state.Approvals = nil
-			if len(e.Message.ToolCalls) > 0 {
+			if calls := e.Message.ToolCalls(); len(calls) > 0 {
 				state.Branch.PendingCalls = map[string]protocol.ToolCall{}
-				for _, call := range e.Message.ToolCalls {
+				for _, call := range calls {
 					state.Branch.PendingCalls[call.ID] = call
 				}
 			}

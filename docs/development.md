@@ -10,6 +10,7 @@ astral-core/
 ├── model.go, message.go, tool.go   # Provider 中立协议
 ├── events.go, config.go           # 非阻塞事件与执行配置
 ├── internal/retry/                # 生成与摘要共用 Retry / Backoff
+├── internal/streamcheck/          # 每次 Attempt 的轻量内容索引校验
 ├── environment/                   # 宿主 Snapshot：模型 Context 与 opaque Binding
 ├── session/
 │   ├── manager.go, session.go     # 持久会话所有权与生命周期
@@ -59,6 +60,8 @@ go run ./examples/fork
 
 | 测试 | 验证 |
 | --- | --- |
+| 根目录 `message_test.go` | 唯一有序 Content、调用提取、统一校验、扩展类型、签名与大整数、旧字段明确拒绝 |
+| `ordered_content_test.go` | 交错流式索引、提交前不派发、乱序结果排序、Retry / Fallback 隔离、三后端冷重开 / 压缩 / Fork / 恢复 |
 | `core_test.go` | 仅 Model / Tools 启动；Core 与 Session 的请求、事件、Retry、输入、顺序、并行上限一致；取消不重跑 |
 | `crash_test.go` | SQLite / JSONL 在七个确定屏障强杀子进程；持久效果与 Hook 计数证明无重复副作用 |
 | `recovery_test.go` | 审批恢复、固定授权、未知效果、完成但缺输出、丢失确认 |
