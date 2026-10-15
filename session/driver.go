@@ -30,7 +30,7 @@ func (s *Session) initCore() error {
 	for _, d := range a.defaults.Tools {
 		tools = append(tools, frozenTool{a.tools[d.Name]})
 	}
-	c := protocol.Config{ID: s.id, Model: a.config.Model, Tools: tools, ResolveModel: a.config.ResolveModel, Retry: a.config.Retry, Fallback: a.config.Fallback, MaxTurns: a.config.MaxTurns, MaxParallelTools: a.config.MaxParallelTools, AfterToolCall: a.config.AfterToolCall, Driver: sessionDriver{s}}
+	c := protocol.Config{ID: s.id, Model: a.config.Model, Tools: tools, ResolveModel: a.config.ResolveModel, Retry: a.config.Retry, Fallback: a.config.Fallback, MaxTurns: a.config.MaxTurns, MaxParallelTools: a.config.MaxParallelTools, MaxSteeringPerTurn: a.config.MaxSteeringPerTurn, AfterToolCall: a.config.AfterToolCall, Driver: sessionDriver{s}}
 	if a.config.BeforeToolCall != nil {
 		c.BeforeToolCall = func(ctx context.Context, inv protocol.Invocation) (protocol.ToolDecision, error) {
 			return a.config.BeforeToolCall(ctx, ToolContext{Invocation: inv, awaitApproval: func(ctx context.Context, r ApprovalRequest) (ApprovalDecision, error) {
@@ -184,7 +184,14 @@ func (d sessionDriver) Boundary(ctx context.Context, id string, natural bool) (b
 	}
 	if len(pending) > 0 {
 		item := pending[0]
-		_, err := s.appendLocked(ctx, Entry{Kind: EntryMessage, RunID: id, Message: item.Message}, Entry{Kind: EntryInputConsumed, RunID: id, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
+		entries := []Entry{{Kind: EntryMessage, RunID: id, Message: item.Message}, {Kind: EntryInputConsumed, RunID: id, Input: &InputRecord{ID: item.ID, Kind: item.Kind}}}
+		if item.Kind == InputSteer {
+			entries, err = s.steeringEntriesLocked(id, pending)
+			if err != nil {
+				return false, protocol.RunResult{}, err
+			}
+		}
+		_, err := s.appendLocked(ctx, entries...)
 		return false, protocol.RunResult{}, err
 	}
 	if natural {

@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 
 	protocol "github.com/oines/astral-core"
 )
@@ -48,7 +50,11 @@ func (s *Session) pendingInputsLocked(ctx context.Context, kind InputKind) ([]In
 	if s.state.PendingInputs[kind] == 0 {
 		return nil, nil
 	}
-	page, err := s.agent.config.Store.Pending(ctx, s.id, PendingQuery{Kind: EntryInputQueued, InputKind: kind, Limit: 1, MaxBytes: s.agent.config.MaxContextBytes})
+	limit := 1
+	if kind == InputSteer {
+		limit = s.agent.config.MaxSteeringPerTurn
+	}
+	page, err := s.agent.config.Store.Pending(ctx, s.id, PendingQuery{Kind: EntryInputQueued, InputKind: kind, Limit: limit, MaxBytes: s.agent.config.MaxContextBytes})
 	if err != nil {
 		return nil, err
 	}
@@ -57,4 +63,41 @@ func (s *Session) pendingInputsLocked(ctx context.Context, kind InputKind) ([]In
 		out = append(out, *r.Entry.Input)
 	}
 	return out, nil
+}
+
+func (s *Session) steeringEntriesLocked(runID string, pending []InputRecord) ([]Entry, error) {
+	view, err := project(s.pathLocked())
+	if err != nil {
+		return nil, err
+	}
+	request := view.Request
+	// Reserve the uncapped output setting's JSON width, without resolving a
+	// model under the queue lock. Prepare retains token checks and compaction.
+	request.MaxOutputTokens = s.agent.config.Budget.OutputTokens
+	if request.MaxOutputTokens == 0 {
+		request.MaxOutputTokens = 16384
+	}
+	var accepted []Entry
+	for _, item := range pending {
+		request.Messages = append(request.Messages, *item.Message)
+		raw, err := json.Marshal(request)
+		if err != nil {
+			return nil, err
+		}
+		var candidate []Entry
+		if len(raw) > s.agent.config.MaxContextBytes {
+			err = &BudgetError{Input: len(raw), Window: s.agent.config.MaxContextBytes}
+		} else {
+			drafts := append(accepted, Entry{Kind: EntryMessage, RunID: runID, Message: item.Message}, Entry{Kind: EntryInputConsumed, RunID: runID, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
+			candidate, err = s.prepareEntriesLocked(drafts)
+		}
+		if err != nil {
+			if len(accepted) > 0 && errors.Is(err, ErrBudget) {
+				break
+			}
+			return nil, err
+		}
+		accepted = candidate
+	}
+	return accepted, nil
 }

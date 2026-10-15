@@ -50,6 +50,12 @@ func New(config Config) (*Agent, error) {
 	if config.MaxParallelTools == 0 {
 		config.MaxParallelTools = 8
 	}
+	if config.MaxSteeringPerTurn == 0 {
+		config.MaxSteeringPerTurn = 1
+	}
+	if config.MaxSteeringPerTurn < 1 || config.MaxSteeringPerTurn > 16 {
+		return nil, fmtInvalid("MaxSteeringPerTurn must be between 1 and 16")
+	}
 	if config.MaxTurns < 0 || config.MaxParallelTools < 1 || config.Retry.MaxAttempts < 1 || config.Retry.InitialBackoff < 0 || config.Retry.MaxBackoff < config.Retry.InitialBackoff || config.Retry.RequestTimeout < 0 || config.Retry.MaxFallbacks < 0 {
 		return nil, fmtInvalid("invalid execution policy")
 	}

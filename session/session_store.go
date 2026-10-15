@@ -12,50 +12,11 @@ import (
 )
 
 func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, error) {
-	if len(drafts) == 0 {
-		return nil, fmtInvalid("empty commit")
-	}
-	entries, err := copyJSON(drafts)
+	entries, err := s.prepareEntriesLocked(drafts)
 	if err != nil {
 		return nil, err
 	}
-	head := s.state.Branch.HeadID
-	for i := range entries {
-		e := &entries[i]
-		if e.ID == "" {
-			e.ID = newID()
-		}
-		if e.Time.IsZero() {
-			e.Time = time.Now().UTC()
-		}
-		e.Sequence = 0
-		e.SessionID = s.id
-		e.Version = s.state.Version + 1
-		if e.IsHistory() {
-			e.ParentID = head
-			head = e.ID
-		} else {
-			e.ParentID = ""
-		}
-	}
 	commit := Commit{ID: newID(), ExpectedVersion: s.state.Version, Entries: entries}
-
-	// Context memory is independent of archived history. Reject oversized new
-	// messages before model-declared tools can execute; bounded result admission
-	// handles delivery after an actual tool execution separately.
-	added := 0
-	compacting := false
-	for _, e := range entries {
-		if e.IsHistory() {
-			e.Sequence = math.MaxInt64 // conservative size before the Store assigns order
-			b, _ := json.Marshal(e)
-			added += len(b)
-		}
-		compacting = compacting || e.Kind == EntryCompaction
-	}
-	if !compacting && s.windowBytes+added > 2*s.agent.config.MaxContextBytes {
-		return nil, &BudgetError{Input: s.windowBytes + added, Window: 2 * s.agent.config.MaxContextBytes}
-	}
 	digest, err := commit.Digest()
 	if err != nil {
 		return nil, err
@@ -88,11 +49,13 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 	if s.rolloutID == "" {
 		s.rolloutID = next.RolloutID
 	}
+	compacting := false
 	for _, e := range entries {
 		if e.IsHistory() {
 			s.windowIndex[e.ID] = len(s.window)
 			s.window = append(s.window, e)
 		}
+		compacting = compacting || e.Kind == EntryCompaction
 	}
 	if compacting {
 		s.pruneWindow()
@@ -105,6 +68,54 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 		s.publishLocked(protocol.Event{Type: protocol.EventCommitted, EntryID: e.ID, RunID: e.RunID, TurnID: e.TurnID})
 	}
 	return clone(entries), nil
+}
+
+// prepareEntriesLocked admits a draft without mutating state or writing it.
+// Steering uses the same envelope sizing as the eventual atomic append.
+func (s *Session) prepareEntriesLocked(drafts []Entry) ([]Entry, error) {
+	if len(drafts) == 0 {
+		return nil, fmtInvalid("empty commit")
+	}
+	entries, err := copyJSON(drafts)
+	if err != nil {
+		return nil, err
+	}
+	head := s.state.Branch.HeadID
+	for i := range entries {
+		e := &entries[i]
+		if e.ID == "" {
+			e.ID = newID()
+		}
+		if e.Time.IsZero() {
+			e.Time = time.Now().UTC()
+		}
+		e.Sequence = 0
+		e.SessionID = s.id
+		e.Version = s.state.Version + 1
+		if e.IsHistory() {
+			e.ParentID = head
+			head = e.ID
+		} else {
+			e.ParentID = ""
+		}
+	}
+	// Context memory is independent of archived history. Reject oversized new
+	// messages before model-declared tools can execute; bounded result admission
+	// handles delivery after an actual tool execution separately.
+	added := 0
+	compacting := false
+	for _, e := range entries {
+		if e.IsHistory() {
+			e.Sequence = math.MaxInt64 // conservative size before the Store assigns order
+			b, _ := json.Marshal(e)
+			added += len(b)
+		}
+		compacting = compacting || e.Kind == EntryCompaction
+	}
+	if !compacting && s.windowBytes+added > 2*s.agent.config.MaxContextBytes {
+		return nil, &BudgetError{Input: s.windowBytes + added, Window: 2 * s.agent.config.MaxContextBytes}
+	}
+	return entries, nil
 }
 func (s *Session) append(ctx context.Context, entries ...Entry) ([]Entry, error) {
 	s.mu.Lock()

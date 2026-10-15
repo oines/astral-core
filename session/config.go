@@ -29,6 +29,9 @@ type Config struct {
 	// MaxParallelTools defaults to 8. A sequential declaration still serializes
 	// the whole batch, regardless of this limit.
 	MaxParallelTools int
+	// MaxSteeringPerTurn defaults to 1 and accepts 1–16 queued messages per
+	// boundary. Follow-ups are always consumed one at a time.
+	MaxSteeringPerTurn int
 }
 
 // Configuration is the immutable effective configuration recorded in a branch.

@@ -37,7 +37,7 @@ astral-core/
 
 接入从 [独立 Core 示例](../examples/basic/main.go) 和 [持久审批示例](../examples/approval/main.go) 开始。执行路径按 `run.go → generation.go / tool_execution.go → Driver` 阅读；持久路径按 `session/driver.go → session_store.go → Store.Commit（分配 Sequence、Reduce、原子保存）→ Receipt → Session Reduce` 阅读。
 
-Core 的直接第三方依赖只有 JSON Schema 编译器；不导入 Session、存储、环境、Provider SDK 或标准工具。Session 通过组合 Core 加入策略，Store 实现反向依赖 session.Store 契约。
+Core 的直接第三方依赖只有 JSON Schema 编译器；只复用 environment.Snapshot 数据类型，不包含环境发现，也不导入 Session、存储、Provider SDK 或标准工具。Session 通过组合 Core 加入策略，Store 实现反向依赖 session.Store 契约。
 
 ## 验证命令
 
@@ -61,6 +61,8 @@ go run ./examples/fork
 | 测试 | 验证 |
 | --- | --- |
 | 根目录 `message_test.go` | 唯一有序 Content、调用提取、统一校验、扩展类型、签名与大整数、旧字段明确拒绝 |
+| `memory_driver_test.go`（根目录）/ `core_environment_test.go`（integration） | Standalone Snapshot 分离、非法更新拒绝、连续调用绑定、完整 Request 不泄露私有值、字节前缀 |
+| `steering_test.go` | 默认逐条 / 显式批量、配置边界、Core / Session 一致性、FIFO、Metadata、预算、三后端原子提交 / 确认丢失 / 冷重开 / Cancel |
 | `ordered_content_test.go` | 交错流式索引、提交前不派发、乱序结果排序、Retry / Fallback 隔离、三后端冷重开 / 压缩 / Fork / 恢复 |
 | `core_test.go` | 仅 Model / Tools 启动；Core 与 Session 的请求、事件、Retry、输入、顺序、并行上限一致；取消不重跑 |
 | `crash_test.go` | SQLite / JSONL 在七个确定屏障强杀子进程；持久效果与 Hook 计数证明无重复副作用 |

@@ -137,6 +137,8 @@ Store 有三种选择：
 | 从历史重新尝试 | `Fork` |
 | 人工审批 | `PendingApprovals` / `DecideApproval` |
 
+Core 和持久 Session 都默认每个安全边界消费一条 Steer。宿主可在各自 Config 中设置 `MaxSteeringPerTurn: 2` 到 `16`，将已排队的多条 Steer 按 FIFO 放进下一次模型请求；每条仍是独立 User Message。0 等同默认值 1，超出范围报错。FollowUp 始终逐条处理，Steer 优先；字节预算不足时剩余输入继续留队。
+
 ### Fork 的是历史，不是文件系统
 
 每个 Session 有自己的执行状态和当前 Head；它们可以共享同一份 Rollout 历史，也可以将选中的历史路径复制成独立 Rollout（Detached Fork）。

@@ -177,7 +177,11 @@ BeforeToolCall: func(ctx context.Context, inv session.ToolContext) (astral.ToolD
 
 AfterToolCall 返回 ToolResultPatch；nil 保留原字段，布尔指针允许设置 false。可改交付内容、Details、IsError、Code、Artifact、Terminate，不能改实际 Outcome 和 Context 效果。已 completed 的恢复不会重跑 after hook。
 
-Steer 在完整回复或整批工具之后优先消费；FollowUp 在自然完成时消费。消费与用户消息同批提交。只有整批结果都要求 Terminate 才停止自动续问，排队输入仍会处理。收尾与队列检查共享锁，收尾之后入队的输入留给下一次 Continue，不丢失。
+Steer 在完整回复或整批工具之后优先消费；FollowUp 在自然完成时消费。Core 和 Session 的 Config 均提供 `MaxSteeringPerTurn`：0 使用默认值 1，显式 1–16 控制每个 Boundary 的 Steer 数量，负数及大于 16 报配置错误。未配置时保持逐条消费；显式大于 1 时，当前已排队的 FIFO 前缀作为多条独立 User Message 进入同一次模型请求，保留 Content、Metadata 和原输入 ID，不拼接正文、不等待未来消息。FollowUp 始终一次一条。该配置是宿主执行策略，不写入持久 Configuration 或 RuntimeState。
+
+候选读取同时限制条数与字节。Session 在提交前使用 `MaxContextBytes` 和现有 Context 缓存保护选择可容纳的前缀；Standalone 对 Steering 使用相同默认字节额度 32 MiB，不增加预算配置。序列化大小为输出预留设置保守保留数字宽度，不在队列锁内解析模型或调用估算器；Token 检查和自动压缩仍由原 Prepare 执行。首条无法容纳时不消费输入：Session 返回 ErrBudget，Standalone 使用现有 ErrInvalid 报告输入超出字节预算；宿主可调整 Session 预算或先压缩再 Continue。
+
+Session 对整个选中前缀交替形成 EntryMessage / EntryInputConsumed，通过一次 Commit 原子提交，后者保留原始输入 ID；消息条目仍分配独立的历史 Entry ID。提交失败不提前推进缓存或消费队列，CAS 和丢失确认沿用现有 Receipt 机制。Core 在同一锁内追加独立消息并移除选中项。只有整批结果都要求 Terminate 才停止自动续问，排队输入仍会处理。收尾与队列检查共享锁，收尾之后入队的输入留给下一次 Continue，不丢失。
 
 Subscribe 为尽力投递，缓冲溢出关闭订阅并返回 ErrSlowSubscriber。先订阅，再分页读取历史，按 Entry ID 去重。Event.Sequence 只在当前句柄内递增，不是持久游标；失败 Attempt 的 Delta 不能从历史恢复。InspectContext 不生成回复、压缩或发现环境。
 
@@ -197,6 +201,8 @@ Binding 可以是任意有效 JSON，包括对象、数组、字符串、数字�
 Context 是模型可见的宿主文本。环境条目按发生位置投影为 RoleContext / ContextKind=environment，正文精确使用 Snapshot.Context；普通生成和摘要都不自动序列化 Binding。System Prompt 不受环境影响。环境发现、设备列表、Shell、Workspace、Skills Index 以及 AGENTS.md / SOUL.md / SKILL.md 的读取和组织均属于上层产品；引用文件正文是来源材料，不提升为 System 指令。
 
 NewSession 可以接收初始快照，或调用宿主 Provider，第一轮请求即可看到 Context。RefreshEnvironment 只允许空闲且未关闭的 Session，保留原有维护和预算限制。普通 Sequential Tool 可以通过 ToolResult.Context 提交 `json.Marshal(snapshot)`；SDK 将结果与环境节点原子持久化。失败的宿主解析不得返回环境更新；结果 Hook 无权改写已发生的环境效果。
+
+Standalone Core 使用同一 Snapshot 更新协议：初始执行 Binding 来自 Config.Binding，Sequential Tool 的快照生效后，后续 Invocation 只接收其中 Binding 的隔离副本。完整工具结果批次之后仅投影快照 Context，ContextKind 为 environment，不把原始 JSON 或 Binding 发送给模型。非法快照在 Result 被采用前报错，当前有效 Binding 不变；它没有持久 Session 的恢复保证。
 
 环境切换工具的结果节点本身也保存快照效果：若 Fork 恰好选在结果节点、尚未包含同批后续环境节点，Projection 会引用结果内的快照并投影其 Context；包含后续环境节点时不重复投影。继续执行前仍需宿主重新确认。Compaction 原子重申最新完整快照，执行 Binding 和模型 Context 分开保留。
 

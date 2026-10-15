@@ -21,7 +21,10 @@ type Config struct {
 	Retry            RetryPolicy
 	MaxTurns         int
 	MaxParallelTools int
-	Driver           Driver
+	// MaxSteeringPerTurn defaults to 1 and accepts 1–16 queued messages per
+	// boundary. Follow-ups are always consumed one at a time.
+	MaxSteeringPerTurn int
+	Driver             Driver
 }
 
 type RetryPolicy struct {

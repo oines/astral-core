@@ -58,6 +58,12 @@ func New(config Config) (*Manager, error) {
 	if config.MaxParallelTools == 0 {
 		config.MaxParallelTools = 8
 	}
+	if config.MaxSteeringPerTurn == 0 {
+		config.MaxSteeringPerTurn = 1
+	}
+	if config.MaxSteeringPerTurn < 1 || config.MaxSteeringPerTurn > 16 {
+		return nil, fmtInvalid("MaxSteeringPerTurn must be between 1 and 16")
+	}
 	if config.Budget.OutputTokens < 0 || config.Budget.SafetyMargin < 0 || config.Budget.AutoCompactAt < 0 || config.MaxTurns < 0 || config.MaxParallelTools < 1 {
 		return nil, fmtInvalid("negative budget or turn limit")
 	}
