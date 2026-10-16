@@ -20,6 +20,7 @@ import (
 	core "github.com/oines/astral-core"
 	s "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/internal/historypage"
+	"github.com/oines/astral-core/store/internal/pending"
 	"github.com/oines/astral-core/store/internal/targetlock"
 	_ "modernc.org/sqlite"
 )
@@ -43,7 +44,7 @@ func (st *Store) Close() error { return st.db.Close() }
 
 const schema = `
 CREATE TABLE format(version INTEGER NOT NULL);
-INSERT INTO format VALUES(4);
+INSERT INTO format VALUES(5);
 CREATE TABLE rollouts(id TEXT PRIMARY KEY,status TEXT NOT NULL,seq INTEGER NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY,rollout_id TEXT NOT NULL,ready INTEGER NOT NULL,state BLOB NOT NULL,fork_digest TEXT NOT NULL DEFAULT '');
 CREATE INDEX session_rollout ON sessions(rollout_id,id);
@@ -59,7 +60,7 @@ CREATE TABLE pending(rollout_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT
 CREATE INDEX pending_order ON pending(session_id,kind,input_kind,seq);
 CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
-PRAGMA user_version=4;
+PRAGMA user_version=5;
 `
 
 // CROSS JOIN keeps the bounded chain on the outside of each indexed lookup.
@@ -484,7 +485,6 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	if next.SessionID != id || next.RolloutID != rolloutID {
 		return receipt, s.ErrCorrupt
 	}
-	queued := map[string]bool{}
 	for _, e := range confirmed.Entries {
 		var one int
 		check := tx.QueryRowContext(ctx, "SELECT 1 FROM entries WHERE rollout_id=? AND id=?", rolloutID, e.ID).Scan(&one)
@@ -499,23 +499,18 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 				return receipt, s.ErrCorrupt
 			}
 		}
-		if e.Kind == s.EntryInputConsumed {
-			var kind string
-			if err = tx.QueryRowContext(ctx, "SELECT input_kind FROM pending WHERE session_id=? AND kind=? AND key=?", id, string(s.EntryInputQueued), e.Input.ID).Scan(&kind); err != nil || kind != string(e.Input.Kind) {
-				return receipt, s.ErrCorrupt
-			}
-		}
-		if e.Kind == s.EntryInputQueued {
-			check = tx.QueryRowContext(ctx, "SELECT 1 FROM pending WHERE session_id=? AND kind=? AND key=?", id, string(s.EntryInputQueued), e.Input.ID).Scan(&one)
-			if check == nil || queued[e.Input.ID] {
-				return receipt, s.ErrCorrupt
-			}
-			if !errors.Is(check, sql.ErrNoRows) {
-				return receipt, check
-			}
-			queued[e.Input.ID] = true
-		}
 	}
+	if err := pending.Validate(confirmed.Entries, func(key string) (s.InputKind, bool, error) {
+		var kind string
+		err := tx.QueryRowContext(ctx, "SELECT input_kind FROM pending WHERE session_id=? AND kind=? AND key=?", id, string(s.EntryInputQueued), key).Scan(&kind)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return s.InputKind(kind), err == nil, err
+	}); err != nil {
+		return receipt, err
+	}
+
 	raw, err = json.Marshal(next)
 	if err != nil {
 		return receipt, err
@@ -583,6 +578,12 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []s.Record, pend
 				owner = e.Approval.ExecutionID
 			}
 			_, err = tx.ExecContext(ctx, "INSERT INTO pending(rollout_id,session_id,kind,input_kind,key,owner,seq,payload) VALUES(?,?,?,?,?,?,?,?)", id, e.SessionID, string(e.Kind), kind, key, owner, e.Sequence, payload)
+		case s.EntryInputCleared:
+			for _, kind := range e.Clear.Kinds {
+				if _, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND input_kind=?", e.SessionID, string(s.EntryInputQueued), string(kind)); err != nil {
+					return err
+				}
+			}
 		case s.EntryInputConsumed:
 			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(s.EntryInputQueued), e.Input.ID)
 		case s.EntryApprovalDecided:

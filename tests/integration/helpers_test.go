@@ -11,7 +11,6 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
 )
 
@@ -52,7 +51,7 @@ func (m *testModel) observed() []astral.Request {
 }
 
 func answer(text string) astral.Reply {
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: astral.Text(text)}, FinishReason: astral.FinishStop}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: astral.Text(text), FinishReason: astral.FinishStop}}
 }
 
 func calls(calls ...astral.ToolCall) astral.Reply {
@@ -60,7 +59,7 @@ func calls(calls ...astral.ToolCall) astral.Reply {
 	for i := range calls {
 		content[i] = astral.Content{Type: "tool_call", ToolCall: &calls[i]}
 	}
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content}, FinishReason: astral.FinishToolCalls}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content, FinishReason: astral.FinishToolCalls}}
 }
 
 func contentIndex(i int) *int { return &i }
@@ -193,28 +192,6 @@ func bindingOf(raw json.RawMessage) hostBinding {
 	return value
 }
 
-func hostSnapshot(target, location string) environments.Snapshot {
-	raw, err := json.Marshal(hostBinding{Target: target, Location: location})
-	if err != nil {
-		panic(err)
-	}
-	return environments.Snapshot{Binding: raw, Context: fmt.Sprintf("Target: %s\nLocation: %s", target, location)}
-}
-
-func switchEnvironment(resolve func(context.Context, astral.Invocation) (environments.Snapshot, error)) astral.Tool {
-	return astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object"}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
-		snapshot, err := resolve(ctx, inv)
-		if err != nil {
-			return astral.ToolResult{}, err
-		}
-		payload, err := json.Marshal(snapshot)
-		if err != nil {
-			return astral.ToolResult{}, err
-		}
-		return astral.ToolResult{Content: astral.Text("Environment updated."), Context: payload}, nil
-	}}
-}
-
 type historySnapshot struct {
 	Version uint64
 	Entries []sessions.Entry
@@ -298,4 +275,30 @@ func appendStore(ctx context.Context, store sessions.Store, id string, version u
 	commit := makeCommit(state, version, entries)
 	_, err = store.Commit(ctx, id, commit)
 	return err
+}
+
+// hostTargetTool is a host adapter, outside Core's routing policy. Live process
+// handles retain their resource binding; new calls resolve the host selection.
+type hostTargetTool struct {
+	astral.Tool
+	target func() json.RawMessage
+}
+
+func (t hostTargetTool) Bind(ctx context.Context, inv astral.Invocation) (json.RawMessage, error) {
+	if t.Definition().Name == "write_stdin" {
+		return t.Tool.(astral.TargetedTool).Bind(ctx, inv)
+	}
+	return append(json.RawMessage(nil), t.target()...), nil
+}
+
+func seedCompletedBoundary(t *testing.T, s *sessions.Session, store sessions.Store) {
+	t.Helper()
+	m := answer("prior").Message
+	drafts := []sessions.Entry{{ID: "seed-assistant", ParentID: s.Head(), Kind: sessions.EntryMessage, TurnID: "seed-turn", Message: &m}, {ID: "seed-decision", Kind: sessions.EntryTurn, Turn: &astral.TurnState{ID: "seed-turn", AssistantID: "seed-assistant", Decided: true, Advanced: true}}}
+	if err := appendStore(context.Background(), store, s.ID(), s.State().Version, drafts); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -6,20 +6,16 @@ import (
 	"fmt"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Context is the effective request plus provenance in the active branch. Its
 // messages contain only the active window and its provenance.
 type Context struct {
-	HeadID          string              `json:"head_id"`
-	ConfigurationID string              `json:"configuration_id"`
-	Request         protocol.Request    `json:"request"`
-	Sources         []string            `json:"sources"`
-	Environment     *targetenv.Snapshot `json:"environment,omitempty"`
-	Binding         json.RawMessage     `json:"binding,omitempty"`
-	SnapshotID      string              `json:"snapshot_id,omitempty"`
-	EstimatedInput  int                 `json:"estimated_input"`
+	HeadID          string           `json:"head_id"`
+	ConfigurationID string           `json:"configuration_id"`
+	Request         protocol.Request `json:"request"`
+	Sources         []string         `json:"sources"`
+	EstimatedInput  int              `json:"estimated_input"`
 }
 
 func (s *Session) InspectContext(ctx context.Context) (Context, error) {
@@ -72,8 +68,8 @@ func (s *Session) requestContext(ctx context.Context, model protocol.Model) (Con
 func resultKey(assistantID, callID string) string { return assistantID + "\x00" + callID }
 
 // project is the only normal history-to-context projection. Tool results are
-// emitted in the assistant's call order as one contiguous batch. Environment
-// entries inside that batch follow it, preserving their relative order. Since
+// emitted in the assistant's call order as one contiguous batch. Context may
+// only be committed at a complete batch boundary. Since
 // no model request observes a half batch, previously sent prefixes stay stable.
 func project(path []Entry) (Context, error) {
 	configuration, configurationID, err := effectiveConfiguration(path)
@@ -83,10 +79,6 @@ func project(path []Entry) (Context, error) {
 	view := Context{ConfigurationID: configurationID, Request: protocol.Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools}}
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
-	}
-	view.Environment, view.SnapshotID = effectiveEnvironment(path)
-	if view.Environment != nil {
-		view.Binding = view.Environment.Binding
 	}
 	start := 0
 	var checkpoint *Entry
@@ -109,7 +101,7 @@ func project(path []Entry) (Context, error) {
 		if !found {
 			return Context{}, fmt.Errorf("%w: compaction boundary missing", ErrCorrupt)
 		}
-		view.Request.Messages = append(view.Request.Messages, protocol.Message{Role: protocol.RoleContext, ContextKind: "summary", Content: protocol.Text(checkpoint.Compaction.Summary)})
+		view.Request.Messages = append(view.Request.Messages, protocol.Message{Role: protocol.RoleUser, ContextKind: "summary", Content: protocol.Text(checkpoint.Compaction.Summary)})
 		view.Sources = append(view.Sources, checkpoint.ID)
 	}
 	visible := path[start:]
@@ -118,11 +110,7 @@ func project(path []Entry) (Context, error) {
 	}
 	results := map[string]Entry{}
 	assistants := map[string]Entry{}
-	environmentParents := map[string]bool{}
 	for _, e := range visible {
-		if e.Kind == EntryEnvironment {
-			environmentParents[e.ParentID] = true
-		}
 		if e.Kind == EntryMessage && e.Message.Role == protocol.RoleAssistant {
 			assistants[e.ID] = e
 		}
@@ -157,6 +145,9 @@ func project(path []Entry) (Context, error) {
 	for _, e := range visible {
 		switch e.Kind {
 		case EntryMessage:
+			if e.Message.Failed() {
+				continue
+			}
 			if e.Message.Role == protocol.RoleTool {
 				return Context{}, fmt.Errorf("%w: tool messages require a tool result entry", ErrCorrupt)
 			}
@@ -173,20 +164,8 @@ func project(path []Entry) (Context, error) {
 				}
 				add(protocol.Message{Role: protocol.RoleTool, Content: content, ToolCallID: call.ID, Name: call.Name, IsError: r.IsError}, result.ID)
 			}
-		case EntryEnvironment:
-			add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(e.Environment.Context)}, e.ID)
-		case EntryToolResult, EntryToolResolution:
-			// An inclusive result boundary can omit the following environment
-			// node from the same atomic commit. Project its effect once here.
-			if !environmentParents[e.ID] {
-				snapshot, err := resultEnvironment(e)
-				if err != nil {
-					return Context{}, err
-				}
-				if snapshot != nil {
-					add(protocol.Message{Role: protocol.RoleContext, ContextKind: "environment", Content: protocol.Text(snapshot.Context)}, e.ID)
-				}
-			}
+		case EntryContext:
+			add(*e.Message, e.ID)
 		}
 	}
 	if err = validateProtocol(view.Request.Messages); err != nil {
@@ -202,7 +181,10 @@ func validateToolTimeline(path []Entry) error {
 	completed := map[string]Entry{}
 	for _, e := range path {
 		switch e.Kind {
-		case EntryMessage:
+		case EntryMessage, EntryContext:
+			if e.Message.Failed() {
+				continue
+			}
 			if len(pending) > 0 {
 				return fmt.Errorf("%w: message precedes outstanding tool results", protocol.ErrIncompleteBatch)
 			}

@@ -17,9 +17,9 @@ import (
 )
 
 type inputEndpoint interface {
-	Start(context.Context, astral.Message) (*astral.Run, error)
-	Steer(context.Context, astral.Message) (string, error)
-	FollowUp(context.Context, astral.Message) (string, error)
+	Start(context.Context, astral.Message, ...astral.InputOptions) (*astral.Run, error)
+	Steer(context.Context, astral.Message, ...astral.InputOptions) (string, error)
+	FollowUp(context.Context, astral.Message, ...astral.InputOptions) (string, error)
 }
 
 func steeringMessage(i int) astral.Message {
@@ -252,6 +252,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 				c.MaxSteeringPerTurn = 16
 				a := newAgent(t, c)
 				s := newSession(t, a, sessions.SessionOptions{ID: "input-recovery"})
+				seedCompletedBoundary(t, s, store)
 				var ids []string
 				for i := 0; i < 3; i++ {
 					id, err := s.Steer(ctx, steeringMessage(i))
@@ -300,15 +301,21 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 					t.Fatal("partial input batch recovered")
 				}
 				for _, e := range entries(s) {
-					if !written && e.Message != nil {
+					if !written && e.Message != nil && e.Message.Role == astral.RoleUser {
 						t.Fatal("uncommitted message appeared in history")
 					}
 				}
 				run, err = s.Continue(ctx)
-				if err != nil {
-					t.Fatal(err)
+				if written && len(m.observed()) == 1 {
+					if !errors.Is(err, astral.ErrNotContinuable) {
+						t.Fatal(err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					waitOK(t, run)
 				}
-				waitOK(t, run)
 				if len(m.observed()) != 1 || !reflect.DeepEqual(userMessages(m.observed()[0]), []astral.Message{steeringMessage(0), steeringMessage(1), steeringMessage(2)}) {
 					t.Fatal("recovery lost, split or repeated an input batch")
 				}
@@ -329,8 +336,8 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 					version = e.Version
 					consumed = append(consumed, e.Input.ID)
 				}
-				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 4 {
-					t.Fatal("consumed IDs or V4 state changed during recovery")
+				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 5 {
+					t.Fatal("consumed IDs or V5 state changed during recovery")
 				}
 			})
 		}
@@ -359,6 +366,7 @@ func TestSteeringArrivingDuringCommitWaitsForNextBoundary(t *testing.T) {
 		c := testConfig(m, fault)
 		c.MaxSteeringPerTurn = 16
 		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		seedCompletedBoundary(t, s, store)
 		for i := 0; i < 3; i++ {
 			if _, err := s.Steer(ctx, steeringMessage(i)); err != nil {
 				t.Fatal(err)
@@ -455,51 +463,24 @@ func TestSteeringByteBudgetConsumesOnlyPrefixAndRetainsOversizedHead(t *testing.
 	})
 }
 
-func TestSteeringOversizedQueuedRecordRemainsPending(t *testing.T) {
+func TestOversizedInputBatchRejectedBeforeAdmission(t *testing.T) {
 	eachStore(t, func(t *testing.T, store sessions.Store) {
-		ctx := context.Background()
 		m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-			return answer("done"), nil
+			return answer("unused"), nil
 		})
 		c := testConfig(m, store)
-		c.MaxContextBytes, c.MaxSteeringPerTurn = 4096, 16
-		a := newAgent(t, c)
-		s := newSession(t, a, sessions.SessionOptions{ID: "large-queued-record"})
+		c.MaxContextBytes = 4096
+		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		before := s.State()
 		large := astral.User(strings.Repeat("x", 5000))
-		first, err := s.Steer(ctx, large)
-		if err != nil {
+		if _, err := s.Steer(context.Background(), large); !errors.Is(err, sessions.ErrBudget) {
 			t.Fatal(err)
 		}
-		second, err := s.Steer(ctx, steeringMessage(1))
-		if err != nil {
+		if _, err := s.InjectContext(context.Background(), []astral.Message{large}); !errors.Is(err, sessions.ErrBudget) {
 			t.Fatal(err)
 		}
-		run, err := s.Continue(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := wait(t, run); !errors.Is(err, sessions.ErrBudget) || len(m.observed()) != 0 || s.State().PendingInputs[sessions.InputSteer] != 2 {
-			t.Fatalf("oversized queue head was consumed: %v", err)
-		}
-		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{Kind: sessions.EntryInputQueued, InputKind: sessions.InputSteer, Limit: 16, MaxBytes: 8192})
-		if err != nil || len(pending.Records) != 2 || pending.Records[0].Entry.Input.ID != first || pending.Records[1].Entry.Input.ID != second {
-			t.Fatal("oversized queue lost its original IDs or FIFO order")
-		}
-		if err := a.Close(ctx); err != nil {
-			t.Fatal(err)
-		}
-		c.MaxContextBytes = 8192
-		s, err = newAgent(t, c).OpenSession(ctx, s.ID())
-		if err != nil {
-			t.Fatal(err)
-		}
-		run, err = s.Continue(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		waitOK(t, run)
-		if len(m.observed()) != 1 || !reflect.DeepEqual(userMessages(m.observed()[0]), []astral.Message{large, steeringMessage(1)}) {
-			t.Fatal("oversized head could not resume after increasing the host byte budget")
+		if !reflect.DeepEqual(before, s.State()) || len(m.observed()) != 0 {
+			t.Fatal("oversized admission changed state")
 		}
 	})
 }
@@ -571,8 +552,9 @@ func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
 			return answer("done"), nil
 		})
 		s := newSession(t, newAgent(t, testConfig(m, store)), sessions.SessionOptions{})
+		seedCompletedBoundary(t, s, store)
 		message := steeringMessage(0)
-		// V4 permits the input ID to equal its queued record's entry ID. A new
+		// V5 permits the input ID to equal its queued record's entry ID. A new
 		// message must keep a fresh history identity when this input is consumed.
 		queued := sessions.Entry{ID: "existing-input", Kind: sessions.EntryInputQueued, Input: &sessions.InputRecord{ID: "existing-input", Kind: sessions.InputSteer, Message: &message}}
 		if err := appendStore(ctx, store, s.ID(), s.State().Version, []sessions.Entry{queued}); err != nil {
@@ -587,7 +569,7 @@ func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
 		}
 		waitOK(t, run)
 		if len(m.observed()) != 1 || !reflect.DeepEqual(userMessages(m.observed()[0]), []astral.Message{message}) {
-			t.Fatal("existing V4 queued identity could not be consumed")
+			t.Fatal("existing V5 queued identity could not be consumed")
 		}
 		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{Kind: sessions.EntryInputQueued})
 		if err != nil || len(pending.Records) != 0 {

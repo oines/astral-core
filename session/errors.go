@@ -9,7 +9,6 @@ var (
 	ErrNotFound                = errors.New("astral: session or entry not found")
 	ErrConflict                = errors.New("astral: store version conflict")
 	ErrCorrupt                 = errors.New("astral: invalid session state")
-	ErrEnvironmentRefresh      = errors.New("astral: refresh the environment before continuing")
 	ErrBudget                  = errors.New("astral: request exceeds model context budget")
 	ErrCompactionInputTooLarge = errors.New("astral: compaction input cannot fit")
 	ErrCompactionNoProgress    = errors.New("astral: compaction cannot make progress")

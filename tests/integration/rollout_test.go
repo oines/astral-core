@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
 )
 
@@ -69,10 +68,16 @@ func TestForkBoundaryMatrixAndHistoricalResults(t *testing.T) {
 					}
 					n := len(m.observed())
 					run, err := child.Continue(ctx)
-					if err != nil {
+					if terminate {
+						if !errors.Is(err, astral.ErrNotContinuable) {
+							t.Fatalf("terminated batch continued: %v", err)
+						}
+					} else if err != nil {
 						t.Fatal(err)
 					}
-					waitOK(t, run)
+					if !terminate {
+						waitOK(t, run)
+					}
 					wantCalls := n + 1
 					if terminate {
 						wantCalls = n
@@ -89,11 +94,9 @@ func TestForkBoundaryMatrixAndHistoricalResults(t *testing.T) {
 							t.Fatal(err)
 						}
 						n = len(m.observed())
-						r, err := final.Continue(ctx)
-						if err != nil {
-							t.Fatal(err)
+						if _, err := final.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
+							t.Fatalf("completed boundary accepted: %v", err)
 						}
-						waitOK(t, r)
 						if len(m.observed()) != n {
 							t.Fatal("completed assistant boundary called model")
 						}
@@ -280,7 +283,7 @@ func TestForkIdentityIsolationAndRetryAfterChildAdvances(t *testing.T) {
 				t.Fatalf("retry reset child: %v", err)
 			}
 			changed := options
-			changed.Environment = &environments.Snapshot{Context: "different"}
+			changed.Mode = sessions.ForkMode(1 - int(options.Mode))
 			if _, err = parent.Fork(ctx, boundary, changed); !errors.Is(err, sessions.ErrConflict) {
 				t.Fatalf("different parameters accepted: %v", err)
 			}
@@ -456,29 +459,6 @@ func TestStoreForkReturnsIsolatedSnapshot(t *testing.T) {
 	})
 }
 
-func TestExplicitForkEnvironmentBudgetRejectsBeforePublication(t *testing.T) {
-	eachStore(t, func(t *testing.T, st sessions.Store) {
-		ctx := context.Background()
-		m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-			return answer("done"), nil
-		})
-		c := testConfig(m, st)
-		c.MaxContextBytes = 4096
-		a := newAgent(t, c)
-		parent := newSession(t, a, sessions.SessionOptions{})
-		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
-			id := fmt.Sprintf("oversized-%d", mode)
-			_, err := parent.Fork(ctx, parent.Head(), sessions.ForkOptions{ID: id, Mode: mode, Environment: &environments.Snapshot{Context: strings.Repeat("x", 10000)}})
-			if !errors.Is(err, sessions.ErrBudget) {
-				t.Fatalf("oversized environment accepted: %v", err)
-			}
-			if _, err = st.LoadState(ctx, id); !errors.Is(err, sessions.ErrNotFound) {
-				t.Fatal("budget failure published child")
-			}
-		}
-	})
-}
-
 func TestParentAndSharedChildRunConcurrentlyAndCloseIndependently(t *testing.T) {
 	eachStore(t, func(t *testing.T, st sessions.Store) {
 		parentEntered, childEntered, childRelease := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -558,11 +538,9 @@ func TestConfigurationAndCompactionForkBoundaries(t *testing.T) {
 					t.Fatalf("projection changed at %s: %v", kind, err)
 				}
 				before := len(m.observed())
-				r, err := child.Continue(ctx)
-				if err != nil {
-					t.Fatal(err)
+				if _, err := child.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
+					t.Fatalf("completed context boundary accepted: %v", err)
 				}
-				waitOK(t, r)
 				if len(m.observed()) != before {
 					t.Fatalf("last final reply lost at %s", kind)
 				}
@@ -606,74 +584,6 @@ func TestDetachedCopiesLargeArchivedRecordWithSmallActiveContext(t *testing.T) {
 		}
 		if child.Stats().ContextBytes > 8192 {
 			t.Fatal("archived payload entered active context")
-		}
-	})
-}
-
-func TestForkAtEnvironmentToolResultRequiresRediscovery(t *testing.T) {
-	eachStore(t, func(t *testing.T, st sessions.Store) {
-		ctx := context.Background()
-		var effects atomic.Int32
-		m := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-			if len(texts(r.Messages, astral.RoleTool)) == 0 {
-				return calls(call("switch", "switch_environment", `{}`)), nil
-			}
-			return answer("done"), nil
-		})
-		c := testConfig(m, st)
-		c.Tools = []astral.Tool{switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
-			effects.Add(1)
-			return hostSnapshot("switched", "workspace"), nil
-		})}
-		a := newAgent(t, c)
-		parent := newSession(t, a, sessions.SessionOptions{})
-		waitOK(t, start(t, parent, "switch"))
-		var boundary string
-		for _, e := range entries(parent) {
-			if e.Kind == sessions.EntryToolResult {
-				boundary = e.ID
-			}
-		}
-		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
-			id := fmt.Sprintf("environment-result-%d", mode)
-			child, err := parent.Fork(ctx, boundary, sessions.ForkOptions{ID: id, Mode: mode})
-			if err != nil {
-				t.Fatal(err)
-			}
-			view, err := child.InspectContext(ctx)
-			if err != nil || view.Environment == nil || bindingOf(view.Binding).Target != "switched" || view.SnapshotID != boundary {
-				t.Fatalf("result boundary lost environment: %+v %v", view.Environment, err)
-			}
-			var contexts []string
-			for _, message := range view.Request.Messages {
-				if message.ContextKind == "environment" {
-					contexts = append(contexts, message.Content[0].Text)
-				}
-			}
-			if len(contexts) != 1 || contexts[0] != hostSnapshot("switched", "workspace").Context {
-				t.Fatalf("result boundary lost model-visible context: %v", contexts)
-			}
-			if err = child.Close(ctx); err != nil {
-				t.Fatal(err)
-			}
-			child, err = a.OpenSession(ctx, id)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err = child.Continue(ctx); !errors.Is(err, sessions.ErrEnvironmentRefresh) {
-				t.Fatalf("result-boundary environment not revalidated: %v", err)
-			}
-			if err = child.RefreshEnvironment(ctx, hostSnapshot("host-confirmed", "workspace")); err != nil {
-				t.Fatal(err)
-			}
-			r, err := child.Continue(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			waitOK(t, r)
-		}
-		if effects.Load() != 1 {
-			t.Fatal("environment-switch tool replayed")
 		}
 	})
 }

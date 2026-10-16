@@ -13,7 +13,6 @@ import (
 type Projection struct {
 	HeadID               string                       `json:"head_id,omitempty"`
 	ConfigurationID      string                       `json:"configuration_id,omitempty"`
-	EnvironmentID        string                       `json:"environment_id,omitempty"`
 	CompactionID         string                       `json:"compaction_id,omitempty"`
 	ThroughID            string                       `json:"through_id,omitempty"`
 	LastMessageID        string                       `json:"last_message_id,omitempty"`
@@ -44,6 +43,8 @@ type RuntimeState struct {
 	Tools            map[string]ToolState      `json:"tools,omitempty"`
 	Approvals        map[string]ApprovalRecord `json:"approvals,omitempty"`
 	PendingInputs    map[InputKind]uint64      `json:"pending_inputs,omitempty"`
+	LastRun          *RunRecord                `json:"last_run,omitempty"`
+	Turn             *protocol.TurnState       `json:"turn,omitempty"`
 	BoundaryRequired bool                      `json:"boundary_required,omitempty"`
 }
 
@@ -111,8 +112,10 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 		switch e.Kind {
 		case EntryConfiguration:
 			state.Branch.ConfigurationID = e.ID
-		case EntryEnvironment:
-			state.Branch.EnvironmentID = e.ID
+		case EntryContext:
+			if len(state.Branch.PendingCalls) > 0 {
+				return RuntimeState{}, nil, protocol.ErrIncompleteBatch
+			}
 		case EntryMessage:
 			if len(state.Branch.PendingCalls) > 0 {
 				return RuntimeState{}, nil, protocol.ErrIncompleteBatch
@@ -126,7 +129,11 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.Results = nil
 			state.Tools = nil
 			state.Approvals = nil
-			if calls := e.Message.ToolCalls(); len(calls) > 0 {
+			state.Turn = nil
+			if e.Message.Role == protocol.RoleAssistant {
+				state.Turn = &protocol.TurnState{ID: e.TurnID, AssistantID: e.ID}
+			}
+			if calls := e.Message.ToolCalls(); len(calls) > 0 && !e.Message.Failed() {
 				state.Branch.PendingCalls = map[string]protocol.ToolCall{}
 				for _, call := range calls {
 					state.Branch.PendingCalls[call.ID] = call
@@ -178,14 +185,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				}
 				work.Completed = &e
 			case EntryToolResult, EntryToolResolution:
-				snapshot, err := resultEnvironment(e)
-				if err != nil {
-					return RuntimeState{}, nil, err
-				}
-				if snapshot != nil {
-					state.Branch.EnvironmentID = e.ID
-				}
-				if e.Kind == EntryToolResult && work.Completed != nil && (work.Completed.Tool.Result.Outcome != e.Tool.Result.Outcome || !sameJSON(work.Completed.Tool.Result.Context, e.Tool.Result.Context)) {
+				if e.Kind == EntryToolResult && work.Completed != nil && work.Completed.Tool.Result.Outcome != e.Tool.Result.Outcome {
 					return RuntimeState{}, nil, fmt.Errorf("%w: completed effect changed", ErrCorrupt)
 				}
 				work.Result = &e
@@ -221,6 +221,21 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 					state.PendingInputs = nil
 				}
 			}
+		case EntryInputCleared:
+			for _, kind := range e.Clear.Kinds {
+				delete(state.PendingInputs, kind)
+			}
+			if len(state.PendingInputs) == 0 {
+				state.PendingInputs = nil
+			}
+		case EntryTurn:
+			if e.Turn.AssistantID != state.Branch.LastMessageID || !e.Turn.Decided {
+				return RuntimeState{}, nil, fmt.Errorf("%w: turn decision outside current assistant", ErrCorrupt)
+			}
+			if len(state.Branch.PendingCalls) > 0 || len(state.Branch.Unresolved) > 0 {
+				return RuntimeState{}, nil, protocol.ErrIncompleteBatch
+			}
+			state.Turn = clone(e.Turn)
 		case EntryApprovalRequested, EntryApprovalDecided:
 			prepared := false
 			for _, work := range state.Tools {
@@ -247,6 +262,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.CompactionID = e.ID
 			state.Branch.ThroughID = e.Compaction.ThroughID
 		case EntryRun:
+			state.LastRun = clone(e.Run)
 			if e.Run.Status == "started" || e.Run.Status == "resumed" {
 				state.BoundaryRequired = false
 			}
@@ -290,7 +306,7 @@ func ValidateFork(r ForkRequest) error {
 // PrepareFork builds only the child's creation commit, using Store-assigned
 // rollout positions. Imported history retains its original writer and version.
 func PrepareFork(r ForkRequest, head Record, first uint64) (Commit, RuntimeState, []Record, Receipt, error) {
-	if first == 0 || first > math.MaxInt64 || (r.Environment != nil && first == math.MaxInt64) {
+	if first == 0 || first > math.MaxInt64 {
 		return Commit{}, RuntimeState{}, nil, Receipt{}, ErrCorrupt
 	}
 	seed, err := ForkState(r, head)
@@ -303,9 +319,6 @@ func PrepareFork(r ForkRequest, head Record, first uint64) (Commit, RuntimeState
 	}
 	creation := &CreationRecord{ForkDigest: digest, FormatVersion: FormatVersion, SessionID: r.TargetID, RolloutID: seed.RolloutID, ForkRolloutID: r.SourceRolloutID, ForkSessionID: r.SourceID, ForkEntryID: r.HeadID, ForkMode: r.Mode, Projection: &seed.Branch}
 	c := Commit{ID: ForkCommitID, Entries: []Entry{{ID: newID(), SessionID: r.TargetID, Version: 1, Time: time.Now().UTC(), Kind: EntryCreated, Created: creation}}}
-	if r.Environment != nil {
-		c.Entries = append(c.Entries, Entry{ID: newID(), SessionID: r.TargetID, Version: 1, ParentID: r.HeadID, Time: time.Now().UTC(), Kind: EntryEnvironment, Environment: clone(r.Environment)})
-	}
 	for i := range c.Entries {
 		c.Entries[i].Sequence = first + uint64(i)
 	}

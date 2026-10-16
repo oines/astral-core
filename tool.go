@@ -13,7 +13,7 @@ type Tool interface {
 
 // TargetedTool optionally resolves a resource's original execution target before
 // the invocation is persisted or approved. This is useful for process handles
-// whose runtime differs from the session's currently selected environment.
+// whose runtime is selected and managed by the host.
 // The host must validate resource ownership; a Binding is not an authorization.
 type TargetedTool interface {
 	Bind(context.Context, Invocation) (json.RawMessage, error)
@@ -60,9 +60,6 @@ type ToolResult struct {
 	Outcome   Outcome         `json:"outcome"`
 	Artifact  string          `json:"artifact,omitempty"`
 	Terminate bool            `json:"terminate,omitempty"`
-	// Only a sequential tool may return an context update. Core commits the
-	// result and the opaque context update atomically before the next dispatch.
-	Context json.RawMessage `json:"context,omitempty"`
 }
 
 type ToolProgress struct {

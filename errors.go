@@ -15,6 +15,7 @@ var (
 	ErrIncompleteResponse = errors.New("astral: model response did not finish successfully")
 	ErrSlowSubscriber     = errors.New("astral: subscriber overflow; reload durable history")
 	ErrTurnLimit          = errors.New("astral: run turn limit reached")
+	ErrNotContinuable     = errors.New("astral: no unfinished work or eligible queued input to continue")
 )
 
 // ModelError lets adapters classify failures without parsing provider messages.

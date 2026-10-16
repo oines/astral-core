@@ -2,7 +2,6 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -10,7 +9,6 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
@@ -163,10 +161,12 @@ func largeHistory(t *testing.T, normal *testModel, summary *testModel, large str
 	c.Compaction = sessions.CompactionPolicy{ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
 	options := sessions.SessionOptions{}
-	if withEnvironment {
-		options.Environment = &environments.Snapshot{Binding: json.RawMessage(`{"target":"private-target","cwd":"/exact/path"}`), Context: "Working directory: /exact/path\nBuild guide: /skills/build/SKILL.md"}
-	}
 	s := newSession(t, newAgent(t, c), options)
+	if withEnvironment {
+		if _, err := s.InjectContext(context.Background(), []astral.Message{{Role: astral.RoleDeveloper, ContextKind: "environment", Content: astral.Text("Working directory: /exact/path\nBuild guide: /skills/build/SKILL.md")}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	waitOK(t, start(t, s, "work"))
 	var userID string
 	for _, e := range entries(s) {
@@ -178,7 +178,7 @@ func largeHistory(t *testing.T, normal *testModel, summary *testModel, large str
 	return s, userID
 }
 
-func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *testing.T) {
+func TestCompactionKeepsNativeInputAndSummarizesContextNormally(t *testing.T) {
 	large := strings.Repeat("full-tool-output-", 20000)
 	normal := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
@@ -187,7 +187,7 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 		return answer("recent answer"), nil
 	})
 	summary := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		if len(r.Tools) != 0 || !strings.Contains(r.Messages[0].Content[0].Text, large) {
+		if len(r.Tools) != 0 || !strings.Contains(requestText(r), large) {
 			return astral.Reply{}, errors.New("fitting full input was cropped")
 		}
 		return answer("summary of completed work"), nil
@@ -209,16 +209,20 @@ func TestCompactionKeepsFullInputWhenItFitsAndReassertsEnvironmentAtomically(t *
 	if after.Version != before.Version+1 {
 		t.Fatalf("checkpoint/environment were not one commit: %d -> %d", before.Version, after.Version)
 	}
-	end := after.Entries[len(after.Entries)-2:]
-	if end[0].Kind != sessions.EntryCompaction || end[1].Kind != sessions.EntryEnvironment || end[1].ParentID != end[0].ID {
-		t.Fatal("environment reassertion missing")
+	if after.Entries[len(after.Entries)-1].Kind != sessions.EntryCompaction {
+		t.Fatal("unexpected context reassertion")
 	}
 	view, err := s.InspectContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Environment.Context != "Working directory: /exact/path\nBuild guide: /skills/build/SKILL.md" || view.Request.Messages[0].ContextKind != "summary" {
-		t.Fatal("environment or summary lost")
+	if view.Request.Messages[0].ContextKind != "summary" {
+		t.Fatal("summary lost")
+	}
+	for _, m := range view.Request.Messages {
+		if m.ContextKind == "environment" {
+			t.Fatal("environment context was pinned")
+		}
 	}
 	fork, err := s.Fork(context.Background(), userID, sessions.ForkOptions{ID: "budget-child"})
 	if err != nil {
@@ -244,7 +248,7 @@ func TestCompactionTrimsOnlyToolCopiesForSmallerSummarizer(t *testing.T) {
 		return answer("recent"), nil
 	})
 	summary := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		text := r.Messages[0].Content[0].Text
+		text := requestText(r)
 		if !strings.Contains(text, "shortened for summary") || !strings.Contains(text, `"execution_outcome":"succeeded"`) || !strings.Contains(text, `"tool_call_id":"c"`) {
 			return astral.Reply{}, errors.New("summary input lost status, identity or trim marker")
 		}
@@ -292,7 +296,7 @@ func TestFailedSummaryDoesNotCommitCheckpoint(t *testing.T) {
 	})
 	summary := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		r := answer("partial summary")
-		r.FinishReason = astral.FinishLength
+		r.Message.FinishReason = astral.FinishLength
 		return r, nil
 	})
 	summary.spec.ID = "summary"
@@ -309,4 +313,16 @@ func TestFailedSummaryDoesNotCommitCheckpoint(t *testing.T) {
 			t.Fatal("failed summary checkpoint committed")
 		}
 	}
+}
+
+func requestText(r astral.Request) string {
+	var parts []string
+	for _, m := range r.Messages {
+		for _, p := range m.Content {
+			if p.Type == "text" {
+				parts = append(parts, p.Text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }

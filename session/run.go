@@ -4,22 +4,25 @@ import (
 	"context"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Start and Continue use the same driver. Start adds a user message. Continue
 // resumes unfinished work or drains queued input without inventing a new prompt.
-func (s *Session) Start(ctx context.Context, message protocol.Message) (*protocol.Run, error) {
+func (s *Session) Start(ctx context.Context, message protocol.Message, options ...protocol.InputOptions) (*protocol.Run, error) {
 	if err := validateUser(message); err != nil {
 		return nil, err
 	}
 	owned := clone(message)
-	return s.begin(ctx, &owned)
+	contexts, err := sessionInputOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	return s.begin(ctx, &owned, contexts)
 }
 
-func (s *Session) Continue(ctx context.Context) (*protocol.Run, error) { return s.begin(ctx, nil) }
+func (s *Session) Continue(ctx context.Context) (*protocol.Run, error) { return s.begin(ctx, nil, nil) }
 
-func (s *Session) begin(ctx context.Context, input *protocol.Message) (run *protocol.Run, err error) {
+func (s *Session) begin(ctx context.Context, input *protocol.Message, contexts []protocol.Message) (run *protocol.Run, err error) {
 	parentCtx := ctx
 	a := s.agent
 	ctx, finish, err := s.beginMaintenance(ctx)
@@ -46,30 +49,6 @@ func (s *Session) begin(ctx context.Context, input *protocol.Message) (run *prot
 		}
 	}
 	s.mu.Lock()
-	needsRefresh := s.needsEnvironment
-	previous, _ := effectiveEnvironment(s.pathLocked())
-	previous = clone(previous)
-	s.mu.Unlock()
-	if needsRefresh {
-		if a.config.Environment == nil {
-			return nil, ErrEnvironmentRefresh
-		}
-		var snapshot targetenv.Snapshot
-		snapshot, err = a.config.Environment(ctx, targetenv.Request{SessionID: s.id, Previous: previous})
-		if err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		_, err = s.appendLocked(ctx, Entry{Kind: EntryEnvironment, Environment: &snapshot})
-		if err == nil {
-			s.needsEnvironment = false
-		}
-		s.mu.Unlock()
-		if err != nil {
-			return nil, err
-		}
-	}
-	s.mu.Lock()
 	configuration := clone(s.configurationLocked())
 	s.mu.Unlock()
 	if err = a.validateConfiguration(ctx, configuration); err != nil {
@@ -80,7 +59,7 @@ func (s *Session) begin(ctx context.Context, input *protocol.Message) (run *prot
 		return nil, err
 	}
 	if input != nil {
-		return s.core.Start(parentCtx, *input)
+		return s.core.Start(parentCtx, *input, protocol.InputOptions{Contexts: contexts})
 	}
 	return s.core.Continue(parentCtx)
 }

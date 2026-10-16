@@ -65,7 +65,7 @@ func TestMessageValidatesRolesBlocksAndCalls(t *testing.T) {
 		{"call-in-text", func(m *astral.Message) { m.Content[2].Type = "text" }},
 		{"call-in-extension", func(m *astral.Message) { m.Content[2].Type = "provider_extension" }},
 		{"user-call", func(m *astral.Message) { m.Role = astral.RoleUser }},
-		{"context-call", func(m *astral.Message) { m.Role = astral.RoleContext }},
+		{"context-call", func(m *astral.Message) { m.Role = astral.RoleDeveloper }},
 		{"tool-call", func(m *astral.Message) { m.Role, m.ToolCallID = astral.RoleTool, "result" }},
 		{"duplicate-id", func(m *astral.Message) { m.Content[5].ToolCall.ID = "one" }},
 		{"missing-id", func(m *astral.Message) { m.Content[2].ToolCall.ID = "" }},
@@ -100,7 +100,7 @@ func TestToolArgumentsRetainAnySingleJSONValue(t *testing.T) {
 			}
 		})
 	}
-	for _, role := range []astral.Role{astral.RoleUser, astral.RoleAssistant, astral.RoleTool, astral.RoleContext} {
+	for _, role := range []astral.Role{astral.RoleUser, astral.RoleAssistant, astral.RoleTool, astral.RoleDeveloper} {
 		message := astral.Message{Role: role, Content: []astral.Content{{Type: "provider_extension", Data: json.RawMessage(`{"opaque":true}`)}}}
 		if role == astral.RoleTool {
 			message.ToolCallID = "result"

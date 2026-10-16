@@ -19,7 +19,7 @@
 - **历史分支**：从任意合法历史节点 Fork，尝试另一条路径，不影响原会话。
 - **可插拔执行环境**：工具可以在本机、远程机器或自定义 Runtime 运行，环境发现完全由宿主负责。
 
-不必采用某种 Agent Framework 的全部约定。可以只用 Core，也可以按需加入持久化、标准工具和环境绑定。
+不必采用某种 Agent Framework 的全部约定。可以只用 Core，也可以按需加入持久化、标准工具和上下文注入。
 
 ## 五分钟试跑
 
@@ -126,7 +126,10 @@ Store 有三种选择：
 
 | 想做什么 | API |
 | --- | --- |
-| 追加新任务 | `Start` / `Continue` |
+| 追加新任务 | `Start` |
+| 恢复未完成执行或消费保留队列 | `Continue` |
+| 被动更新模型上下文 | `InjectContext` |
+| 查看或清理待处理输入 | `PeekQueuedInputs` / `ClearQueuedInputs` |
 | 工作中修改方向 | `Steer` |
 | 当前任务结束后再处理 | `FollowUp` |
 | 停止工作 | `Cancel` |
@@ -174,23 +177,35 @@ Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，�
 
 流式 `text_delta`、`reasoning_delta` 和 `tool_call_delta` 使用 `content_index` 对应最终 Content 数组；事件按 AttemptID 区分重试。增量用于展示，完整回复提交成功后才派发工具。协议细节见 [宿主契约](docs/contracts.md)。
 
-当前 Rollout 格式为 **4**。V3 及更早的持久数据会被明确拒绝并保持原样，本轮不提供自动迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
+当前 Rollout 格式为 **5**。V4 及更早的持久数据会被明确拒绝并保持原样，本轮不提供自动迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
 
-## 环境由宿主定义
+## 上下文与执行控制分开
 
-`astral-core` 不知道什么是 Computer、Workspace、`AGENTS.md` 或 `SOUL.md`。应用可以提供一个 Environment Snapshot：
+`InjectContext` 追加模型可见信息，支持 `user` / `developer` 目标 Role 和有序多模态 Content，不修改 System Prompt，也不触发模型或自动摘要。
 
 ```go
-snapshot := environment.Snapshot{
-    Context: "OS: macOS\nWorkspace: /project\nSkills: /skills/git/SKILL.md",
-    Binding: json.RawMessage(`{"target":"my-mac","workspace":"/project"}`),
-}
+observations := []astral.Message{{
+    Role: astral.RoleUser,
+    ContextKind: "observation",
+    Content: []astral.Content{
+        {Type: "text", Text: "用户分享了这张图片。"},
+        {Type: "image", MediaType: "image/png", URL: "asset://stable-image-id"},
+    },
+}}
+id, err := chat.InjectContext(ctx, observations)
+
+// 必须随这条 Prompt 一起生效的 Context，与输入整体接收、整体提交。
+run, err := chat.Start(ctx, astral.User("分析刚才的图片"),
+    astral.InputOptions{Contexts: observations})
 ```
 
-- `Context` 是模型可见的环境信息，会随历史保存和更新。
-- `Binding` 是只给工具执行路径使用的不透明 JSON，不会自动发送给模型。
+这两种调用方式可独立使用。返回 ID 表示接收成功；运行中先持久排队，在整批工具结果之后安全应用。被动 Context 不使 Run 继续，也不能单独使 Continue 合法。Context 正常参与 Compaction，原始多模态消息留在历史中。大型媒体由 Host 保存并提供可重放的稳定引用，Model Bridge 负责解析及能力适配。
 
-环境发现、授权、连接、切换策略均由宿主负责。已有 Tool Call 的目标在执行前固定，切换环境不会让正在运行的进程突然跑到另一台设备上。
+`Continue()` 不生成“继续”提示词。空历史、仅有 Context，或已经完成且没有驱动队列的会话返回 `ErrNotContinuable`。Cancel 保留未消费队列，恢复需要 Host 显式调用；它不会自动重启。
+
+环境发现、授权、连接、目标选择及其持久一致性由 Host 管理。Host 工具通过 `TargetedTool.Bind` 为每次调用提供不透明 `Invocation.Binding`，Core 在 Prepared 前保存它，恢复时复用原引用。环境说明可作为普通 Context 注入；SDK 没有专用 Snapshot 或 Session 级当前 Binding。
+
+Assistant 的终止原因保存在 `Message.FinishReason`，错误说明保存在 `Message.ErrorMessage`。失败和取消保留合法部分快照，历史可见、模型投影跳过；length 回复保留，工具调用以 NotExecuted 结果交回模型。`FinishTurn` 可选择结束或继续一次，其确认后的决策可恢复。
 
 ## 边界清晰，才能真正嵌入
 

@@ -8,10 +8,10 @@ astral-core/
 ├── generation.go, tool_execution.go # 模型与工具调度
 ├── driver.go, memory_driver.go     # 必要策略接点和默认进程内状态
 ├── model.go, message.go, tool.go   # Provider 中立协议
+├── input.go, turn.go              # 原子 Context 投递组与可恢复 Turn 决策
 ├── events.go, config.go           # 非阻塞事件与执行配置
 ├── internal/retry/                # 生成与摘要共用 Retry / Backoff
 ├── internal/streamcheck/          # 每次 Attempt 的轻量内容索引校验
-├── environment/                   # 宿主 Snapshot：模型 Context 与 opaque Binding
 ├── session/
 │   ├── manager.go, session.go     # 持久会话所有权与生命周期
 │   ├── driver.go, run.go          # Core 适配与恢复预检，无第二套循环
@@ -37,7 +37,7 @@ astral-core/
 
 接入从 [独立 Core 示例](../examples/basic/main.go) 和 [持久审批示例](../examples/approval/main.go) 开始。执行路径按 `run.go → generation.go / tool_execution.go → Driver` 阅读；持久路径按 `session/driver.go → session_store.go → Store.Commit（分配 Sequence、Reduce、原子保存）→ Receipt → Session Reduce` 阅读。
 
-Core 的直接第三方依赖只有 JSON Schema 编译器；只复用 environment.Snapshot 数据类型，不包含环境发现，也不导入 Session、存储、Provider SDK 或标准工具。Session 通过组合 Core 加入策略，Store 实现反向依赖 session.Store 契约。
+Core 的直接第三方依赖只有 JSON Schema 编译器；不包含环境状态或发现，也不导入 Session、存储、Provider SDK 或标准工具。Session 通过组合 Core 加入策略，Store 实现反向依赖 session.Store 契约。
 
 ## 验证命令
 
@@ -61,7 +61,9 @@ go run ./examples/fork
 | 测试 | 验证 |
 | --- | --- |
 | 根目录 `message_test.go` | 唯一有序 Content、调用提取、统一校验、扩展类型、签名与大整数、旧字段明确拒绝 |
-| `memory_driver_test.go`（根目录）/ `core_environment_test.go`（integration） | Standalone Snapshot 分离、非法更新拒绝、连续调用绑定、完整 Request 不泄露私有值、字节前缀 |
+| `memory_driver_test.go`（根目录） | Standalone 字节预算前缀与输入保留 |
+| `context_injection_test.go` | 多模态原样往返、被动注入、安全批次、关联提交、失确认、冷重开、Fork 和摘要 |
+| `execution_semantics_test.go` | Continue 准入、FinishTurn 与恢复、串行预检、不可变目标引用、终止事件 |
 | `steering_test.go` | 默认逐条 / 显式批量、配置边界、Core / Session 一致性、FIFO、Metadata、预算、三后端原子提交 / 确认丢失 / 冷重开 / Cancel |
 | `ordered_content_test.go` | 交错流式索引、提交前不派发、乱序结果排序、Retry / Fallback 隔离、三后端冷重开 / 压缩 / Fork / 恢复 |
 | `core_test.go` | 仅 Model / Tools 启动；Core 与 Session 的请求、事件、Retry、输入、顺序、并行上限一致；取消不重跑 |
@@ -73,10 +75,9 @@ go run ./examples/fork
 | `fork_concurrent_test.go` | Parent 运行与排队期间 Fork；固定读取边界、Child 隔离、不复制操作状态；错误所有权回执不授权执行 |
 | `store/sqlite/fork_test.go` | 分页中间暂停时 Parent 仍能写；取消清理；复制中真实进程崩溃；路径查询计划无全历史扫描 |
 | `scale_test.go` / `cold_start_test.go` | 一万 / 十万 / 百万历史 Benchmark；固定有效窗口；新进程冷打开、Open 读行数、Context 保留记录数和零历史读取准备 |
-| `lifecycle_test.go` | Close / Cancel、创建中的环境发现、卸载与重开、并发上限、Hook 效果不可改写 |
-| `budget_compaction_test.go` | 工具输出与累计预算、完整批次摘要、裁剪副本、环境原子重申 |
-| `history_environment_test.go` | 分支配置隔离、包含式 Fork 边界、不完整批次、环境重新发现 |
-| `environment_contract_test.go` | 任意 JSON Binding、模型 / 摘要不泄露、隔离复制、失败切换、Compaction、Fork 与冷重开 |
+| `lifecycle_test.go` | Close / Cancel、卸载与重开、并发上限、Hook 效果不可改写 |
+| `budget_compaction_test.go` | 工具输出与累计预算、完整批次原生多模态摘要、裁剪副本、Context 正常归档 |
+| `history_environment_test.go` | 分支配置隔离、包含式 Fork 边界、不完整批次 |
 | `standardtools/local/backend_test.go` | 宿主绑定解析、目标拒绝、完整执行设置和回调隔离 |
 | `store_test.go` | 三后端隔离 / CAS / 原子性，JSONL 多句柄、未提交尾部和已提交损坏 |
 | 标准工具包测试 | Pi 样例、真实文件与图片、命令等待、PTY、原目标绑定、进程清理 |
@@ -94,6 +95,6 @@ go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/Deta
 
 ## 范围
 
-存储格式为 3，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
+存储格式为 5，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
 
 模块地址为 `github.com/oines/astral-core`，项目使用 [Apache-2.0 许可证](../LICENSE)。标准工具参考来源及许可证见 [第三方声明](../THIRD_PARTY_NOTICES.md)。本地验证环境为 macOS / arm64，不能把离线协议测试视为真实 Provider 或所有平台的兼容性认证。

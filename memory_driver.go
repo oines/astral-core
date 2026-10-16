@@ -4,18 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
-
-	"github.com/oines/astral-core/environment"
 )
 
-// Standalone has no configurable context policy; steering uses the persistent
-// session's default byte allowance without adding a second public policy API.
 const standaloneSteeringContextBytes = 32 << 20
+const maxPassivePerBoundary = 64
 
-type queuedInput struct {
-	ID, Kind string
-	Message  Message
-}
+type queuedInput = QueuedInput
+
 type memoryDriver struct {
 	mu       sync.Mutex
 	agent    *Agent
@@ -26,17 +21,24 @@ type memoryDriver struct {
 }
 
 func newMemoryDriver(a *Agent, c Configuration) *memoryDriver {
-	return &memoryDriver{agent: a, state: ExecutionState{ID: a.config.ID, Configuration: c, Binding: clone(a.config.Binding), Calls: map[string]CallState{}}}
+	return &memoryDriver{agent: a, state: ExecutionState{ID: a.config.ID, Configuration: c, Calls: map[string]CallState{}}}
 }
 func (d *memoryDriver) Snapshot() ExecutionState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return clone(d.state)
+	out := clone(d.state)
+	out.HasQueuedInputs = d.hasInputs()
+	return out
 }
 func (d *memoryDriver) Prepare(ctx context.Context, override string) (Model, Request, error) {
 	d.mu.Lock()
 	c := clone(d.state.Configuration)
-	messages := clone(d.messages)
+	var messages []Message
+	for _, m := range d.messages {
+		if !m.Failed() {
+			messages = append(messages, clone(m))
+		}
+	}
 	d.mu.Unlock()
 	if override != "" {
 		c.ModelID = override
@@ -53,19 +55,9 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var snapshot *environment.Snapshot
-	if t.Kind == TransitionResult {
-		if t.Result == nil {
-			return fmtInvalid("missing tool result")
-		}
-		var err error
-		snapshot, err = memoryEnvironment(t.Result.Context)
-		if err != nil {
-			return err
-		}
-	}
 	switch t.Kind {
 	case TransitionRunStart:
+		queueOnly := t.Message == nil && d.state.Last != nil && d.state.Last.Message.Role == RoleUser && d.state.LastRunStatus == "cancelled"
 		for _, s := range d.state.Calls {
 			if s.NeedsResolution {
 				return &UnknownOutcomeError{ExecutionID: s.Invocation.ExecutionID}
@@ -74,11 +66,41 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 				return ErrIncompleteBatch
 			}
 		}
-		if t.Message != nil {
-			d.addMessage(t.ID, "", *t.Message)
+		if t.Message == nil && !d.state.Continuable(d.hasInputs()) {
+			return ErrNotContinuable
 		}
+		if t.Message != nil {
+			q := QueuedInput{Message: t.Message, Contexts: t.Contexts, Kind: InputSteer}
+			if err := inputSize(q, standaloneSteeringContextBytes); err != nil {
+				return err
+			}
+			if err := d.startInput(t, q); err != nil {
+				return err
+			}
+		}
+		if d.state.Turn != nil && d.state.Turn.Decided && d.state.Turn.Decision != TurnContinue && d.state.LastRunStatus != "started" {
+			d.state.Turn.Advanced = true
+		}
+		d.state.QueueOnly = queueOnly
+		d.state.LastRunStatus = "started"
 	case TransitionMessage:
 		d.addMessage(t.ID, t.TurnID, *t.Message)
+		for _, r := range t.SyntheticResults {
+			c := d.state.Calls[r.Invocation.Call.ID]
+			c.Invocation = clone(r.Invocation)
+			v := clone(r.Result)
+			c.Result = &v
+			d.state.Calls[r.Invocation.Call.ID] = c
+		}
+		if len(t.SyntheticResults) > 0 {
+			return d.renderResults()
+		}
+	case TransitionTurnStart:
+		if d.state.Turn != nil {
+			d.state.Turn.Advanced = true
+		}
+	case TransitionTurnDecision:
+		d.state.Turn = clone(t.Turn)
 	case TransitionSelectModel:
 		d.state.Configuration.ModelID = t.ModelID
 	default:
@@ -96,9 +118,6 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 		case TransitionResult:
 			c.Result = clone(t.Result)
 			c.NeedsResolution = t.NeedsResolution
-			if snapshot != nil {
-				d.state.Binding = clone(snapshot.Binding)
-			}
 		}
 		d.state.Calls[t.Invocation.Call.ID] = c
 		if t.Kind == TransitionResult {
@@ -112,25 +131,19 @@ func (d *memoryDriver) addMessage(id, turn string, m Message) {
 	d.state.Calls = map[string]CallState{}
 	d.state.BatchTools = clone(d.state.Configuration.Tools)
 	d.rendered = false
-	for _, c := range m.ToolCalls() {
-		d.state.Calls[c.ID] = CallState{}
+	d.state.Turn = nil
+	if m.Role == RoleAssistant {
+		d.state.Turn = &TurnState{ID: turn, AssistantID: id}
+	}
+	if !m.Failed() {
+		for _, c := range m.ToolCalls() {
+			d.state.Calls[c.ID] = CallState{}
+		}
 	}
 	d.messages = append(d.messages, clone(m))
 }
-func memoryEnvironment(raw json.RawMessage) (*environment.Snapshot, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var snapshot *environment.Snapshot
-	if err := json.Unmarshal(raw, &snapshot); err != nil || snapshot == nil {
-		// Neither the raw envelope nor decoder details belong in model output.
-		return nil, fmtInvalid("invalid environment context update")
-	}
-	return snapshot, nil
-}
-
 func (d *memoryDriver) renderResults() error {
-	if d.rendered || d.state.Last == nil {
+	if d.rendered || d.state.Last == nil || d.state.Last.Message.Failed() {
 		return nil
 	}
 	calls := d.state.Last.Message.ToolCalls()
@@ -139,111 +152,183 @@ func (d *memoryDriver) renderResults() error {
 			return nil
 		}
 	}
-	var messages []Message
 	for _, c := range calls {
 		r := d.state.Calls[c.ID].Result
-		messages = append(messages, Message{Role: RoleTool, ToolCallID: c.ID, Name: c.Name, Content: clone(r.Content), IsError: r.IsError})
+		d.messages = append(d.messages, Message{Role: RoleTool, ToolCallID: c.ID, Name: c.Name, Content: clone(r.Content), IsError: r.IsError})
 	}
-	for _, c := range calls {
-		r := d.state.Calls[c.ID].Result
-		snapshot, err := memoryEnvironment(r.Context)
-		if err != nil {
-			return err
-		}
-		if snapshot != nil {
-			messages = append(messages, Message{Role: RoleContext, ContextKind: "environment", Content: Text(snapshot.Context)})
-		}
-	}
-	d.messages = append(d.messages, messages...)
 	d.rendered = true
 	return nil
 }
-func (d *memoryDriver) queue(ctx context.Context, kind string, m Message) (string, error) {
+func (d *memoryDriver) queue(ctx context.Context, q QueuedInput) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if err := validateUser(m); err != nil {
+	if err := q.Validate(); err != nil {
 		return "", err
 	}
-	owned, err := copyJSON(m)
+	if err := inputSize(q, standaloneSteeringContextBytes); err != nil {
+		return "", err
+	}
+	owned, err := copyJSON(q)
 	if err != nil {
 		return "", err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	id := newID()
-	d.inputs = append(d.inputs, queuedInput{ID: id, Kind: kind, Message: owned})
-	return id, nil
+	owned.ID = newID()
+	d.inputs = append(d.inputs, owned)
+	return owned.ID, nil
 }
-func (d *memoryDriver) Boundary(ctx context.Context, runID string, natural bool) (bool, RunResult, error) {
+func (d *memoryDriver) inject(ctx context.Context, batch []Message, running bool) (string, error) {
+	q := QueuedInput{Kind: InputContext, Contexts: batch}
+	id, err := d.queue(ctx, q)
+	if err != nil {
+		return "", err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !running && d.complete() {
+		_, err = d.applyPending(true, false)
+	}
+	return id, err
+}
+func (d *memoryDriver) complete() bool {
+	for _, s := range d.state.Calls {
+		if s.Result == nil {
+			return false
+		}
+	}
+	return true
+}
+func (d *memoryDriver) hasInputs() bool {
+	for _, q := range d.inputs {
+		if q.Kind != InputContext {
+			return true
+		}
+	}
+	return false
+}
+func (d *memoryDriver) Boundary(ctx context.Context, id string, natural bool) (bool, RunResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return false, RunResult{}, err
 	}
+	end := false
+	forceContinue := false
+	if t := d.state.Turn; t != nil && t.Decided && !t.Advanced {
+		end = t.Decision == TurnEnd
+		if t.Decision == TurnContinue {
+			forceContinue = true
+		}
+	}
+	driven, err := d.applyPending(end, natural)
+	if err != nil {
+		return false, RunResult{}, err
+	}
+	if !driven && (natural && !forceContinue || end) {
+		d.state.LastRunStatus = "completed"
+		return true, d.result(id, "completed"), nil
+	}
+	return false, RunResult{}, nil
+}
+
+// applyPending takes one finite snapshot. Passive groups never drive a request.
+func (d *memoryDriver) applyPending(passiveOnly, natural bool) (bool, error) {
+	if !d.complete() {
+		return false, nil
+	}
 	var selected []int
-	for i, q := range d.inputs {
-		if q.Kind == "steer" {
-			selected = append(selected, i)
-			if len(selected) == d.agent.config.MaxSteeringPerTurn {
-				break
+	steers := 0
+	if !passiveOnly {
+		for i, q := range d.inputs {
+			if q.Kind == InputSteer && steers < d.agent.config.MaxSteeringPerTurn {
+				selected = append(selected, i)
+				steers++
 			}
 		}
 	}
-	if len(selected) > 0 {
-		var err error
-		selected, err = d.steeringPrefix(selected, standaloneSteeringContextBytes)
-		if err != nil {
-			return false, RunResult{}, err
-		}
-	}
-	if len(selected) == 0 && natural {
+	if !passiveOnly && steers == 0 && natural {
 		for i, q := range d.inputs {
-			if q.Kind == "follow_up" {
+			if q.Kind == InputFollowUp {
 				selected = append(selected, i)
 				break
 			}
 		}
 	}
-	if len(selected) > 0 {
-		if err := ctx.Err(); err != nil {
-			return false, RunResult{}, err
+	wanted := map[int]bool{}
+	for _, i := range selected {
+		wanted[i] = true
+	}
+	passive := 0
+	for i, q := range d.inputs {
+		if q.Kind == InputContext && passive < maxPassivePerBoundary {
+			wanted[i] = true
+			passive++
 		}
-		for _, index := range selected {
-			q := d.inputs[index]
-			d.addMessage(q.ID, "", q.Message)
+	}
+	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: append([]Message(nil), d.messages...)}
+	applied := map[int]bool{}
+	driven := false
+	passiveBlocked := false
+	for i, q := range d.inputs {
+		if !wanted[i] || q.Kind == InputContext && passiveBlocked {
+			continue
 		}
-		remaining := d.inputs[:0]
-		next := 0
-		for i, q := range d.inputs {
-			if next < len(selected) && selected[next] == i {
-				next++
+		candidate := append(append([]Message(nil), request.Messages...), q.Messages()...)
+		trial := request
+		trial.Messages = candidate
+		raw, err := json.Marshal(trial)
+		if err != nil {
+			return false, err
+		}
+		if len(raw) > standaloneSteeringContextBytes {
+			if q.Kind == InputContext {
+				passiveBlocked = true
 				continue
 			}
+			if !driven {
+				return false, fmtInvalid("steering input exceeds context byte budget")
+			}
+			break
+		}
+		request.Messages = candidate
+		applied[i] = true
+		driven = driven || q.Kind != InputContext
+	}
+	for i, q := range d.inputs {
+		if !applied[i] {
+			continue
+		}
+		d.messages = append(d.messages, clone(q.Contexts)...)
+		for range q.Contexts {
+			d.agent.Publish(Event{Type: EventContextApplied, InputID: q.ID})
+		}
+		if q.Message != nil {
+			d.addMessage(q.ID, "", *q.Message)
+		}
+	}
+	remaining := d.inputs[:0]
+	for i, q := range d.inputs {
+		if !applied[i] {
 			remaining = append(remaining, q)
 		}
-		clear(d.inputs[len(remaining):])
-		d.inputs = remaining
-		return false, RunResult{}, nil
 	}
-	if natural {
-		return true, d.result(runID, "completed"), nil
-	}
-	return false, RunResult{}, nil
+	clear(d.inputs[len(remaining):])
+	d.inputs = remaining
+	return driven, nil
 }
-
 func (d *memoryDriver) steeringPrefix(selected []int, maxBytes int) ([]int, error) {
-	c := d.state.Configuration
-	request := Request{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools, MaxOutputTokens: 16384, Messages: d.messages[:len(d.messages):len(d.messages)]}
+	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: append([]Message(nil), d.messages...)}
 	for n, index := range selected {
-		request.Messages = append(request.Messages, d.inputs[index].Message)
+		request.Messages = append(request.Messages, d.inputs[index].Messages()...)
 		raw, err := json.Marshal(request)
 		if err != nil {
 			return nil, err
 		}
 		if len(raw) > maxBytes {
 			if n == 0 {
-				return nil, fmtInvalid("steering input exceeds the context byte budget (%d bytes)", maxBytes)
+				return nil, fmtInvalid("steering input exceeds context byte budget")
 			}
 			return selected[:n], nil
 		}
@@ -258,11 +343,67 @@ func (d *memoryDriver) result(id, status string) RunResult {
 	}
 	return clone(r)
 }
-func (d *memoryDriver) Finish(_ context.Context, id, status string, _ error) (RunResult, error) {
+func (d *memoryDriver) Finish(ctx context.Context, id, status string, _ error) (RunResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.result(id, status), nil
+	d.state.LastRunStatus = status
+	_, err := d.applyPending(true, false)
+	return d.result(id, status), err
 }
 func (d *memoryDriver) AcceptResult(_ context.Context, _ Invocation, r ToolResult) (ToolResult, error) {
 	return r, nil
+}
+
+// startInput reserves room for the complete prompt group before changing either
+// the passive queue or history. A rejected Start has no partial side effects.
+func (d *memoryDriver) startInput(t Transition, q QueuedInput) error {
+	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384}
+	messages := append([]Message(nil), d.messages...)
+	fits := func(prefix []Message) (bool, error) {
+		candidate := request
+		candidate.Messages = append(append([]Message(nil), prefix...), q.Messages()...)
+		raw, err := json.Marshal(candidate)
+		return len(raw) <= standaloneSteeringContextBytes, err
+	}
+	ok, err := fits(messages)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmtInvalid("input exceeds context byte budget")
+	}
+	selected := map[int]bool{}
+	count := 0
+	for i, pending := range d.inputs {
+		if pending.Kind != InputContext {
+			continue
+		}
+		if count == maxPassivePerBoundary {
+			break
+		}
+		candidate := append(append([]Message(nil), messages...), pending.Contexts...)
+		ok, err := fits(candidate)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		messages = candidate
+		selected[i] = true
+		count++
+	}
+	d.messages = append(messages, clone(q.Contexts)...)
+	d.addMessage(t.ID, "", *q.Message)
+	remaining := d.inputs[:0]
+	for i, pending := range d.inputs {
+		if selected[i] {
+			d.agent.Publish(Event{Type: EventContextApplied, InputID: pending.ID})
+		} else {
+			remaining = append(remaining, pending)
+		}
+	}
+	clear(d.inputs[len(remaining):])
+	d.inputs = remaining
+	return nil
 }

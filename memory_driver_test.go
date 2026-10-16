@@ -7,8 +7,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/oines/astral-core/environment"
 )
 
 func memoryTestAgent(t *testing.T, config Config) (*Agent, *memoryDriver) {
@@ -20,63 +18,6 @@ func memoryTestAgent(t *testing.T, config Config) (*Agent, *memoryDriver) {
 	}
 	t.Cleanup(func() { a.Close(context.Background()) })
 	return a, a.driver.(*memoryDriver)
-}
-
-func TestMemoryEnvironmentRejectsInvalidSnapshotWithoutAdoptingResult(t *testing.T) {
-	for _, raw := range []string{`null`, `[]`, `true`, `42`, `"private-B"`, `{"binding":"private-B","context":42}`, `{"binding":"private-B","context":{}}`, `{"binding":`} {
-		t.Run(raw, func(t *testing.T) {
-			_, d := memoryTestAgent(t, Config{Binding: json.RawMessage(`"private-A"`)})
-			call := ToolCall{ID: "switch", Name: "switch", Arguments: json.RawMessage(`{}`)}
-			message := Message{Role: RoleAssistant, Content: []Content{{Type: "tool_call", ToolCall: &call}}}
-			if err := d.Commit(context.Background(), Transition{Kind: TransitionMessage, ID: "assistant", Message: &message}); err != nil {
-				t.Fatal(err)
-			}
-			before, messages := d.Snapshot(), clone(d.messages)
-			result := ToolResult{Outcome: OutcomeSucceeded, Content: Text("public result"), Context: json.RawMessage(raw)}
-			transition := Transition{Kind: TransitionResult, Invocation: Invocation{Call: call}, Result: &result}
-			err := d.Commit(context.Background(), transition)
-			if !errors.Is(err, ErrInvalid) || strings.Contains(err.Error(), "private-B") {
-				t.Fatalf("invalid snapshot accepted or exposed: %v", err)
-			}
-			if !reflect.DeepEqual(d.Snapshot(), before) || !reflect.DeepEqual(d.messages, messages) {
-				t.Fatal("invalid snapshot changed binding, execution facts or context")
-			}
-			result.Context = json.RawMessage(`{"binding":"private-B","context":"public B"}`)
-			if err := d.Commit(context.Background(), transition); err != nil {
-				t.Fatal(err)
-			}
-			result.Context[0] = '!'
-			if string(d.Snapshot().Binding) != `"private-B"` {
-				t.Fatal("valid binding was enveloped or aliased")
-			}
-			projected := d.messages[len(d.messages)-1]
-			if projected.ContextKind != "environment" || projected.Role != RoleContext || projected.Content[0].Text != "public B" {
-				t.Fatalf("wrong public environment projection: %+v", projected)
-			}
-		})
-	}
-}
-
-func TestMemoryEnvironmentPreservesOpaqueBindingValues(t *testing.T) {
-	for _, binding := range []string{"", `null`, `true`, `42`, `"target"`, `[1,2]`, `{"large":900719925474099312345}`} {
-		t.Run(binding, func(t *testing.T) {
-			_, d := memoryTestAgent(t, Config{Binding: json.RawMessage(`"old"`)})
-			var raw json.RawMessage
-			if binding != "" {
-				raw = json.RawMessage(binding)
-			}
-			payload, err := json.Marshal(environment.Snapshot{Binding: raw, Context: "public"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := d.Commit(context.Background(), Transition{Kind: TransitionResult, Result: &ToolResult{Context: payload}}); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(d.Snapshot().Binding, raw) {
-				t.Fatal("opaque binding value changed")
-			}
-		})
-	}
 }
 
 func TestMemorySteeringBytePrefixDoesNotMutateQueueOrHistory(t *testing.T) {

@@ -7,20 +7,22 @@ import (
 type EventType string
 
 const (
-	EventRunStart      EventType = "run_start"
-	EventRunEnd        EventType = "run_end"
-	EventTurnStart     EventType = "turn_start"
-	EventTurnEnd       EventType = "turn_end"
-	EventMessageStart  EventType = "message_start"
-	EventMessageUpdate EventType = "message_update"
-	EventMessageEnd    EventType = "message_end"
-	EventAttemptFailed EventType = "attempt_failed"
-	EventRetry         EventType = "retry"
-	EventToolStart     EventType = "tool_execution_start"
-	EventToolUpdate    EventType = "tool_execution_update"
-	EventToolEnd       EventType = "tool_execution_end"
-	EventCommitted     EventType = "entry_committed"
-	EventApproval      EventType = "approval_requested"
+	EventRunStart       EventType = "run_start"
+	EventRunEnd         EventType = "run_end"
+	EventTurnStart      EventType = "turn_start"
+	EventTurnEnd        EventType = "turn_end"
+	EventMessageStart   EventType = "message_start"
+	EventMessageUpdate  EventType = "message_update"
+	EventMessageEnd     EventType = "message_end"
+	EventAttemptFailed  EventType = "attempt_failed"
+	EventAttemptStart   EventType = "attempt_start"
+	EventContextApplied EventType = "context_applied"
+	EventRetry          EventType = "retry"
+	EventToolStart      EventType = "tool_execution_start"
+	EventToolUpdate     EventType = "tool_execution_update"
+	EventToolEnd        EventType = "tool_execution_end"
+	EventCommitted      EventType = "entry_committed"
+	EventApproval       EventType = "approval_requested"
 )
 
 type Event struct {
@@ -37,6 +39,9 @@ type Event struct {
 	Model       *ModelEvent   `json:"model,omitempty"`
 	Progress    *ToolProgress `json:"progress,omitempty"`
 	Error       string        `json:"error,omitempty"`
+	Message     *Message      `json:"message,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	InputID     string        `json:"input_id,omitempty"`
 }
 
 // Subscription closes on overflow; emitting never blocks the executor.

@@ -27,11 +27,6 @@ func New(config Config) (*Agent, error) {
 	if err := validateModelSpec(config.Model.Spec()); err != nil {
 		return nil, err
 	}
-	ownedBinding, err := copyJSON(config.Binding)
-	if err != nil {
-		return nil, fmtInvalid("binding: %v", err)
-	}
-	config.Binding = ownedBinding
 	if config.ID == "" {
 		config.ID = newID()
 	}
@@ -91,7 +86,7 @@ func New(config Config) (*Agent, error) {
 	return a, nil
 }
 
-func (a *Agent) Start(ctx context.Context, message Message) (*Run, error) {
+func (a *Agent) Start(ctx context.Context, message Message, options ...InputOptions) (*Run, error) {
 	if err := validateUser(message); err != nil {
 		return nil, err
 	}
@@ -99,10 +94,14 @@ func (a *Agent) Start(ctx context.Context, message Message) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.begin(ctx, &owned)
+	contexts, err := inputOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	return a.begin(ctx, &owned, contexts)
 }
-func (a *Agent) Continue(ctx context.Context) (*Run, error) { return a.begin(ctx, nil) }
-func (a *Agent) begin(ctx context.Context, input *Message) (*Run, error) {
+func (a *Agent) Continue(ctx context.Context) (*Run, error) { return a.begin(ctx, nil, nil) }
+func (a *Agent) begin(ctx context.Context, input *Message, contexts []Message) (*Run, error) {
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -116,13 +115,20 @@ func (a *Agent) begin(ctx context.Context, input *Message) (*Run, error) {
 		a.mu.Unlock()
 		return nil, err
 	}
+	if input == nil {
+		state := a.driver.Snapshot()
+		if !state.Continuable(state.HasQueuedInputs) {
+			a.mu.Unlock()
+			return nil, ErrNotContinuable
+		}
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &Run{id: newID(), ctx: runCtx, cancel: cancel, done: make(chan struct{})}
 	// Reserve ownership before awaiting the driver, without holding the
 	// lifecycle lock across host IO. Close can cancel and join this start too.
 	a.active = r
 	a.mu.Unlock()
-	if err := a.driver.Commit(runCtx, Transition{Kind: TransitionRunStart, ID: newID(), RunID: r.id, Message: input}); err != nil {
+	if err := a.driver.Commit(runCtx, Transition{Kind: TransitionRunStart, ID: newID(), RunID: r.id, Message: input, Contexts: contexts}); err != nil {
 		cancel()
 		a.mu.Lock()
 		a.active = nil
@@ -137,13 +143,13 @@ func (a *Agent) begin(ctx context.Context, input *Message) (*Run, error) {
 
 // Steer and FollowUp are available with the default in-memory driver. A custom
 // driver exposes its own enqueue API so queue persistence and boundaries agree.
-func (a *Agent) Steer(ctx context.Context, m Message) (string, error) {
-	return a.queue(ctx, "steer", m)
+func (a *Agent) Steer(ctx context.Context, m Message, options ...InputOptions) (string, error) {
+	return a.queue(ctx, InputSteer, m, options)
 }
-func (a *Agent) FollowUp(ctx context.Context, m Message) (string, error) {
-	return a.queue(ctx, "follow_up", m)
+func (a *Agent) FollowUp(ctx context.Context, m Message, options ...InputOptions) (string, error) {
+	return a.queue(ctx, InputFollowUp, m, options)
 }
-func (a *Agent) queue(ctx context.Context, kind string, m Message) (string, error) {
+func (a *Agent) queue(ctx context.Context, kind InputKind, m Message, options []InputOptions) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -153,7 +159,11 @@ func (a *Agent) queue(ctx context.Context, kind string, m Message) (string, erro
 	if !ok {
 		return "", fmtInvalid("enqueue through the custom driver's owner")
 	}
-	return d.queue(ctx, kind, m)
+	contexts, err := inputOptions(options)
+	if err != nil {
+		return "", err
+	}
+	return d.queue(ctx, QueuedInput{Kind: kind, Message: &m, Contexts: contexts})
 }
 func (a *Agent) Cancel() {
 	a.mu.Lock()
@@ -170,7 +180,6 @@ func (a *Agent) Close(ctx context.Context) error {
 		r.cancel()
 	}
 	a.mu.Unlock()
-	a.events.close(ErrClosed)
 	if r != nil {
 		select {
 		case <-r.done:
@@ -178,6 +187,9 @@ func (a *Agent) Close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// Cancellation closes the started logical lifecycles before subscribers are
+	// closed. A timed-out Close can be retried while the executor winds down.
+	a.events.close(ErrClosed)
 	if d, ok := a.driver.(*memoryDriver); ok {
 		d.mu.Lock()
 		d.messages = nil

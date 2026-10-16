@@ -36,9 +36,6 @@ func (s *Session) ResolveTool(ctx context.Context, executionID string, result pr
 	if !validOutcome(result.Outcome) {
 		return fmtInvalid("explicit outcome required")
 	}
-	if result.Context != nil {
-		return fmtInvalid("refresh environment separately while reconciling a tool")
-	}
 	result = normalizeResult(result)
 	if err := validateToolResult(result); err != nil {
 		return err
@@ -65,7 +62,7 @@ func (s *Session) ResolveTool(ctx context.Context, executionID string, result pr
 	return ErrNotFound
 }
 
-// recoverInterrupted runs before environment rediscovery and before new effects.
+// recoverInterrupted runs before new execution effects.
 // Prepared/authorized calls may still execute; started calls are never replayed.
 func (s *Session) recoverInterrupted(ctx context.Context) error {
 	s.mu.Lock()
@@ -76,7 +73,7 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 	s.mu.Unlock()
 	var unknown error
 	for _, assistant := range path {
-		if assistant.Kind != EntryMessage {
+		if assistant.Kind != EntryMessage || assistant.Message.Failed() {
 			continue
 		}
 		calls := assistant.Message.ToolCalls()
@@ -94,15 +91,10 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 				fact := state.completed.Tool.Result
 				result = toolFailure("result_unavailable", "Execution finished before interruption, but its final output was not committed. Do not repeat the operation to retrieve output.", fact.Outcome)
 				result.Artifact = fact.Artifact
-				result.Context = fact.Context
+				result.Terminate = fact.Terminate
 				needsResolution = fact.Outcome == protocol.OutcomeUnknown
 			}
 			_, err := s.commitToolResult(ctx, inv, result, needsResolution)
-			if result.Context != nil {
-				s.mu.Lock()
-				s.needsEnvironment = true
-				s.mu.Unlock()
-			}
 			if err != nil {
 				if errors.Is(err, protocol.ErrOutcomeUnknown) {
 					unknown = err

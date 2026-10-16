@@ -7,11 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-
-	targetenv "github.com/oines/astral-core/environment"
 )
 
-const FormatVersion = 4
+const FormatVersion = 5
 const ForkCommitID = "session-fork-created"
 const DefaultPageSize = 256
 const DefaultPageBytes = 4 << 20
@@ -140,7 +138,6 @@ type ForkRequest struct {
 	TargetID        string
 	HeadID          string
 	Mode            ForkMode
-	Environment     *targetenv.Snapshot
 }
 
 func (r ForkRequest) Digest() (string, error) {
@@ -171,6 +168,9 @@ func PageLimits(limit, maxBytes int) (int, int) {
 	return limit, maxBytes
 }
 func Reference(e Entry) string {
+	if e.InputID != "" {
+		return e.InputID
+	}
 	if e.Tool != nil {
 		return e.Tool.Invocation.ExecutionID
 	}

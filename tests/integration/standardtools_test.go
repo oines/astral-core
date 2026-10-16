@@ -12,7 +12,6 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
@@ -72,10 +71,13 @@ func TestEmptyBindingUsesLocalDefaults(t *testing.T) {
 				c := testConfig(m, memory.New())
 				c.Tools = set.Tools()
 				options := sessions.SessionOptions{}
+				s := newSession(t, newAgent(t, c), options)
 				if mode == "context-only-session" {
-					options.Environment = &environments.Snapshot{Context: "Host context without an execution binding."}
+					if _, err := s.InjectContext(context.Background(), []astral.Message{astral.User("Host context without an execution binding.")}); err != nil {
+						t.Fatal(err)
+					}
 				}
-				run = start(t, newSession(t, newAgent(t, c), options), "pwd")
+				run = start(t, s, "pwd")
 			}
 			waitOK(t, run)
 		})
@@ -101,9 +103,18 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeStandard(t, set)
-	tools := append(set.Tools(), switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
-		return hostSnapshot("target-two", "location-two"), nil
-	}))
+	current := "target-one"
+	var tools []astral.Tool
+	for _, base := range set.Tools() {
+		tools = append(tools, hostTargetTool{Tool: base, target: func() json.RawMessage {
+			raw, _ := json.Marshal(hostBinding{Target: current, Location: "location-one"})
+			return raw
+		}})
+	}
+	tools = append(tools, astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object"}`)}, Run: func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+		current = "target-two"
+		return astral.ToolResult{Content: astral.Text("Host target updated.")}, nil
+	}})
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		switch n {
 		case 1:
@@ -137,15 +148,10 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		}
 		return astral.ToolDecision{}, nil
 	}
-	snapshot := hostSnapshot("target-one", "location-one")
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{Environment: &snapshot})
+	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "work"))
-	view, err := s.InspectContext(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if initial.Target != "target-one" || poll != initial || bindingOf(view.Binding).Target != "target-two" {
-		t.Fatalf("wrong target before approval: initial=%+v poll=%+v current=%+v", initial, poll, view.Binding)
+	if initial.Target != "target-one" || poll != initial || current != "target-two" {
+		t.Fatalf("wrong target: initial=%+v poll=%+v current=%s", initial, poll, current)
 	}
 	results := toolResults(s)
 	if len(results) != 3 || results[2].IsError {

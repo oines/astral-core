@@ -2,7 +2,6 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
@@ -50,72 +48,6 @@ func TestCloseCancelsManualCompactionAndClosesLateSubscribers(t *testing.T) {
 	sub := s.Subscribe(8)
 	if _, ok := <-sub.C; ok || !errors.Is(sub.Err(), astral.ErrClosed) {
 		t.Fatal("late subscriber remained open")
-	}
-}
-
-func TestCloseCancelsEnvironmentDiscoveryBeforeRunStarts(t *testing.T) {
-	entered := make(chan struct{})
-	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-		return answer("unexpected"), nil
-	})
-	c := testConfig(m, memory.New())
-	c.Environment = func(ctx context.Context, _ environments.Request) (environments.Snapshot, error) {
-		close(entered)
-		<-ctx.Done()
-		return environments.Snapshot{}, ctx.Err()
-	}
-	a := newAgent(t, c)
-	initial := hostSnapshot("old", "")
-	s := newSession(t, a, sessions.SessionOptions{Environment: &initial})
-	child, err := s.Fork(context.Background(), s.Head(), sessions.ForkOptions{ID: "discovery-child"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s = child
-	finished := make(chan error, 1)
-	go func() { _, err := s.Start(context.Background(), astral.User("hello")); finished <- err }()
-	signal(t, entered)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := a.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-finished; !errors.Is(err, context.Canceled) {
-		t.Fatalf("discovery: %v", err)
-	}
-	if len(m.observed()) != 0 {
-		t.Fatal("model called after close")
-	}
-}
-
-func TestManagerCloseCancelsAndJoinsSessionCreation(t *testing.T) {
-	entered, exited := make(chan struct{}), make(chan struct{})
-	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-		return answer("unused"), nil
-	})
-	c := testConfig(m, memory.New())
-	c.Environment = func(ctx context.Context, _ environments.Request) (environments.Snapshot, error) {
-		close(entered)
-		<-ctx.Done()
-		close(exited)
-		return environments.Snapshot{}, ctx.Err()
-	}
-	a := newAgent(t, c)
-	finished := make(chan error, 1)
-	go func() { _, err := a.NewSession(context.Background(), sessions.SessionOptions{}); finished <- err }()
-	signal(t, entered)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := a.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-exited:
-	default:
-		t.Fatal("creation callback not joined")
-	}
-	if err := <-finished; !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
 	}
 }
 
@@ -269,35 +201,22 @@ func TestResolvedOutputUsesDeliveryBudget(t *testing.T) {
 	}
 }
 
-func TestAfterHookCannotRewriteEnvironmentEffects(t *testing.T) {
+func TestAfterHookCannotRewriteExecutionOutcome(t *testing.T) {
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
-			return calls(call("switch", "switch_environment", `{}`)), nil
+			return calls(call("echo", "echo", `{"value":"x"}`)), nil
 		}
 		return answer("done"), nil
 	})
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{switchEnvironment(func(context.Context, astral.Invocation) (environments.Snapshot, error) {
-		return hostSnapshot("actual", ""), nil
-	})}
+	c.Tools = []astral.Tool{echoTool(nil)}
 	c.AfterToolCall = func(_ context.Context, _ astral.Invocation, result astral.ToolResult) (astral.ToolResultPatch, error) {
 		result.Outcome = astral.OutcomeFailed
-		var payload environments.Snapshot
-		if err := json.Unmarshal(result.Context, &payload); err != nil {
-			t.Fatal(err)
-		}
-		payload.Binding = json.RawMessage(`{"target":"invented"}`)
-		payload.Context = "invented"
-		result.Context, _ = json.Marshal(payload)
 		return astral.ToolResultPatch{Content: astral.Text("processed")}, nil
 	}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "switch"))
-	view, err := s.InspectContext(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bindingOf(view.Binding).Target != "actual" || toolResults(s)[0].Outcome != astral.OutcomeSucceeded {
+	if toolResults(s)[0].Outcome != astral.OutcomeSucceeded {
 		t.Fatal("execution facts changed by hook")
 	}
 }

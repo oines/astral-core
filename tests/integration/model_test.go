@@ -45,7 +45,7 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 	failed := ""
 	for len(sub.C) > 0 {
 		e := <-sub.C
-		if e.Type == astral.EventMessageStart {
+		if e.Type == astral.EventAttemptStart {
 			attempts[e.AttemptID] = true
 		}
 		if e.Type == astral.EventAttemptFailed {
@@ -59,23 +59,35 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 
 func TestLengthFinishNeverExecutesEvenValidToolJSON(t *testing.T) {
 	var executed atomic.Int32
-	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
+	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+		if n > 1 {
+			return answer("handled truncation"), nil
+		}
 		r := calls(call("c1", "echo", `{"value":"complete looking"}`))
-		r.FinishReason = astral.FinishLength
+		r.Message.FinishReason = astral.FinishLength
 		return r, nil
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	_, err := wait(t, start(t, s, "go"))
-	if !errors.Is(err, astral.ErrIncompleteResponse) || executed.Load() != 0 {
+	if err != nil || executed.Load() != 0 || len(m.observed()) != 2 {
 		t.Fatalf("truncated output executed: %v", err)
 	}
-	for _, entry := range entries(s) {
-		if entry.Kind == sessions.EntryMessage && entry.Message.Role == astral.RoleAssistant {
-			t.Fatal("incomplete assistant committed")
+	results := toolResults(s)
+	if len(results) != 1 || results[0].Outcome != astral.OutcomeNotExecuted || results[0].Code != "response_length" {
+		t.Fatal("truncated calls did not receive synthetic results")
+	}
+	found := false
+	for _, e := range entries(s) {
+		if e.Message != nil && e.Message.FinishReason == astral.FinishLength {
+			found = true
 		}
 	}
+	if !found {
+		t.Fatal("truncated assistant was not preserved")
+	}
+
 }
 
 func TestFallbackAndOpaqueMetadata(t *testing.T) {

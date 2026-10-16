@@ -11,6 +11,7 @@ import (
 	core "github.com/oines/astral-core"
 	s "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/internal/historypage"
+	"github.com/oines/astral-core/store/internal/pending"
 	"github.com/oines/astral-core/store/internal/targetlock"
 )
 
@@ -94,6 +95,17 @@ func (d *Data) AddPending(r s.Record) {
 	switch e.Kind {
 	case s.EntryInputQueued:
 		d.Pending["input:"+e.Input.ID] = r
+	case s.EntryInputCleared:
+		for key, p := range d.Pending {
+			if p.Entry.Kind == s.EntryInputQueued {
+				for _, kind := range e.Clear.Kinds {
+					if p.Entry.Input.Kind == kind {
+						delete(d.Pending, key)
+						break
+					}
+				}
+			}
+		}
 	case s.EntryInputConsumed:
 		delete(d.Pending, "input:"+e.Input.ID)
 	case s.EntryApprovalRequested:
@@ -249,7 +261,6 @@ func (st *Store) PrepareConfirmed(id string, c s.Commit, receipt s.Receipt) (Cha
 			return Change{}, s.ErrCorrupt
 		}
 	}
-	queued := map[string]bool{}
 	for _, e := range c.Entries {
 		if _, ok := r.Records[e.ID]; ok {
 			return Change{}, s.ErrCorrupt
@@ -260,20 +271,17 @@ func (st *Store) PrepareConfirmed(id string, c s.Commit, receipt s.Receipt) (Cha
 				return Change{}, s.ErrCorrupt
 			}
 		}
-		if e.Kind == s.EntryInputConsumed {
-			p, ok := d.Pending["input:"+e.Input.ID]
-			if !ok || p.Entry.Input.Kind != e.Input.Kind {
-				return Change{}, s.ErrCorrupt
-			}
-		}
-		if e.Kind == s.EntryInputQueued {
-			_, ok := d.Pending["input:"+e.Input.ID]
-			if ok || queued[e.Input.ID] {
-				return Change{}, s.ErrCorrupt
-			}
-			queued[e.Input.ID] = true
-		}
 	}
+	if err := pending.Validate(c.Entries, func(id string) (s.InputKind, bool, error) {
+		r, ok := d.Pending["input:"+id]
+		if !ok {
+			return "", false, nil
+		}
+		return r.Entry.Input.Kind, true, nil
+	}); err != nil {
+		return Change{}, err
+	}
+
 	return Change{Commit: c, State: state, Records: records, Receipt: receipt}, nil
 }
 func (st *Store) Apply(change Change) {

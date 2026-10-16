@@ -28,13 +28,20 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (bo
 		interrupted := false
 		for i, c := range calls {
 			if interrupted {
-				results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], true)
+				results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], true, false)
 			} else {
-				results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false)
+				results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false, false)
 			}
 			interrupted = interrupted || errs[i] != nil
 		}
 	} else {
+		// Preflight every call in source order before dispatching any parallel effect.
+		for i, c := range calls {
+			results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false, true)
+		}
+		if err := errors.Join(errs...); err != nil {
+			return false, err
+		}
 		var wg sync.WaitGroup
 		jobs := make(chan int)
 		for n := 0; n < min(len(results), a.config.MaxParallelTools); n++ {
@@ -43,7 +50,7 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (bo
 				defer wg.Done()
 				for i := range jobs {
 					c := calls[i]
-					results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false)
+					results[i], errs[i] = a.executeTool(ctx, run, assistant, c, definitions[c.Name], false, false)
 				}
 			}()
 		}
@@ -62,7 +69,7 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (bo
 	}
 	return terminate, nil
 }
-func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call ToolCall, definition ToolDefinition, skip bool) (result ToolResult, err error) {
+func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call ToolCall, definition ToolDefinition, skip, preflight bool) (result ToolResult, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("tool pipeline panicked: %v", p)
@@ -77,7 +84,7 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 		}
 		return result, nil
 	}
-	inv := Invocation{SessionID: snapshot.ID, RunID: run.id, TurnID: assistant.TurnID, AssistantID: assistant.ID, ExecutionID: newID(), Call: clone(call), Binding: snapshot.Binding}
+	inv := Invocation{SessionID: snapshot.ID, RunID: run.id, TurnID: assistant.TurnID, AssistantID: assistant.ID, ExecutionID: newID(), Call: clone(call)}
 	if state.Prepared {
 		inv = clone(state.Invocation)
 	}
@@ -135,6 +142,9 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 		r.Terminate = decision.Terminate
 		return a.commitToolResult(ctx, inv, r, false)
 	}
+	if preflight {
+		return ToolResult{}, nil
+	}
 	if ctx.Err() != nil {
 		return a.commitToolResult(ctx, inv, toolFailure("cancelled", "Cancelled before tool execution.", OutcomeNotExecuted), false)
 	}
@@ -164,19 +174,13 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 		if result.Outcome != "" {
 			outcome = result.Outcome
 		}
-		result = ToolResult{Content: Text("Tool call ended with an error; partial effects may have occurred: " + executeErr.Error()), IsError: true, Code: code, Outcome: outcome, Artifact: result.Artifact, Context: result.Context}
+		result = ToolResult{Content: Text("Tool call ended with an error; partial effects may have occurred: " + executeErr.Error()), IsError: true, Code: code, Outcome: outcome, Artifact: result.Artifact}
 	}
 	result = normalizeResult(result)
 	if validateToolResult(result) != nil {
 		result = toolFailure("invalid_tool_result", "Tool returned an invalid result; effects require host reconciliation.", OutcomeUnknown)
 	}
-	if result.Context != nil && !definition.Sequential {
-		result.Context = nil
-		result.IsError = true
-		result.Code = "invalid_context_change"
-		result.Content = Text("Tool executed, but its context update requires a sequential tool.")
-	}
-	fact := ToolResult{Outcome: result.Outcome, Artifact: result.Artifact, Context: clone(result.Context)}
+	fact := ToolResult{Outcome: result.Outcome, Artifact: result.Artifact, Terminate: result.Terminate}
 	cleanup, cancel := persistContext(ctx)
 	err = a.commitTool(cleanup, TransitionCompleted, inv, nil, &fact, false)
 	cancel()
@@ -184,7 +188,6 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 		return ToolResult{}, err
 	}
 	actualOutcome := result.Outcome
-	actualContext := clone(result.Context)
 	if a.config.AfterToolCall != nil {
 		patch, hookErr := afterTool(ctx, a.config.AfterToolCall, inv, result)
 		if hookErr != nil {
@@ -195,12 +198,10 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 			result = applyToolPatch(result, patch)
 		}
 		result.Outcome = actualOutcome
-		result.Context = actualContext
 	}
 	result = normalizeResult(result)
 	if validateToolResult(result) != nil {
 		result = toolFailure("after_tool_failed", "Tool execution finished, but its processed result is invalid. Do not repeat the operation to retrieve output.", actualOutcome)
-		result.Context = actualContext
 	}
 	return a.commitToolResult(ctx, inv, result, result.Outcome == OutcomeUnknown)
 }

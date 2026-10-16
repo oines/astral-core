@@ -44,14 +44,14 @@ func Model(reply func(astral.Request) (astral.Reply, error)) astral.Model {
 }
 
 func Answer(text string) astral.Reply {
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: astral.Text(text)}, FinishReason: astral.FinishStop}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: astral.Text(text), FinishReason: astral.FinishStop}}
 }
 func Calls(calls ...astral.ToolCall) astral.Reply {
 	content := make([]astral.Content, len(calls))
 	for i := range calls {
 		content[i] = astral.Content{Type: "tool_call", ToolCall: &calls[i]}
 	}
-	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content}, FinishReason: astral.FinishToolCalls}
+	return astral.Reply{Message: astral.Message{Role: astral.RoleAssistant, Content: content, FinishReason: astral.FinishToolCalls}}
 }
 func Call(id, name, arguments string) astral.ToolCall {
 	return astral.ToolCall{ID: id, Name: name, Arguments: json.RawMessage(arguments)}

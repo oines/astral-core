@@ -7,7 +7,47 @@ import (
 	"github.com/oines/astral-core/internal/retry"
 )
 
-func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, error) {
+func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (adopted Frame, finalErr error) {
+	messageID := newID()
+	started := false
+	lastAttempt := ""
+	var lastReply Reply
+	defer func() {
+		if !started {
+			return
+		}
+		if finalErr != nil && adopted.ID == "" {
+			m := lastReply.Message
+			m.Role = RoleAssistant
+			m.FinishReason = FinishError
+			if m.ErrorMessage == "" {
+				m.ErrorMessage = finalErr.Error()
+			}
+			if ctx.Err() != nil || errors.Is(finalErr, context.Canceled) || lastReply.Message.FinishReason == FinishCancelled {
+				m.FinishReason = FinishCancelled
+			}
+			if m.Validate() != nil {
+				m = Message{Role: RoleAssistant, FinishReason: m.FinishReason, ErrorMessage: m.ErrorMessage}
+			}
+			frame := Frame{ID: messageID, TurnID: turnID, Message: m}
+			cleanup, cancel := persistContext(ctx)
+			err := a.driver.Commit(cleanup, Transition{Kind: TransitionMessage, ID: frame.ID, RunID: run.id, TurnID: turnID, Message: &frame.Message, Usage: lastReply.Usage})
+			cancel()
+			finalErr = errors.Join(finalErr, err)
+			if err == nil {
+				adopted = frame
+			}
+		}
+		event := Event{Type: EventMessageEnd, RunID: run.id, TurnID: turnID, AttemptID: lastAttempt, EntryID: adopted.ID}
+		if adopted.ID != "" {
+			event.Message = &adopted.Message
+			event.Status = string(adopted.Message.FinishReason)
+		}
+		if finalErr != nil {
+			event.Error = finalErr.Error()
+		}
+		a.Publish(event)
+	}()
 	p := a.config.Retry
 	override := ""
 	seen := map[string]bool{}
@@ -28,9 +68,21 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, e
 			if err != nil {
 				return Frame{}, retry.Decision{}, err
 			}
+			// A prepare failure has not requested the next model response yet. Keep
+			// a pending FinishTurn continuation available for explicit recovery.
+			if !started {
+				if err := a.driver.Commit(ctx, Transition{Kind: TransitionTurnStart, ID: newID(), RunID: run.id, TurnID: turnID}); err != nil {
+					return Frame{}, retry.Decision{}, err
+				}
+			}
 			lastModel = model.Spec().ID
 			attemptID = newID()
-			a.Publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID, AttemptID: attemptID})
+			lastAttempt = attemptID
+			if !started {
+				a.Publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID})
+				started = true
+			}
+			a.Publish(Event{Type: EventAttemptStart, RunID: run.id, TurnID: turnID, AttemptID: attemptID})
 			requestCtx := ctx
 			cancel := func() {}
 			if p.RequestTimeout > 0 {
@@ -39,7 +91,11 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, e
 			reply, streamErr := stream(requestCtx, model, request, func(e ModelEvent) {
 				a.Publish(Event{Type: EventMessageUpdate, RunID: run.id, TurnID: turnID, AttemptID: attemptID, Model: &e})
 			})
+			lastReply = reply
 			streamErr = requestError(ctx, requestCtx, streamErr)
+			if reply.Message.FinishReason == FinishCancelled {
+				streamErr = errors.Join(streamErr, context.Canceled)
+			}
 			cancel()
 			attempts++
 			if streamErr == nil {
@@ -49,11 +105,16 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, e
 				streamErr = ctx.Err()
 			}
 			if streamErr == nil {
-				frame := Frame{ID: newID(), TurnID: turnID, Message: reply.Message}
-				if err = a.driver.Commit(ctx, Transition{Kind: TransitionMessage, ID: frame.ID, RunID: run.id, TurnID: turnID, Message: &frame.Message, Usage: reply.Usage}); err != nil {
+				frame := Frame{ID: messageID, TurnID: turnID, Message: reply.Message}
+				var synthetic []ToolCompletion
+				if frame.Message.FinishReason == FinishLength {
+					for _, call := range frame.Message.ToolCalls() {
+						synthetic = append(synthetic, ToolCompletion{ID: newID(), Invocation: Invocation{SessionID: a.driver.Snapshot().ID, RunID: run.id, TurnID: turnID, AssistantID: frame.ID, ExecutionID: newID(), Call: clone(call)}, Result: toolFailure("response_length", "Tool was not executed because the model response was truncated.", OutcomeNotExecuted)})
+					}
+				}
+				if err = a.driver.Commit(ctx, Transition{Kind: TransitionMessage, ID: frame.ID, RunID: run.id, TurnID: turnID, Message: &frame.Message, Usage: reply.Usage, SyntheticResults: synthetic}); err != nil {
 					return Frame{}, retry.Decision{}, err
 				}
-				a.Publish(Event{Type: EventMessageEnd, RunID: run.id, TurnID: turnID, AttemptID: attemptID, EntryID: frame.ID})
 				return frame, retry.Decision{}, nil
 			}
 			fallbackAllowed = true
@@ -76,6 +137,9 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (Frame, e
 		}
 		if ctx.Err() != nil {
 			return Frame{}, ctx.Err()
+		}
+		if errors.Is(err, context.Canceled) {
+			return Frame{}, err
 		}
 		if a.config.Fallback == nil || round == p.MaxFallbacks {
 			return Frame{}, lastErr

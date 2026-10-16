@@ -23,7 +23,7 @@ func interleavedReply() astral.Reply {
 	first := call("first", "work", `{"value":"one"}`)
 	second := call("second", "work", `{"value":"two"}`)
 	first.Metadata, second.Metadata = json.RawMessage(orderedOpaque), json.RawMessage(orderedOpaque)
-	return astral.Reply{FinishReason: astral.FinishToolCalls, Message: astral.Message{Role: astral.RoleAssistant, Metadata: json.RawMessage(orderedOpaque), Content: []astral.Content{
+	return astral.Reply{Message: astral.Message{FinishReason: astral.FinishToolCalls, Role: astral.RoleAssistant, Metadata: json.RawMessage(orderedOpaque), Content: []astral.Content{
 		{Type: "reasoning", Text: "reasoning before first call", Data: json.RawMessage(`{"encrypted_content":"AAA"}`), Metadata: json.RawMessage(orderedOpaque)},
 		{Type: "text", Text: "first explanation", Metadata: json.RawMessage(orderedOpaque)},
 		{Type: "tool_call", ToolCall: &first, Metadata: json.RawMessage(orderedOpaque)},
@@ -117,7 +117,7 @@ func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
 			t.Fatal("streamed arguments dispatched a tool before the complete reply")
 		}
 		for _, entry := range entries(s) {
-			if entry.Message != nil && entry.Message.Role == astral.RoleAssistant {
+			if entry.Message != nil && entry.Message.Role == astral.RoleAssistant && !entry.Message.Failed() {
 				t.Fatal("partial stream became durable")
 			}
 		}
@@ -297,7 +297,7 @@ func TestInvalidStreamReferencesCannotCommitOrDispatch(t *testing.T) {
 						t.Fatalf("invalid stream succeeded: %v", err)
 					}
 					for _, entry := range entries(s) {
-						if entry.Message != nil && entry.Message.Role == astral.RoleAssistant {
+						if entry.Message != nil && entry.Message.Role == astral.RoleAssistant && !entry.Message.Failed() {
 							t.Fatal("invalid stream became a durable assistant message")
 						}
 					}
@@ -349,13 +349,10 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 			})
 			var summarized atomic.Bool
 			summary := model(func(_ context.Context, _ int, request astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-				for _, line := range strings.Split(request.Messages[0].Content[0].Text, "\n") {
-					var item struct {
-						Message astral.Message `json:"message"`
-					}
-					if json.Unmarshal([]byte(line), &item) == nil && len(item.Message.ToolCalls()) > 0 {
-						if !reflect.DeepEqual(item.Message, want.Message) {
-							t.Fatal("compaction changed the original block order or signatures")
+				for _, message := range request.Messages {
+					if len(message.ToolCalls()) > 0 {
+						if !reflect.DeepEqual(message, want.Message) {
+							t.Fatal("compaction changed ordered blocks or signatures")
 						}
 						summarized.Store(true)
 					}

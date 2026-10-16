@@ -33,6 +33,12 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	if err != nil {
 		return record, err
 	}
+	s.mu.Lock()
+	_, err = s.applyInputsLocked(ctx, "", true, false)
+	s.mu.Unlock()
+	if err != nil {
+		return record, err
+	}
 	_, err = s.requestContext(ctx, model)
 	return record, err
 }
@@ -88,9 +94,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	if through <= previousThrough || through < 0 {
 		return CompactionRecord{}, ErrCompactionNoProgress
 	}
-	// Moving a whole tool batch before its environment messages in Context can
-	// put an environment's source before this raw boundary. Include every such
-	// covered message in the summary input rather than silently losing it.
+	// Select every message covered by the complete history boundary.
 	var selected []protocol.Message
 	var sourceIDs []string
 	for i, message := range view.Request.Messages {
@@ -121,12 +125,12 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	output = outputReservation(output, summaryModel.Spec())
 	request := protocol.Request{ModelID: summaryModelID, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output}
 	build := func(messages []protocol.Message) (protocol.Request, error) {
-		text, err := summaryText(messages, sourceIDs, path, instructions)
+		messages, err := summaryMessages(messages, sourceIDs, path, instructions)
 		if err != nil {
 			return protocol.Request{}, err
 		}
 		candidate := request
-		candidate.Messages = []protocol.Message{protocol.User(text)}
+		candidate.Messages = messages
 		return candidate, nil
 	}
 	request, err = build(selected)
@@ -192,10 +196,6 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	}
 	record := CompactionRecord{ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
 	entries := []Entry{{Kind: EntryCompaction, Compaction: &record}}
-	environment, snapshotID := effectiveEnvironment(path)
-	if environment != nil && indices[snapshotID] <= through {
-		entries = append(entries, Entry{Kind: EntryEnvironment, Environment: environment})
-	}
 	if _, err = s.append(ctx, entries...); err != nil {
 		return CompactionRecord{}, err
 	}

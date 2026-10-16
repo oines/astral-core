@@ -30,7 +30,7 @@ func (s *Session) initCore() error {
 	for _, d := range a.defaults.Tools {
 		tools = append(tools, frozenTool{a.tools[d.Name]})
 	}
-	c := protocol.Config{ID: s.id, Model: a.config.Model, Tools: tools, ResolveModel: a.config.ResolveModel, Retry: a.config.Retry, Fallback: a.config.Fallback, MaxTurns: a.config.MaxTurns, MaxParallelTools: a.config.MaxParallelTools, MaxSteeringPerTurn: a.config.MaxSteeringPerTurn, AfterToolCall: a.config.AfterToolCall, Driver: sessionDriver{s}}
+	c := protocol.Config{ID: s.id, Model: a.config.Model, Tools: tools, ResolveModel: a.config.ResolveModel, Retry: a.config.Retry, Fallback: a.config.Fallback, MaxTurns: a.config.MaxTurns, MaxParallelTools: a.config.MaxParallelTools, MaxSteeringPerTurn: a.config.MaxSteeringPerTurn, AfterToolCall: a.config.AfterToolCall, FinishTurn: a.config.FinishTurn, Driver: sessionDriver{s}}
 	if a.config.BeforeToolCall != nil {
 		c.BeforeToolCall = func(ctx context.Context, inv protocol.Invocation) (protocol.ToolDecision, error) {
 			return a.config.BeforeToolCall(ctx, ToolContext{Invocation: inv, awaitApproval: func(ctx context.Context, r ApprovalRequest) (ApprovalDecision, error) {
@@ -49,11 +49,16 @@ func (d sessionDriver) Snapshot() protocol.ExecutionState {
 	s := d.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.executionStateLocked()
+}
+func (s *Session) executionStateLocked() protocol.ExecutionState {
 	c := s.configurationLocked()
-	env, _ := effectiveEnvironment(s.pathLocked())
 	out := protocol.ExecutionState{ID: s.id, Configuration: protocol.Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools}, Calls: map[string]protocol.CallState{}}
-	if env != nil {
-		out.Binding = env.Binding
+	out.Turn = clone(s.state.Turn)
+	out.HasQueuedInputs = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
+	if s.state.LastRun != nil {
+		out.LastRunStatus = s.state.LastRun.Status
+		out.QueueOnly = s.state.LastRun.QueueOnly
 	}
 	if e := s.lastMessageLocked(); e != nil {
 		out.Last = &protocol.Frame{ID: e.ID, TurnID: e.TurnID, Message: *e.Message}
@@ -120,46 +125,111 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 	if t.Kind == protocol.TransitionSelectModel {
 		return s.SelectModel(ctx, t.ModelID)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed && t.Kind == protocol.TransitionRunStart {
+		return protocol.ErrClosed
+	}
 	e := Entry{ID: t.ID, RunID: t.RunID, TurnID: t.TurnID}
 	var entries []Entry
 	switch t.Kind {
 	case protocol.TransitionRunStart:
-		e.Kind = EntryRun
-		e.Run = &RunRecord{ID: t.RunID, Status: "started"}
-		entries = append(entries, e)
+		if !s.maintenance || s.maintenanceContext == nil {
+			return protocol.ErrBusy
+		}
+		ctx = s.maintenanceContext
+		queued := s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
+		if t.Message == nil && !s.executionStateLocked().Continuable(queued) {
+			return protocol.ErrNotContinuable
+		}
 		if t.Message != nil {
-			entries = append(entries, Entry{Kind: EntryMessage, RunID: t.RunID, Message: t.Message})
+			if err := s.admitInput(InputRecord{Kind: InputSteer, Message: t.Message, Contexts: t.Contexts}); err != nil {
+				return err
+			}
+			view, err := project(s.pathLocked())
+			if err != nil {
+				return err
+			}
+			view.Request.Messages = append(view.Request.Messages, t.Contexts...)
+			view.Request.Messages = append(view.Request.Messages, *t.Message)
+			raw, err := json.Marshal(view.Request)
+			if err != nil {
+				return err
+			}
+			if len(raw) > s.agent.config.MaxContextBytes {
+				return ErrBudget
+			}
+		}
+		if s.state.Turn != nil && s.state.Turn.Decided && s.state.Turn.Decision != protocol.TurnContinue && s.state.LastRun != nil && s.state.LastRun.Status != "started" {
+			checkpoint := clone(*s.state.Turn)
+			checkpoint.Advanced = true
+			entries = append(entries, Entry{Kind: EntryTurn, Turn: &checkpoint})
+		}
+		// Pending passive groups precede a new prompt. The start and its attached
+		// batch remain a single commit; already accepted groups stay pending if full.
+		if t.Message != nil {
+			pending, err := s.pendingRecordsLocked(ctx, InputContext, maxPassivePerBoundary)
+			if err != nil {
+				return err
+			}
+			view, err := project(s.pathLocked())
+			if err != nil {
+				return err
+			}
+			request := view.Request
+			for _, r := range pending {
+				q := r.Entry.Input
+				trial := request
+				trial.Messages = append(append([]protocol.Message(nil), request.Messages...), q.Contexts...)
+				fit := trial
+				fit.Messages = append(append(append([]protocol.Message(nil), trial.Messages...), t.Contexts...), *t.Message)
+				raw, err := json.Marshal(fit)
+				if err != nil {
+					return err
+				}
+				if len(raw) > s.agent.config.MaxContextBytes {
+					break
+				}
+				entries = append(entries, contextEntries(q.Contexts, t.RunID, q.ID)...)
+				entries = append(entries, Entry{Kind: EntryInputConsumed, Input: &InputRecord{ID: q.ID, Kind: q.Kind}})
+				request = trial
+			}
+		}
+		e.Kind = EntryRun
+		previous := s.executionStateLocked()
+		e.Run = &RunRecord{ID: t.RunID, Status: "started", QueueOnly: t.Message == nil && previous.Last != nil && previous.Last.Message.Role == protocol.RoleUser && previous.LastRunStatus == "cancelled"}
+		entries = append(entries, e)
+		entries = append(entries, contextEntries(t.Contexts, t.RunID, t.ID)...)
+		if t.Message != nil {
+			entries = append(entries, Entry{Kind: EntryMessage, RunID: t.RunID, InputID: t.ID, Message: t.Message})
 		}
 	case protocol.TransitionMessage:
 		e.Kind = EntryMessage
 		e.Message = t.Message
 		e.Usage = t.Usage
 		entries = append(entries, e)
+		for _, r := range t.SyntheticResults {
+			result := r.Result
+			entries = append(entries, Entry{ID: r.ID, Kind: EntryToolResult, RunID: t.RunID, TurnID: t.TurnID, Tool: &ToolRecord{Invocation: r.Invocation, Result: &result}})
+		}
+	case protocol.TransitionTurnStart:
+		if s.state.Turn == nil {
+			return ctx.Err()
+		}
+		checkpoint := clone(*s.state.Turn)
+		checkpoint.Advanced = true
+		e.Kind = EntryTurn
+		e.Turn = &checkpoint
+		entries = append(entries, e)
+	case protocol.TransitionTurnDecision:
+		e.Kind = EntryTurn
+		e.Turn = t.Turn
+		entries = append(entries, e)
 	default:
 		kinds := map[protocol.TransitionKind]EntryKind{protocol.TransitionPrepared: EntryToolPrepared, protocol.TransitionAuthorized: EntryToolAuthorized, protocol.TransitionStarted: EntryToolStarted, protocol.TransitionCompleted: EntryToolCompleted, protocol.TransitionResult: EntryToolResult}
 		e.Kind = kinds[t.Kind]
 		e.Tool = &ToolRecord{Invocation: t.Invocation, Decision: t.Decision, Result: t.Result, NeedsResolution: t.NeedsResolution}
 		entries = append(entries, e)
-		if t.Kind == protocol.TransitionResult && len(t.Result.Context) > 0 {
-			snapshot, err := decodeEnvironment(t.Result.Context)
-			if err != nil {
-				return err
-			}
-			entries = append(entries, Entry{Kind: EntryEnvironment, RunID: t.RunID, TurnID: t.TurnID, Environment: snapshot})
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed && t.Kind == protocol.TransitionRunStart {
-		return protocol.ErrClosed
-	}
-	if t.Kind == protocol.TransitionRunStart {
-		if !s.maintenance || s.maintenanceContext == nil {
-			return protocol.ErrBusy
-		}
-		// Transfer the reservation to the executor only after its start commit.
-		// Cancel and Close can still cancel the preflight/commit context here.
-		ctx = s.maintenanceContext
 	}
 	_, err := s.appendLocked(ctx, entries...)
 	if err == nil && t.Kind == protocol.TransitionRunStart {
@@ -170,43 +240,49 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 }
 func (d sessionDriver) Boundary(ctx context.Context, id string, natural bool) (bool, protocol.RunResult, error) {
 	s := d.s
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pending, err := s.pendingInputsLocked(ctx, InputSteer)
-	if err != nil {
-		return false, protocol.RunResult{}, err
-	}
-	if len(pending) == 0 && natural {
-		pending, err = s.pendingInputsLocked(ctx, InputFollowUp)
-		if err != nil {
-			return false, protocol.RunResult{}, err
-		}
-	}
-	if len(pending) > 0 {
-		item := pending[0]
-		entries := []Entry{{Kind: EntryMessage, RunID: id, Message: item.Message}, {Kind: EntryInputConsumed, RunID: id, Input: &InputRecord{ID: item.ID, Kind: item.Kind}}}
-		if item.Kind == InputSteer {
-			entries, err = s.steeringEntriesLocked(id, pending)
-			if err != nil {
-				return false, protocol.RunResult{}, err
+	for attempt := 0; attempt < 2; attempt++ {
+		s.mu.Lock()
+		end := false
+		forceContinue := false
+		if t := s.state.Turn; t != nil && t.Decided && !t.Advanced {
+			end = t.Decision == protocol.TurnEnd
+			if t.Decision == protocol.TurnContinue {
+				forceContinue = true
 			}
 		}
-		_, err := s.appendLocked(ctx, entries...)
-		return false, protocol.RunResult{}, err
+		driven, err := s.applyInputsLocked(ctx, id, end, natural)
+		if err == nil && (!driven && (natural && !forceContinue || end)) {
+			cleanup, cancel := persistContext(ctx)
+			r, finishErr := s.finishLocked(cleanup, id, "completed", nil)
+			cancel()
+			s.mu.Unlock()
+			return true, r, finishErr
+		}
+		modelID := s.configurationLocked().ModelID
+		s.mu.Unlock()
+		if err == nil {
+			return false, protocol.RunResult{}, nil
+		}
+		if !errors.Is(err, ErrBudget) || attempt > 0 || s.agent.config.Compaction.Disabled {
+			return false, protocol.RunResult{}, err
+		}
+		m, resolveErr := s.agent.model(ctx, modelID)
+		if resolveErr != nil {
+			return false, protocol.RunResult{}, resolveErr
+		}
+		if _, compactErr := s.compact(ctx, "", m); compactErr != nil {
+			return false, protocol.RunResult{}, errors.Join(err, compactErr)
+		}
 	}
-	if natural {
-		cleanup, cancel := persistContext(ctx)
-		defer cancel()
-		r, err := s.finishLocked(cleanup, id, "completed", nil)
-		return true, r, err
-	}
-	return false, protocol.RunResult{}, nil
+	return false, protocol.RunResult{}, ErrBudget
 }
 func (d sessionDriver) Finish(ctx context.Context, id, status string, cause error) (protocol.RunResult, error) {
 	s := d.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.finishLocked(ctx, id, status, cause)
+	_, err := s.applyInputsLocked(ctx, id, true, false)
+	r, finishErr := s.finishLocked(ctx, id, status, cause)
+	return r, errors.Join(err, finishErr)
 }
 func (s *Session) finishLocked(ctx context.Context, id, status string, cause error) (protocol.RunResult, error) {
 	record := RunRecord{ID: id, Status: status}

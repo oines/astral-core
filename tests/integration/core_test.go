@@ -102,7 +102,7 @@ func TestCoreAndPersistentSessionShareExecutionBehavior(t *testing.T) {
 		})
 		m.spec.MaxOutputTokens = 32000
 		retry := astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
-		var startRun func(context.Context, astral.Message) (*astral.Run, error)
+		var startRun func(context.Context, astral.Message, ...astral.InputOptions) (*astral.Run, error)
 		var sub *astral.Subscription
 		if persistent {
 			c := testConfig(m, memory.New())
@@ -142,9 +142,9 @@ func TestCoreAndPersistentSessionShareExecutionBehavior(t *testing.T) {
 
 func TestCoreAndSessionShareInputAndParallelToolBoundaries(t *testing.T) {
 	type endpoint interface {
-		Start(context.Context, astral.Message) (*astral.Run, error)
-		Steer(context.Context, astral.Message) (string, error)
-		FollowUp(context.Context, astral.Message) (string, error)
+		Start(context.Context, astral.Message, ...astral.InputOptions) (*astral.Run, error)
+		Steer(context.Context, astral.Message, ...astral.InputOptions) (string, error)
+		FollowUp(context.Context, astral.Message, ...astral.InputOptions) (string, error)
 		Subscribe(int) *astral.Subscription
 	}
 	type observation struct {

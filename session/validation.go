@@ -37,7 +37,7 @@ func stream(ctx context.Context, model protocol.Model, request protocol.Request,
 	if err == nil {
 		reply, err = copyJSON(reply)
 	}
-	if err == nil && (reply.FinishReason == protocol.FinishStop || reply.FinishReason == protocol.FinishToolCalls) {
+	if err == nil && (reply.Message.FinishReason == protocol.FinishStop || reply.Message.FinishReason == protocol.FinishToolCalls) {
 		if checkErr := check.Finish(len(reply.Message.Content), func(i int) (string, string) {
 			part := reply.Message.Content[i]
 			callID := ""
@@ -53,13 +53,13 @@ func stream(ctx context.Context, model protocol.Model, request protocol.Request,
 }
 
 func validateReply(reply protocol.Reply) error {
-	if reply.FinishReason != protocol.FinishStop && reply.FinishReason != protocol.FinishToolCalls {
-		return fmt.Errorf("%w: finish reason %q", protocol.ErrIncompleteResponse, reply.FinishReason)
+	if reply.Message.FinishReason != protocol.FinishStop && reply.Message.FinishReason != protocol.FinishToolCalls {
+		return fmt.Errorf("%w: finish reason %q", protocol.ErrIncompleteResponse, reply.Message.FinishReason)
 	}
 	if reply.Message.Role != protocol.RoleAssistant {
 		return fmtInvalid("model reply must be an assistant message")
 	}
-	if reply.FinishReason == protocol.FinishToolCalls && len(reply.Message.ToolCalls()) == 0 {
+	if reply.Message.FinishReason == protocol.FinishToolCalls && len(reply.Message.ToolCalls()) == 0 {
 		return fmtInvalid("tool_calls finish reason without calls")
 	}
 	return validateMessage(reply.Message)

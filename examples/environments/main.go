@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	astral "github.com/oines/astral-core"
-	environments "github.com/oines/astral-core/environment"
 	"github.com/oines/astral-core/examples/internal/demo"
 	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
@@ -41,9 +41,21 @@ func targetOf(raw json.RawMessage) (string, error) {
 	return binding.Target, nil
 }
 
-func snapshotFor(id, dir string) environments.Snapshot {
-	binding, _ := json.Marshal(hostBinding{Target: id})
-	return environments.Snapshot{Binding: binding, Context: fmt.Sprintf("Execution target: %s\nWorking directory: %s", id, dir)}
+func contextFor(id, dir string) astral.Message {
+	return astral.Message{Role: astral.RoleDeveloper, ContextKind: "environment", Content: astral.Text(fmt.Sprintf("Execution target: %s\nWorking directory: %s", id, dir))}
+}
+
+// This wrapper belongs to the host. Core only persists the resulting reference.
+type hostTool struct {
+	astral.Tool
+	selected func() string
+}
+
+func (t hostTool) Bind(ctx context.Context, inv astral.Invocation) (json.RawMessage, error) {
+	if t.Definition().Name == "write_stdin" {
+		return t.Tool.(astral.TargetedTool).Bind(ctx, inv)
+	}
+	return json.Marshal(hostBinding{Target: t.selected()})
 }
 
 func (r hostRouter) backend(inv astral.Invocation) (standardtools.Backend, error) {
@@ -110,20 +122,30 @@ func run(ctx context.Context) error {
 		defer cancel()
 		_ = set.Close(cleanup)
 	}()
-	// Environment switching is an ordinary host tool. The SDK supplies neither
-	// its selection schema nor target discovery or authorization.
-	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Description: "Select an authorized execution target.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	var mu sync.RWMutex
+	selected := "target-a"
+	current := func() string { mu.RLock(); defer mu.RUnlock(); return selected }
+	var live *sessions.Session
+	// Target selection and its persistence are host policy. A sequential tool
+	// changes it before later calls in the same batch are bound.
+	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Description: "Select an authorized execution target.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
 		target, err := targetOf(inv.Call.Arguments)
 		if err != nil || router[target] == nil {
 			return astral.ToolResult{}, errors.New("target not authorized")
 		}
-		payload, err := json.Marshal(snapshotFor(target, filepath.Join(root, target)))
-		if err != nil {
-			return astral.ToolResult{}, err
+		mu.Lock()
+		selected = target
+		mu.Unlock()
+		if _, err = live.InjectContext(ctx, []astral.Message{contextFor(target, filepath.Join(root, target))}); err != nil {
+			return astral.ToolResult{Outcome: astral.OutcomeSucceeded}, err
 		}
-		return astral.ToolResult{Content: astral.Text("Environment updated."), Context: payload}, nil
+		return astral.ToolResult{Content: astral.Text("Host target updated.")}, nil
 	}}
-	tools := append(set.Tools(), switcher)
+	var tools []astral.Tool
+	for _, base := range set.Tools() {
+		tools = append(tools, hostTool{Tool: base, selected: current})
+	}
+	tools = append(tools, switcher)
 	model := demo.Model(func(request astral.Request) (astral.Reply, error) {
 		if result := demo.LastTool(request, "write_stdin"); result != nil {
 			if result.IsError {
@@ -167,9 +189,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 	defer agent.Close(context.Background())
-	initial := snapshotFor("target-a", filepath.Join(root, "target-a"))
-	session, err := agent.NewSession(ctx, sessions.SessionOptions{Environment: &initial})
+	session, err := agent.NewSession(ctx, sessions.SessionOptions{})
 	if err != nil {
+		return err
+	}
+	live = session
+	if _, err = session.InjectContext(ctx, []astral.Message{contextFor("target-a", filepath.Join(root, "target-a"))}); err != nil {
 		return err
 	}
 	run, err := session.Start(ctx, astral.User("Start a command, switch target, then finish the original command and run on the new target."))
@@ -179,17 +204,10 @@ func run(ctx context.Context) error {
 	if _, err = run.Wait(ctx); err != nil {
 		return err
 	}
-	view, err := session.InspectContext(ctx)
-	if err != nil {
-		return err
-	}
-	current, err := targetOf(view.Binding)
-	if err != nil {
-		return err
-	}
-	if current != "target-b" || processTarget != "target-a" || newCallTarget != "target-b" {
+	selectedTarget := current()
+	if selectedTarget != "target-b" || processTarget != "target-a" || newCallTarget != "target-b" {
 		return errors.New("execution binding was not preserved")
 	}
-	fmt.Printf("current target: %s\noriginal process target: %s\nnew command target: %s\n", current, processTarget, newCallTarget)
+	fmt.Printf("current target: %s\noriginal process target: %s\nnew command target: %s\n", selectedTarget, processTarget, newCallTarget)
 	return nil
 }

@@ -11,9 +11,7 @@ const (
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
 	RoleTool      Role = "tool"
-	// RoleContext is model-visible context, never a system instruction. Adapters
-	// must preserve its position and must not promote referenced file contents.
-	RoleContext Role = "context"
+	RoleDeveloper Role = "developer"
 )
 
 // Content preserves text, multimodal parts and opaque provider payloads. Type is
@@ -29,13 +27,15 @@ type Content struct {
 }
 
 type Message struct {
-	Role        Role            `json:"role"`
-	Content     []Content       `json:"content,omitempty"`
-	ToolCallID  string          `json:"tool_call_id,omitempty"`
-	Name        string          `json:"name,omitempty"`
-	IsError     bool            `json:"is_error,omitempty"`
-	ContextKind string          `json:"context_kind,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	Role         Role            `json:"role"`
+	Content      []Content       `json:"content,omitempty"`
+	ToolCallID   string          `json:"tool_call_id,omitempty"`
+	Name         string          `json:"name,omitempty"`
+	IsError      bool            `json:"is_error,omitempty"`
+	ContextKind  string          `json:"context_kind,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	FinishReason FinishReason    `json:"finish_reason,omitempty"`
+	ErrorMessage string          `json:"error_message,omitempty"`
 }
 
 func Text(text string) []Content { return []Content{{Type: "text", Text: text}} }
@@ -85,10 +85,16 @@ func validateMessage(m Message) error { return m.Validate() }
 // Validate checks the common message contract used by Core and persistent
 // sessions. Provider-defined part types remain opaque and are never executed.
 func (m Message) Validate() error {
-	if m.Role != RoleUser && m.Role != RoleAssistant && m.Role != RoleTool && m.Role != RoleContext {
+	if m.Role != RoleUser && m.Role != RoleAssistant && m.Role != RoleTool && m.Role != RoleDeveloper {
 		return fmtInvalid("unknown message role %q", m.Role)
 	}
-	if len(m.Content) == 0 {
+	if m.Role != RoleAssistant && (m.FinishReason != "" || m.ErrorMessage != "") {
+		return fmtInvalid("only assistant messages may have a terminal status")
+	}
+	if m.FinishReason != "" && m.FinishReason != FinishStop && m.FinishReason != FinishToolCalls && m.FinishReason != FinishLength && m.FinishReason != FinishError && m.FinishReason != FinishCancelled {
+		return fmtInvalid("unknown finish reason %q", m.FinishReason)
+	}
+	if len(m.Content) == 0 && !m.Failed() {
 		return fmtInvalid("empty message")
 	}
 	if m.Role == RoleTool && m.ToolCallID == "" {
@@ -127,4 +133,19 @@ func (m Message) Validate() error {
 		return fmtInvalid("message is not JSON serializable: %v", err)
 	}
 	return nil
+}
+
+// Failed messages remain in history, but are omitted from model requests and
+// never introduce executable tool calls.
+func (m Message) Failed() bool {
+	return m.Role == RoleAssistant && (m.FinishReason == FinishError || m.FinishReason == FinishCancelled)
+}
+
+// ValidateContext validates host-supplied passive context without interpreting
+// its modalities, source kind or provider metadata.
+func (m Message) ValidateContext() error {
+	if m.Role != RoleUser && m.Role != RoleDeveloper {
+		return fmtInvalid("context role must be user or developer")
+	}
+	return m.Validate()
 }

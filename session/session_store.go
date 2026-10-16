@@ -66,6 +66,9 @@ func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, e
 	s.changed = make(chan struct{})
 	for _, e := range entries {
 		s.publishLocked(protocol.Event{Type: protocol.EventCommitted, EntryID: e.ID, RunID: e.RunID, TurnID: e.TurnID})
+		if e.Kind == EntryContext {
+			s.publishLocked(protocol.Event{Type: protocol.EventContextApplied, EntryID: e.ID, InputID: e.InputID, RunID: e.RunID, Message: e.Message})
+		}
 	}
 	return clone(entries), nil
 }
@@ -150,7 +153,7 @@ func (s *Session) pruneWindow() {
 	if !ok {
 		panic("missing committed context boundary")
 	}
-	keep := map[string]bool{p.ConfigurationID: true, p.EnvironmentID: true, p.CompactionID: true, p.ThroughID: true, p.LastMessageID: true, p.BatchConfigurationID: true}
+	keep := map[string]bool{p.ConfigurationID: true, p.CompactionID: true, p.ThroughID: true, p.LastMessageID: true, p.BatchConfigurationID: true}
 	out := make([]Entry, 0, len(s.window)-through+len(keep))
 	for _, id := range p.Results {
 		keep[id] = true
@@ -190,7 +193,7 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 		}
 		cursor = page.Next
 	}
-	references := []string{p.ConfigurationID, p.EnvironmentID, p.CompactionID, p.ThroughID, p.LastMessageID, p.BatchConfigurationID}
+	references := []string{p.ConfigurationID, p.CompactionID, p.ThroughID, p.LastMessageID, p.BatchConfigurationID}
 	for _, id := range p.Results {
 		references = append(references, id)
 	}
@@ -254,7 +257,6 @@ func (s *Session) Reload(ctx context.Context) error {
 	}
 	s.state = state
 	s.setWindow(window)
-	s.needsEnvironment = state.Branch.EnvironmentID != ""
 	close(s.changed)
 	s.changed = make(chan struct{})
 	return nil

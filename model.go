@@ -40,9 +40,8 @@ type Request struct {
 }
 
 type Reply struct {
-	Message      Message      `json:"message"`
-	FinishReason FinishReason `json:"finish_reason"`
-	Usage        Usage        `json:"usage,omitempty"`
+	Message Message `json:"message"`
+	Usage   Usage   `json:"usage,omitempty"`
 }
 
 type Usage struct {
@@ -150,10 +149,14 @@ func stream(ctx context.Context, model Model, request Request, emit func(ModelEv
 	if check.Err() != nil {
 		err = errors.Join(err, fmtInvalid("model event: %v", check.Err()))
 	}
-	if err == nil {
-		reply, err = copyJSON(reply)
+	owned, copyErr := copyJSON(reply)
+	if copyErr != nil {
+		reply = Reply{}
+		err = errors.Join(err, copyErr)
+	} else {
+		reply = owned
 	}
-	if err == nil && (reply.FinishReason == FinishStop || reply.FinishReason == FinishToolCalls) {
+	if err == nil && (reply.Message.FinishReason == FinishStop || reply.Message.FinishReason == FinishToolCalls || reply.Message.FinishReason == FinishLength) {
 		if checkErr := check.Finish(len(reply.Message.Content), func(i int) (string, string) {
 			part := reply.Message.Content[i]
 			callID := ""
@@ -169,13 +172,16 @@ func stream(ctx context.Context, model Model, request Request, emit func(ModelEv
 }
 
 func validateReply(reply Reply) error {
-	if reply.FinishReason != FinishStop && reply.FinishReason != FinishToolCalls {
-		return fmt.Errorf("%w: finish reason %q", ErrIncompleteResponse, reply.FinishReason)
+	if reply.Message.FinishReason == FinishCancelled {
+		return context.Canceled
+	}
+	if reply.Message.FinishReason != FinishStop && reply.Message.FinishReason != FinishToolCalls && reply.Message.FinishReason != FinishLength {
+		return fmt.Errorf("%w: finish reason %q: %s", ErrIncompleteResponse, reply.Message.FinishReason, reply.Message.ErrorMessage)
 	}
 	if reply.Message.Role != RoleAssistant {
 		return fmtInvalid("model reply must be an assistant message")
 	}
-	if reply.FinishReason == FinishToolCalls && len(reply.Message.ToolCalls()) == 0 {
+	if reply.Message.FinishReason == FinishToolCalls && len(reply.Message.ToolCalls()) == 0 {
 		return fmtInvalid("tool_calls finish reason without calls")
 	}
 	return validateMessage(reply.Message)

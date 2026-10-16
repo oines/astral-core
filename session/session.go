@@ -5,13 +5,11 @@ import (
 	"sync"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
-// SessionOptions identifies a new session and its optional initial environment.
+// SessionOptions identifies a new persistent session.
 type SessionOptions struct {
-	ID          string
-	Environment *targetenv.Snapshot
+	ID string
 }
 
 // Session owns one recoverable execution cursor over its Rollout history. The
@@ -36,7 +34,6 @@ type Session struct {
 	maintenanceStop    func() bool
 	maintenanceDone    chan struct{}
 	closed             bool
-	needsEnvironment   bool
 	changed            chan struct{}
 }
 

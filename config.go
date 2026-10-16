@@ -2,7 +2,6 @@ package astral
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 )
 
@@ -10,13 +9,13 @@ import (
 // Agent keeps process-local conversation state, without persistence guarantees.
 type Config struct {
 	ID               string
-	Binding          json.RawMessage
 	Model            Model
 	SystemPrompt     string
 	Tools            []Tool
 	ResolveModel     func(context.Context, string) (Model, error)
 	BeforeToolCall   BeforeToolCall
 	AfterToolCall    AfterToolCall
+	FinishTurn       FinishTurn
 	Fallback         func(context.Context, ModelFailure) (Fallback, error)
 	Retry            RetryPolicy
 	MaxTurns         int

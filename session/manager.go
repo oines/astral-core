@@ -8,7 +8,6 @@ import (
 	"time"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Manager freezes defaults and tool declarations at construction. It owns no
@@ -113,21 +112,11 @@ func (a *Manager) NewSession(ctx context.Context, options SessionOptions) (*Sess
 	if options.ID == "" {
 		options.ID = newID()
 	}
-	if options.Environment == nil && a.config.Environment != nil {
-		snapshot, err := a.config.Environment(ctx, targetenv.Request{SessionID: options.ID})
-		if err != nil {
-			return nil, err
-		}
-		options.Environment = &snapshot
-	}
 	entries := []Entry{{Kind: EntryCreated, Created: &CreationRecord{FormatVersion: FormatVersion, SessionID: options.ID, RolloutID: newID()}}, {Kind: EntryConfiguration, Configuration: &a.defaults}}
-	if options.Environment != nil {
-		entries = append(entries, Entry{Kind: EntryEnvironment, Environment: options.Environment})
-	}
-	return a.create(ctx, options.ID, entries, false)
+	return a.create(ctx, options.ID, entries)
 }
 
-func (a *Manager) create(ctx context.Context, id string, entries []Entry, needsRefresh bool) (*Session, error) {
+func (a *Manager) create(ctx context.Context, id string, entries []Entry) (*Session, error) {
 	if err := a.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -135,7 +124,6 @@ func (a *Manager) create(ctx context.Context, id string, entries []Entry, needsR
 	if err != nil {
 		return nil, err
 	}
-	s.needsEnvironment = needsRefresh
 	s.mu.Lock()
 	_, err = s.appendLocked(ctx, entries...)
 	s.mu.Unlock()
@@ -159,7 +147,7 @@ func (a *Manager) create(ctx context.Context, id string, entries []Entry, needsR
 	a.sessions[id] = s
 	return s, nil
 }
-func (a *Manager) adopt(ctx context.Context, id string, state RuntimeState, needsRefresh bool) (*Session, error) {
+func (a *Manager) adopt(ctx context.Context, id string, state RuntimeState) (*Session, error) {
 	s, err := newSession(a, id, state)
 	if err != nil {
 		return nil, err
@@ -171,7 +159,6 @@ func (a *Manager) adopt(ctx context.Context, id string, state RuntimeState, need
 		return nil, err
 	}
 	s.setWindow(window)
-	s.needsEnvironment = needsRefresh
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -207,7 +194,7 @@ func (a *Manager) OpenSession(ctx context.Context, id string) (*Session, error) 
 	if err != nil {
 		return nil, err
 	}
-	return a.adopt(ctx, id, state, state.Branch.EnvironmentID != "")
+	return a.adopt(ctx, id, state)
 }
 
 // Close joins owned sessions without closing host dependencies.

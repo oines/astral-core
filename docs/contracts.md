@@ -6,11 +6,11 @@
 
 `session.New(Config)` 创建 Manager。每个 Session 用 `sessionDriver` 组合同一个 Core，通过 `Snapshot/Prepare/Commit/Boundary/Finish/AcceptResult` 接入状态、上下文策略和提交确认；没有第二套 Agent Loop。普通生成与摘要使用同一个内部 Retry / Backoff 实现。
 
-Core 的 `Driver.Commit` 必须在事实被采用、依赖动作开始之前确认成功。`Boundary` 负责在同一串行边界内消费输入或完成 Run；自定义 Driver 不得把队列为空检查与完成动作拆开。事件只用于观察，不能代替提交确认。
+Core 的 `Driver.Commit` 必须在事实被采用、依赖动作开始之前确认成功。`Boundary` 负责在同一串行边界内消费输入或完成 Run；自定义 Driver 不得把队列为空检查与完成动作拆开。事件只用于观察，不能代替提交确认。Snapshot 的 HasQueuedInputs 仅报告驱动输入，并提供 LastRunStatus / Turn 等恢复事实；Core 在创建 Continue Run 前据此检查资格，Driver 在提交时再次串行核对队列。
 
 ## 所有权与生命周期
 
-一个 Manager 内，同一 ID 的 OpenSession 返回同一已打开对象。一个 Session 同时只能有一个 Run 或独占维护操作，冲突返回 `astral.ErrBusy`。Compact、恢复预检、环境重新发现和效果确认属于维护操作。Fork 不占用 Parent 的维护状态，也不改变 Parent 的状态。
+一个 Manager 内，同一 ID 的 OpenSession 返回同一已打开对象。一个 Session 同时只能有一个 Run 或独占维护操作，冲突返回 `astral.ErrBusy`。Compact、恢复预检和效果确认属于维护操作。Fork 不占用 Parent 的维护状态，也不改变 Parent 的状态。
 
 宿主必须保证跨 Manager、进程和主机的独占执行所有权。Store CAS 只能拒绝冲突写入，不能撤销外部操作；SDK 不实现分布式租约或调度。
 
@@ -37,7 +37,7 @@ type Store interface {
 }
 ```
 
-格式版本为 4。V4 将 Assistant 的工具调用放入唯一有序 Content 数组。V3 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供静默迁移或旧消息字段兼容层。
+格式版本为 5。V5 保存独立 Context、关联投递组、Assistant 终止状态、队列清理与 Turn 决策。V4 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供静默迁移或旧消息字段兼容层。
 
 `Get` / `Scan` 的第一个字符串参数是 **RolloutID**。`LoadState` / `Pending` / `Commit` / `LookupCommit` 的第一个字符串参数是 **SessionID**；SessionID 在 Store 内唯一。
 
@@ -70,7 +70,7 @@ rollouts 保存状态与顺序计数；entries 按 Rollout / ID、Rollout / Sequ
 
 ### JSONL 与 Memory
 
-JSONL 目录包含版本 4 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 4 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 4，RuntimeState 与创建记录也使用 4。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
+JSONL 目录包含版本 5 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 5 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 5，RuntimeState 与创建记录也使用 5。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
 
 未以换行结束的最后一行视为未提交尾部，读取忽略它，下一次 Commit 仅截去这段。完整行损坏、校验和失败或非法状态转换返回 ErrCorrupt，不自动修复已提交历史。确认恢复在采用新读到的完整提交前执行同步。
 
@@ -78,7 +78,7 @@ JSONL 目录包含版本 4 的 format.json；每个 Rollout 使用其 ID 的 SHA
 
 ## 精确状态、Context 与预算
 
-RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head、有效配置 / 环境 / 摘要引用、当前批次执行事实、当前审批和待办数量。队列正文留在 Store 中，按索引分页读取；旧批次不保存在运行状态中。
+RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head、有效配置 / 摘要引用、当前批次执行事实、当前审批、待办数量、最近 Run 状态及 Turn 决策。队列正文留在 Store 中，按索引分页读取；旧批次不保存在运行状态中。
 
 每个历史节点保存 Projection，Fork 通过索引取得所选节点状态；Projection 保留末尾工具批次的结果引用，Child 可向 Core 提供已完成的 CallState。授权、执行中状态、审批和队列不继承。Session 保留有效 Context 与必要引用，没有完整历史树缓存。任意旧节点若没有摘要且有效路径超限，Fork 或打开会明确报预算错误。
 
@@ -86,7 +86,7 @@ RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head�
 
 模型摘要是 `CompactionRecord`；精确恢复点是 RuntimeState，二者不能互相替代。压缩选择完整消息 / 工具批次，先尝试不裁剪的摘要输入；仅在摘要模型预算不足时缩减输入副本中的工具文本。原始历史、调用标识和结果状态保留。巨大用户输入无法容纳时返回 ErrCompactionInputTooLarge。
 
-摘要成功后，把摘要、读取边界和必要的完整环境重申原子提交，再释放旧 Context。每次请求准备最多自动压缩一次，避免无进展循环。失败摘要不会提交有效摘要；Attempt 诊断只通过可选实时事件提供，不强制写日志。成功回复及摘要保留 Usage。
+摘要请求保留原生消息、多模态 Part、工具历史顺序和不透明元数据，另附来源清单及摘要指令；摘要阶段不执行工具。摘要成功后原子提交摘要与读取边界，再释放旧 Context。全部注入 Context 正常参与摘要，不固定保留或自动重申；生成的摘要投影为 user Role。每次请求准备最多自动压缩一次，避免无进展循环。失败摘要不会提交有效摘要；Attempt 诊断只通过可选实时事件提供，不强制写日志。成功回复及摘要保留 Usage。
 
 ## Model 与协议
 
@@ -125,8 +125,8 @@ SDK 只保存已观察索引、类型和可选 ToolCallID，验证它们与最�
 适配器必须：
 
 1. 保留有序 Content、Tool Call ID、参数、Reasoning、多模态部分及消息 / 内容 / 调用的 opaque Metadata。不支持时明确报错。
-2. 保留 RoleContext 的位置和顺序，将其映射为模型可见上下文，不能把文件正文提升为 System 指令。
-3. Stream 只返回一次完整 Reply，准确标记 FinishReason。length / error / cancelled 不作为成功回复提交。
+2. 保留 Context 消息的位置、目标 user / developer Role 和多模态内容；能力不足时明确处理降级或报错，不能按来源标记自动提权。
+3. Stream 返回本次 Attempt 的完整 Reply，将终止原因放在 Reply.Message.FinishReason；发生错误时可同时返回合法的部分快照。Core 不从 Delta 拼接快照。length 保留，调用以 NotExecuted 结果原子提交；error / cancelled 保留终止消息，投影到模型时跳过。
 4. 返回前停止调用 emit。Delta 是展示数据，最终 Reply 才可提交。
 5. 通过 ModelError 的 Transient、RetryAfter、Code、Cause 分类错误。
 6. 为 Session 提供目标模型实际输入的 Token 估算，包括工具 Schema、消息包装、图片等协议开销。
@@ -145,11 +145,11 @@ SDK 保存协议数据，不包含真实 Chat Completions / Responses 转换器�
 → after hook → 交付预算 → result + 环境变更原子提交
 ```
 
-prepared 固定 Invocation 与目标；authorized 固定 Hook 决定；started 在派发前确认。completed 保存 Outcome、Artifact 和上下文变更等执行事实，不存储未处理的大输出。无效参数、Skip、Block 可直接产生 not_executed 结果。
+prepared 固定 Invocation 与目标；authorized 固定 Hook 决定；started 在派发前确认。completed 保存 Outcome、Artifact 及 Terminate 等执行事实，不存储未处理的大输出。无效参数、Skip、Block 可直接产生 not_executed 结果。
 
-Core Invocation 只包含执行标识、参数及不可变 opaque Binding。TargetedTool 可在审批前固定目标。Binding 的结构、目标解析与授权属于宿主；Core 和 environment 包均不解释其内部结构。工具产生的 Context 更新是不可被结果 Hook 改写的执行事实；需要声明 Sequential。
+Core Invocation 只包含执行标识、参数及不可变 opaque Binding。TargetedTool 可在审批前固定目标。Binding 的结构、目标解析与授权属于 Host。Core 没有 Session 级当前 Binding；工具的 Bind 在 Prepared 之前解析目标，之后审批、执行与恢复均复用该引用。Host 负责引用对应资源及其版本的有效性；引用本身不代表授权。
 
-并行批次受 MaxParallelTools 限制。任一工具声明 Sequential，则整批按调用顺序执行。结果可乱序完成，但下一次 Request 按 Content 中 tool_call 块的先后顺序形成完整批次。只有完整 Reply 校验成功、Assistant 消息提交确认后才允许派发工具；参数流式生成不执行工具。工具与 Hook 必须支持并发，返回后不得继续调用 emit。
+并行批次先按调用顺序完成绑定、参数检查和审批，再受 MaxParallelTools 限制并发执行。任一工具声明 Sequential，则整批按调用顺序执行。结果可乱序完成，但下一次 Request 按 Content 中 tool_call 块的先后顺序形成完整批次。只有可执行的完整 Reply 校验成功、Assistant 消息提交确认后才允许派发工具；参数流式生成不执行工具。工具与 Hook 必须支持并发，返回后不得继续调用 emit。
 
 Outcome 表达执行效果；IsError / Code 也可表达交付失败。普通错误默认 failed，不保证没有部分效果。已知未派发用 OutcomeNotExecuted；确认丢失、取消或未知部分效果用 OutcomeUnknown。Core 不重试工具。超大输出变为 result_too_large，保留真实 Outcome 与 Artifact，清除超大的 Details；原始大输出由宿主管理。
 
@@ -175,7 +175,7 @@ BeforeToolCall: func(ctx context.Context, inv session.ToolContext) (astral.ToolD
 
 每个调用支持一个稳定审批门，请求和决定都持久化。authorized 提交前 Hook 可能重入，审批门外的逻辑必须可重复，不应执行工具副作用。重复提交同一审批决定幂等，冲突决定返回 ErrAlreadyResolved。Standalone Core 的 Hook 接收普通 Invocation，审批策略由宿主自行提供。
 
-AfterToolCall 返回 ToolResultPatch；nil 保留原字段，布尔指针允许设置 false。可改交付内容、Details、IsError、Code、Artifact、Terminate，不能改实际 Outcome 和 Context 效果。已 completed 的恢复不会重跑 after hook。
+AfterToolCall 返回 ToolResultPatch；nil 保留原字段，布尔指针允许设置 false。可改交付内容、Details、IsError、Code、Artifact、Terminate，不能改实际 Outcome。已 completed 的恢复不会重跑 after hook。
 
 Steer 在完整回复或整批工具之后优先消费；FollowUp 在自然完成时消费。Core 和 Session 的 Config 均提供 `MaxSteeringPerTurn`：0 使用默认值 1，显式 1–16 控制每个 Boundary 的 Steer 数量，负数及大于 16 报配置错误。未配置时保持逐条消费；显式大于 1 时，当前已排队的 FIFO 前缀作为多条独立 User Message 进入同一次模型请求，保留 Content、Metadata 和原输入 ID，不拼接正文、不等待未来消息。FollowUp 始终一次一条。该配置是宿主执行策略，不写入持久 Configuration 或 RuntimeState。
 
@@ -183,32 +183,41 @@ Steer 在完整回复或整批工具之后优先消费；FollowUp 在自然完�
 
 Session 对整个选中前缀交替形成 EntryMessage / EntryInputConsumed，通过一次 Commit 原子提交，后者保留原始输入 ID；消息条目仍分配独立的历史 Entry ID。提交失败不提前推进缓存或消费队列，CAS 和丢失确认沿用现有 Receipt 机制。Core 在同一锁内追加独立消息并移除选中项。只有整批结果都要求 Terminate 才停止自动续问，排队输入仍会处理。收尾与队列检查共享锁，收尾之后入队的输入留给下一次 Continue，不丢失。
 
-Subscribe 为尽力投递，缓冲溢出关闭订阅并返回 ErrSlowSubscriber。先订阅，再分页读取历史，按 Entry ID 去重。Event.Sequence 只在当前句柄内递增，不是持久游标；失败 Attempt 的 Delta 不能从历史恢复。InspectContext 不生成回复、压缩或发现环境。
+Subscribe 为尽力投递，缓冲溢出关闭订阅并返回 ErrSlowSubscriber。先订阅，再分页读取历史，按 Entry ID 去重。Event.Sequence 只在当前句柄内递增，不是持久游标；失败 Attempt 的 Delta 不能从历史恢复。InspectContext 不生成回复或压缩。
 
-## 环境、历史位置与 Fork
+## Context、执行控制与 Host 目标
 
-Environment 可选，快照只保存宿主提供的两个值：
+Core 和持久 Session 均提供：
 
 ```go
-type Snapshot struct {
-    Binding json.RawMessage `json:"binding,omitempty"`
-    Context string          `json:"context,omitempty"`
-}
+type InputOptions struct { Contexts []Message }
+InjectContext(ctx context.Context, batch []Message) (string, error)
+Start(ctx context.Context, prompt Message, options ...InputOptions) (*Run, error)
+Steer(ctx context.Context, prompt Message, options ...InputOptions) (string, error)
+FollowUp(ctx context.Context, prompt Message, options ...InputOptions) (string, error)
 ```
 
-Binding 可以是任意有效 JSON，包括对象、数组、字符串、数字、布尔和 null；nil 或零长度 Binding 表示未提供，与 JSON null 不同。它直接作为 Invocation.Binding 的隔离副本传递，不附加 Snapshot 或 SDK 目标字段。SDK 不解释其身份、路径或权限。快照、历史读取、InspectContext、Provider 的 Request.Previous 和工具回调的可变字节均与内部状态隔离。`InspectContext.Binding` 是 json.RawMessage，SnapshotID 取自保存有效快照的 Rollout Entry ID，宿主无需分配。
+最多提供一个 InputOptions。Context 直接复用 Message，Role 是目标 user / developer，ContextKind 仅标记来源，不能改变权限。所有 Content Part 的类型、顺序、Data / Metadata 原样保存；未知模态交由 Model Bridge 明确适配或报错，不得静默丢弃。Host 决定可信 Role，外部消息不会因来源标记自动提权。
 
-Context 是模型可见的宿主文本。环境条目按发生位置投影为 RoleContext / ContextKind=environment，正文精确使用 Snapshot.Context；普通生成和摘要都不自动序列化 Binding。System Prompt 不受环境影响。环境发现、设备列表、Shell、Workspace、Skills Index 以及 AGENTS.md / SOUL.md / SKILL.md 的读取和组织均属于上层产品；引用文件正文是来源材料，不提升为 System 指令。
+空闲且 Tool Batch 完整时可立即应用；运行、维护或未完成批次期间先保存 EntryInputQueued。EntryContext 是独立历史事实，推进 Head / Sources，不覆盖 LastMessageID 或工具状态。接收 ID 与最终 Entry ID 分开；应用后的 Context 记录通过 InputID 关联，支持按 Kind / Reference 查询。Session 返回 ID 前确认接收提交；如果后续即时应用失败，返回的非空 ID 仍指向已接收的 Pending 批次。
 
-NewSession 可以接收初始快照，或调用宿主 Provider，第一轮请求即可看到 Context。RefreshEnvironment 只允许空闲且未关闭的 Session，保留原有维护和预算限制。普通 Sequential Tool 可以通过 ToolResult.Context 提交 `json.Marshal(snapshot)`；SDK 将结果与环境节点原子持久化。失败的宿主解析不得返回环境更新；结果 Hook 无权改写已发生的环境效果。
+关联 Context 和 Prompt 是不可拆分的输入组；应用顺序为各 Context 消息、Prompt、消费事实，同一次 Commit 确认后才修改队列。独立 Context、Steer、FollowUp 复用同一持久队列和边界机制。Steer 优先，FollowUp 仅在自然完成时消费；选中组按接收顺序提交，保留组内边界。Context 不占 Steering 额度。每次最多选择 64 个独立 Context 批次和配置允许的驱动批次，不等待未来到达的内容。
 
-Standalone Core 使用同一 Snapshot 更新协议：初始执行 Binding 来自 Config.Binding，Sequential Tool 的快照生效后，后续 Invocation 只接收其中 Binding 的隔离副本。完整工具结果批次之后仅投影快照 Context，ContextKind 为 environment，不把原始 JSON 或 Binding 发送给模型。非法快照在 Result 被采用前报错，当前有效 Binding 不变；它没有持久 Session 的恢复保证。
+单批超出字节预算直接拒绝；当前窗口容纳不了的已接收 Context 留队。InjectContext 只做结构、字节校验与提交，不触发模型、估算器或自动摘要。实际执行时可使用现有 Compaction 释放空间；显式 Compact 后也尝试安全应用待处理 Context。Run 收尾做一次有界被动提交，剩余批次继续 Pending，不延长执行。
 
-环境切换工具的结果节点本身也保存快照效果：若 Fork 恰好选在结果节点、尚未包含同批后续环境节点，Projection 会引用结果内的快照并投影其 Context；包含后续环境节点时不重复投影。继续执行前仍需宿主重新确认。Compaction 原子重申最新完整快照，执行 Binding 和模型 Context 分开保留。
+大型媒体由 Host 提供内联数据或能在重启、恢复、Fork 时解析的稳定引用。临时内存对象和即将失效的 URL 不能作为持久重放保证。Core 不上传、解码媒体，不访问引用网络资源；Model Bridge 与 Host 负责引用解析、Role / 模态降级或显式报错。摘要失败保留原始历史且不提交 Compaction。
 
-标准工具只检查 Binding 的 JSON 有效性，将目标解析与授权交给 Backend。已有进程保存原始 Binding；切换当前快照不会改变进程目标。write_stdin 在审批前恢复原始绑定，执行前再次验证所有权和绑定。审批看到的目标与执行时验证的目标必须一致。工具 Schema 固定注册，环境变化不改变工具声明。
+`HasQueuedInputs` / `PeekQueuedInputs` 查看驱动队列；`ClearSteering` / `ClearFollowUps` / `ClearQueuedInputs` 清理对应输入及其附带 Context。清理为空时幂等；非空时用一个 EntryInputCleared 事实，在同一次提交中清除 Pending 索引与计数。独立 Context 不受这些接口影响。
 
-重新打开、Reload 和未提供新 Environment 的 Fork 都把已有环境视为历史信息。产生新副作用前必须通过宿主 Provider 或 RefreshEnvironment 重新确认。Provider 只是宿主回调，SDK 不自行发现环境。没有环境的纯聊天 / 业务 API Session 不要求环境发现。环境快照继续只包含 Binding 和 Context，不提供旧环境类型或绑定信封的兼容层；有序消息使用前述 V4 存储格式。
+Continue 不追加合成 Prompt。空历史即使有队列也返回 ErrNotContinuable；Context 不算用户输入。Assistant 尾部按 Steer、FollowUp 优先级消费输入，无输入且无待恢复工作时拒绝创建空 Run。未完成用户请求与工具执行沿用恢复路径；未知效果仍须 ResolveTool。Cancel 保留队列，不自动重启；取消前尚未开始模型调用时也不会合成 Assistant。
+
+FinishTurn 在完整 Assistant / 工具结果确认后、TurnEnd 与下一次驱动队列消费前执行。返回 TurnDefault、TurnEnd 或 TurnContinue。End 保留驱动队列，仍允许有界被动提交；Continue 要求下一次请求，正常工具续问或队列请求即可满足，不额外生成一轮。Hook 错误终止 Run 并保留驱动输入。Hook 必须按 TurnID 可重入，确认后的决策保存为 EntryTurn，恢复时不重复调用；模型和工具错误或取消直接结束。
+
+一个逻辑 Assistant 对应一次 MessageStart / MessageEnd，AttemptStart / AttemptFailed / Retry 区分其尝试；已开始的 Turn 在成功、失败、取消时均有 TurnEnd。终止 MessageEnd 带确认后的 Message；持久提交失败时 EntryID 为空。旧 RunEnd 发布后才允许新 RunStart。事件保持非阻塞观察语义，Wait 不等待订阅者处理事件。
+
+Core 无专用 Environment Snapshot、RefreshEnvironment、环境确认或自动重申。Host 管理执行环境及其持久一致性；普通环境说明用 InjectContext，工具通过 TargetedTool.Bind 返回每调用的不透明 Invocation.Binding。nil Binding 与 JSON null 保持不同，引用不会自动进入模型或摘要。标准工具的 write_stdin 在审批前找回进程原始绑定，执行前复核所有权；Fork 不继承源会话的进程使用权。
+
+## 历史位置与 Fork
 
 ```go
 type ForkMode uint8
@@ -219,7 +228,6 @@ const (
 type ForkOptions struct {
     ID          string
     Mode        ForkMode
-    Environment *environment.Snapshot
 }
 func (s *Session) RolloutID() string
 func (s *Session) Fork(context.Context, string, ForkOptions) (*Session, error)
@@ -233,8 +241,8 @@ Fork 的 nodeID 是包含式边界。排除消息时传其 ParentID。SelectHead
 | --- | --- |
 | User 消息 | 创建后 Continue 调用模型 |
 | 完整工具批次 | 复用历史结果，不重跑 Tool / Hook，保留 Terminate 语义 |
-| Assistant 最终回复 | Continue 保持完成；Start 可追加输入 |
-| 配置、环境、压缩节点 | 由 Projection 和最后有效消息决定 |
+| Assistant 最终回复 | 无驱动输入时 Continue 返回 ErrNotContinuable；Start 可追加输入 |
+| 配置、Context、压缩节点 | 由 Projection 和最后有效消息决定 |
 | 不完整工具批次 | ErrIncompleteBatch，不创建 Child |
 | 未解决外部效果 | ErrOutcomeUnknown，不创建 Child |
 
@@ -242,7 +250,7 @@ Fork 的 nodeID 是包含式边界。排除消息时传其 ParentID。SelectHead
 
 两种模式都从所选 Projection 初始化 Child，自己的创建批次使本地 Version 从 0 到 1。Detached 祖先通过历史导入路径写入，保留原始 EntryID、写入 SessionID、ParentID、Version、Sequence 和协议数据。祖先版本可以高于 Child；回放时不能把这些祖先作为 Child 的本地 Commit Reduce。Child 后续回放从创建记录保存的 Projection 开始，只应用自己的提交。Detached 的来源字段仅用于追溯，不依赖源 Rollout 存活。
 
-目标 ID 必填，作为创建幂等身份。摘要绑定来源 Rollout、来源 Session、nodeID、模式、目标 ID 和显式 Environment，排除随机记录 ID、时间戳和父 Version。创建、Rollout 关联、来源记录和创建回执原子发布。相同请求返回同一 Child；参数变化返回 ErrConflict；已推进 Child 不重置、不自动启动。确认丢失可通过目标 Session 的 LookupCommit / OpenSession 恢复。
+目标 ID 必填，作为创建幂等身份。摘要绑定来源 Rollout、来源 Session、nodeID、模式与目标 ID，排除随机记录 ID、时间戳和父 Version。创建、Rollout 关联、来源记录和创建回执原子发布。相同请求返回同一 Child；参数变化返回 ErrConflict；已推进 Child 不重置、不自动启动。确认丢失可通过目标 Session 的 LookupCommit / OpenSession 恢复。
 
 Shared 不复制历史前缀，只保存 Child 创建批次并读取有效 Context。Detached 的时间、磁盘和累计分配为 O(K)：SQLite 以短事务写入 building Rollout 和 ready=0 Session，JSONL 使用带稳定请求身份的 .pending 文件；完成后原子发布。复制页默认 4 MiB；超过页大小的不可分割历史记录单独读取并完整复制，峰值内存因此也取决于最大单条记录。有效 Context 预算与归档复制互相独立。分页和发布前后的真实 SIGKILL 测试覆盖两种持久后端。
 

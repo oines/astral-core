@@ -2,11 +2,12 @@ package session
 
 import (
 	"fmt"
+	protocol "github.com/oines/astral-core"
 )
 
 func validateEnvelope(e Entry) error {
 	n := 0
-	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Environment != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Compaction != nil, e.Run != nil} {
+	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Compaction != nil, e.Run != nil, e.Clear != nil, e.Turn != nil} {
 		if v {
 			n++
 		}
@@ -20,8 +21,8 @@ func validateEnvelope(e Entry) error {
 		valid = e.Created != nil && e.Created.FormatVersion == FormatVersion && e.Created.SessionID != "" && e.Created.RolloutID != ""
 	case EntryConfiguration:
 		valid = e.Configuration != nil && e.Configuration.ModelID != ""
-	case EntryEnvironment:
-		valid = e.Environment != nil
+	case EntryContext:
+		valid = e.Message != nil && e.Message.ValidateContext() == nil
 	case EntryMessage:
 		valid = e.Message != nil
 		if valid {
@@ -43,13 +44,19 @@ func validateEnvelope(e Entry) error {
 			valid = e.Approval.Decision != nil
 		}
 	case EntryInputQueued, EntryInputConsumed:
-		valid = e.Input != nil && e.Input.ID != "" && (e.Input.Kind == InputSteer || e.Input.Kind == InputFollowUp)
+		valid = e.Input != nil && e.Input.ID != "" && (e.Input.Kind == InputSteer || e.Input.Kind == InputFollowUp || e.Input.Kind == InputContext)
 		if valid && e.Kind == EntryInputQueued {
-			valid = e.Input.Message != nil
-			if valid {
-				valid = validateUser(*e.Input.Message) == nil
+			valid = e.Input.Validate() == nil
+		}
+	case EntryInputCleared:
+		valid = e.Clear != nil && len(e.Clear.Kinds) > 0
+		if valid {
+			for _, k := range e.Clear.Kinds {
+				valid = valid && (k == InputSteer || k == InputFollowUp)
 			}
 		}
+	case EntryTurn:
+		valid = e.Turn != nil && e.Turn.ID != "" && e.Turn.AssistantID != "" && (e.Turn.Decision == protocol.TurnDefault || e.Turn.Decision == protocol.TurnEnd || e.Turn.Decision == protocol.TurnContinue)
 	case EntryCompaction:
 		valid = e.Compaction != nil && e.Compaction.ThroughID != "" && e.Compaction.Summary != ""
 	case EntryRun:

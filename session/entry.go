@@ -4,7 +4,6 @@ import (
 	"time"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Entry is a versioned, typed envelope. Exactly one payload matches Kind.
@@ -19,16 +18,18 @@ type Entry struct {
 	ParentID      string              `json:"parent_id,omitempty"`
 	Kind          EntryKind           `json:"kind"`
 	Time          time.Time           `json:"time"`
+	InputID       string              `json:"input_id,omitempty"`
 	RunID         string              `json:"run_id,omitempty"`
 	TurnID        string              `json:"turn_id,omitempty"`
 	Created       *CreationRecord     `json:"created,omitempty"`
 	Configuration *Configuration      `json:"configuration,omitempty"`
-	Environment   *targetenv.Snapshot `json:"environment,omitempty"`
 	Message       *protocol.Message   `json:"message,omitempty"`
 	Tool          *ToolRecord         `json:"tool,omitempty"`
 	Approval      *ApprovalRecord     `json:"approval,omitempty"`
 	Input         *InputRecord        `json:"input,omitempty"`
 	Compaction    *CompactionRecord   `json:"compaction,omitempty"`
+	Clear         *InputClear         `json:"clear,omitempty"`
+	Turn          *protocol.TurnState `json:"turn,omitempty"`
 	Run           *RunRecord          `json:"run,omitempty"`
 }
 
@@ -37,7 +38,7 @@ type EntryKind string
 const (
 	EntryCreated           EntryKind = "session_created"
 	EntryConfiguration     EntryKind = "configuration"
-	EntryEnvironment       EntryKind = "environment"
+	EntryContext           EntryKind = "context"
 	EntryMessage           EntryKind = "message"
 	EntryToolPrepared      EntryKind = "tool_prepared"
 	EntryToolAuthorized    EntryKind = "tool_authorized"
@@ -49,13 +50,15 @@ const (
 	EntryApprovalDecided   EntryKind = "approval_decided"
 	EntryInputQueued       EntryKind = "input_queued"
 	EntryInputConsumed     EntryKind = "input_consumed"
+	EntryInputCleared      EntryKind = "input_cleared"
+	EntryTurn              EntryKind = "turn"
 	EntryCompaction        EntryKind = "compaction"
 	EntryRun               EntryKind = "run"
 )
 
 func (e Entry) IsHistory() bool {
 	switch e.Kind {
-	case EntryConfiguration, EntryEnvironment, EntryMessage, EntryToolResult, EntryToolResolution, EntryCompaction:
+	case EntryConfiguration, EntryContext, EntryMessage, EntryToolResult, EntryToolResolution, EntryCompaction:
 		return true
 	default:
 		return false
@@ -90,10 +93,9 @@ type ApprovalRecord struct {
 	Decision    *ApprovalDecision `json:"decision,omitempty"`
 }
 
-type InputRecord struct {
-	ID      string            `json:"id"`
-	Kind    InputKind         `json:"kind"`
-	Message *protocol.Message `json:"message,omitempty"`
+type InputRecord = protocol.QueuedInput
+type InputClear struct {
+	Kinds []InputKind `json:"kinds"`
 }
 
 type CompactionRecord struct {
@@ -106,7 +108,8 @@ type CompactionRecord struct {
 }
 
 type RunRecord struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+	QueueOnly bool   `json:"queue_only,omitempty"`
 }

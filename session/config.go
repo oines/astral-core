@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 // Config supplies host dependencies and defaults for sessions created by an
@@ -20,7 +19,7 @@ type Config struct {
 	ResolveModel    func(context.Context, string) (protocol.Model, error)
 	BeforeToolCall  BeforeToolCall
 	AfterToolCall   protocol.AfterToolCall
-	Environment     targetenv.Provider
+	FinishTurn      protocol.FinishTurn
 	Fallback        func(context.Context, protocol.ModelFailure) (protocol.Fallback, error)
 	Retry           protocol.RetryPolicy
 	Budget          BudgetPolicy

@@ -2,13 +2,9 @@ package session
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"math"
-	"time"
 
 	protocol "github.com/oines/astral-core"
-	targetenv "github.com/oines/astral-core/environment"
 )
 
 type ForkMode uint8
@@ -19,9 +15,8 @@ const (
 )
 
 type ForkOptions struct {
-	ID          string
-	Mode        ForkMode
-	Environment *targetenv.Snapshot
+	ID   string
+	Mode ForkMode
 }
 
 type HistoryReader struct {
@@ -71,10 +66,6 @@ func (s *Session) Fork(ctx context.Context, id string, options ForkOptions) (*Se
 	}
 	request := ForkRequest{SourceID: s.id, SourceRolloutID: s.rolloutID, TargetID: options.ID, HeadID: id, Mode: options.Mode}
 	var err error
-	request.Environment, err = copyJSON(options.Environment)
-	if err != nil {
-		return nil, err
-	}
 	if err = ValidateFork(request); err != nil {
 		return nil, err
 	}
@@ -112,29 +103,9 @@ func (s *Session) Fork(ctx context.Context, id string, options ForkOptions) (*Se
 	}
 	// Admission is bounded by effective context, before any target is published.
 	seed.RolloutID = s.rolloutID
-	window, err := s.loadWindow(forkCtx, seed)
+	_, err = s.loadWindow(forkCtx, seed)
 	if err != nil {
 		return nil, err
-	}
-	if request.Environment != nil {
-		// The Store will assign the actual sequence; reserve its maximum width for
-		// admission so an explicit environment cannot publish an oversized child.
-		draft := Entry{ID: newID(), SessionID: request.TargetID, Sequence: math.MaxInt64, Version: 1, ParentID: id, Time: time.Now().UTC(), Kind: EntryEnvironment, Environment: request.Environment}
-		encoded, err := json.Marshal(draft)
-		if err != nil {
-			return nil, err
-		}
-		size := len(encoded) + 16 // reserve timestamp fractional-width differences
-		for _, entry := range window {
-			raw, err := json.Marshal(entry)
-			if err != nil {
-				return nil, err
-			}
-			size += len(raw)
-		}
-		if size > 2*s.agent.config.MaxContextBytes {
-			return nil, &BudgetError{Input: size, Window: 2 * s.agent.config.MaxContextBytes}
-		}
 	}
 	state, forkErr := s.agent.config.Store.Fork(forkCtx, request)
 	if forkErr != nil {
@@ -153,7 +124,7 @@ func (s *Session) Fork(ctx context.Context, id string, options ForkOptions) (*Se
 			return nil, forkErr
 		}
 	}
-	return s.agent.adopt(forkCtx, options.ID, state, options.Environment == nil && state.Branch.EnvironmentID != "")
+	return s.agent.adopt(forkCtx, options.ID, state)
 }
 func (s *Session) pathLocked() []Entry { return s.window }
 func (s *Session) configurationLocked() Configuration {

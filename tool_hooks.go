@@ -18,7 +18,7 @@ type ToolDecision struct {
 
 // ToolResultPatch changes presentation or the terminate hint. Nil fields keep
 // their original values; a non-nil false pointer explicitly clears a boolean.
-// Execution outcome and environment effects cannot be rewritten by this hook.
+// Execution outcome cannot be rewritten by this hook.
 type ToolResultPatch struct {
 	Content   []Content
 	Details   json.RawMessage
