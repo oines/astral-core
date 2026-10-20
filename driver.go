@@ -144,7 +144,8 @@ func (s ExecutionState) controlEnd() *RunEnd {
 }
 
 type Configuration struct {
-	SystemPrompt string           `json:"system_prompt"`
-	ModelID      string           `json:"model_id"`
-	Tools        []ToolDefinition `json:"tools,omitempty"`
+	SystemPrompt string            `json:"system_prompt"`
+	ModelID      string            `json:"model_id"`
+	Tools        []ToolDefinition  `json:"tools,omitempty"`
+	Options      GenerationOptions `json:"options,omitempty"`
 }

@@ -20,7 +20,7 @@ func validateEnvelope(e Entry) error {
 	case EntryCreated:
 		valid = e.Created != nil && e.Created.FormatVersion == FormatVersion && e.Created.SessionID != "" && e.Created.RolloutID != ""
 	case EntryConfiguration:
-		valid = e.Configuration != nil && e.Configuration.ModelID != ""
+		valid = e.Configuration != nil && e.Configuration.ModelID != "" && e.Configuration.Options.Validate() == nil
 	case EntryContext:
 		valid = e.Message != nil && e.Message.ValidateContext() == nil
 	case EntryMessage:
@@ -66,7 +66,7 @@ func validateEnvelope(e Entry) error {
 	case EntryTurn:
 		valid = e.Turn != nil && e.Turn.ID != "" && e.Turn.AssistantID != "" && (e.Turn.Decision == protocol.TurnDefault || e.Turn.Decision == protocol.TurnEnd || e.Turn.Decision == protocol.TurnContinue)
 	case EntryCompaction:
-		valid = e.Compaction != nil && e.Compaction.ThroughID != "" && e.Compaction.Summary != ""
+		valid = e.Compaction != nil && e.Compaction.ThroughID != "" && e.Compaction.Summary != "" && e.Compaction.Options.Validate() == nil
 	case EntryRun:
 		valid = e.Run != nil && e.Run.ID != "" && (e.Run.Status == "started" || e.Run.Status == "resumed" || e.Run.Status == "completed" || e.Run.Status == "failed" || e.Run.Status == "cancelled")
 	}

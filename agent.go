@@ -27,6 +27,14 @@ func New(config Config) (*Agent, error) {
 	if err := validateModelSpec(config.Model.Spec()); err != nil {
 		return nil, err
 	}
+	if err := config.Options.Validate(); err != nil {
+		return nil, err
+	}
+	options, err := copyJSON(config.Options)
+	if err != nil {
+		return nil, err
+	}
+	config.Options = options
 	if config.ID == "" {
 		config.ID = newID()
 	}
@@ -55,7 +63,7 @@ func New(config Config) (*Agent, error) {
 		return nil, fmtInvalid("invalid execution policy")
 	}
 	a := &Agent{config: config, modelID: config.Model.Spec().ID, tools: map[string]registeredTool{}}
-	configuration := Configuration{SystemPrompt: config.SystemPrompt, ModelID: a.modelID}
+	configuration := Configuration{SystemPrompt: config.SystemPrompt, ModelID: a.modelID, Options: options}
 	for _, t := range config.Tools {
 		if t == nil {
 			return nil, fmtInvalid("nil tool")

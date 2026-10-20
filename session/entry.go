@@ -102,12 +102,14 @@ type InputClear struct {
 }
 
 type CompactionRecord struct {
-	ThroughID    string         `json:"through_id"`
-	Summary      string         `json:"summary"`
-	ModelID      string         `json:"model_id"`
-	InputTokens  int            `json:"input_tokens"`
-	Usage        protocol.Usage `json:"usage,omitempty"`
-	Instructions string         `json:"instructions,omitempty"`
+	ThroughID     string                     `json:"through_id"`
+	Summary       string                     `json:"summary"`
+	ModelID       string                     `json:"model_id"`
+	ModelRevision string                     `json:"model_revision,omitempty"`
+	Options       protocol.GenerationOptions `json:"options,omitempty"`
+	InputTokens   int                        `json:"input_tokens"`
+	Usage         protocol.Usage             `json:"usage,omitempty"`
+	Instructions  string                     `json:"instructions,omitempty"`
 }
 
 type RunRecord struct {

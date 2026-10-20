@@ -137,6 +137,16 @@ SDK 只保存已观察索引、类型和可选 ToolCallID，验证它们与最�
 
 SDK 保存协议数据，不包含真实 Chat Completions / Responses 转换器或 Provider 兼容性认证。
 
+### 生成参数与版本
+
+`Request.Options` 使用 `GenerationOptions`，包括 temperature、top_p、stop、seed、惩罚项、ToolChoice、ResponseFormat、Reasoning 及按协议命名空间划分的 ProviderOptions。指针保留未指定与显式 0 / false 的区别；Reasoning.Effort 是原生字符串，不定义跨 Provider 的统一档位。Core 只验证结构和数值有效性，Provider 适配器验证实际支持的字段、值及组合。
+
+Standalone Config 与 Session Configuration 冻结参数副本；Provider 修改收到的 Request 不影响后续调用。持久配置、重开、InspectContext 和 Fork 保留选定参数。`SelectModel(ctx, id, options)` 可在运行中原子选择下一次请求的模型和参数；省略 options 保留参数，显式零值清空选项。已准备的请求不被更改。
+
+`ModelSpec.Revision` 随请求进入 `Request.ModelRevision`，由 Host 的不可变模型实例提供。Host 应以版本化 ID 解析历史配置，不能把同一 ID 悄悄指向不同限制或凭据；Core 不维护 Provider 配置库。`MaxInputTokens` 非零时，输入与安全余量还必须满足独立输入上限，即使总上下文窗口尚有空间。
+
+`CompactionPolicy.Options` 单独冻结，不隐式继承普通生成的强制工具选择或输出格式。摘要允许伴随 reasoning 块，最终仅提取文本；其他非文本输出仍会失败。成功的 CompactionRecord 保存模型版本、生成选项与 Usage。Usage.Available 区分未报告与真实 0，缓存读写及 reasoning token 数采用可选值。
+
 ## 工具阶段、结果和恢复
 
 工具声明在构造时冻结并验证 JSON Schema。默认 Draft 2020-12，允许声明内引用，拒绝外部 URL / 文件引用。恢复后实际使用的工具声明及 Version 必须与宿主实现一致。

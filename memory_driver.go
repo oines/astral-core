@@ -55,7 +55,8 @@ func (d *memoryDriver) Prepare(ctx context.Context, override string) (Model, Req
 	if err != nil {
 		return nil, Request{}, err
 	}
-	return m, Request{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Messages: messages, MaxOutputTokens: min(16384, m.Spec().MaxOutputTokens)}, nil
+	spec := m.Spec()
+	return m, Request{ModelID: c.ModelID, ModelRevision: spec.Revision, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Messages: messages, MaxOutputTokens: min(16384, spec.MaxOutputTokens), Options: c.Options}, nil
 }
 func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 	if err := ctx.Err(); err != nil {

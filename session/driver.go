@@ -53,7 +53,7 @@ func (d sessionDriver) Snapshot() protocol.ExecutionState {
 }
 func (s *Session) executionStateLocked() protocol.ExecutionState {
 	c := s.configurationLocked()
-	out := protocol.ExecutionState{ID: s.id, Configuration: protocol.Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools}, Calls: map[string]protocol.CallState{}}
+	out := protocol.ExecutionState{ID: s.id, Configuration: protocol.Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Options: c.Options}, Calls: map[string]protocol.CallState{}}
 	out.Turn = clone(s.state.Turn)
 	out.HasQueuedInputs = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
 	if s.state.LastRun != nil {

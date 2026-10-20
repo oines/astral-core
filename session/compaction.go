@@ -58,7 +58,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	keepStart := len(view.Request.Messages)
 	for i := len(groups) - 1; i >= 0; i-- {
 		keepStart = groups[i].start
-		request := protocol.Request{ModelID: normalModel.Spec().ID, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, normalModel.Spec())}
+		request := protocol.Request{ModelID: normalModel.Spec().ID, ModelRevision: normalModel.Spec().Revision, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, normalModel.Spec())}
 		count, err := estimate(ctx, normalModel, request)
 		if err != nil {
 			return CompactionRecord{}, err
@@ -123,7 +123,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 		output = 4096
 	}
 	output = outputReservation(output, summaryModel.Spec())
-	request := protocol.Request{ModelID: summaryModelID, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output}
+	request := protocol.Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.agent.config.Compaction.Options}
 	build := func(messages []protocol.Message) (protocol.Request, error) {
 		messages, err := summaryMessages(messages, sourceIDs, path, instructions)
 		if err != nil {
@@ -185,6 +185,9 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	}
 	var pieces []string
 	for _, part := range reply.Message.Content {
+		if part.Type == "reasoning" {
+			continue
+		}
 		if part.Type != "text" {
 			return CompactionRecord{}, fmtInvalid("summary contains a non-text part")
 		}
@@ -194,7 +197,7 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 	if summary == "" {
 		return CompactionRecord{}, fmtInvalid("empty summary")
 	}
-	record := CompactionRecord{ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
+	record := CompactionRecord{ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, ModelRevision: request.ModelRevision, Options: request.Options, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
 	entries := []Entry{{Kind: EntryCompaction, Compaction: &record}}
 	if _, err = s.append(ctx, entries...); err != nil {
 		return CompactionRecord{}, err

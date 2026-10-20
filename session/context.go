@@ -35,6 +35,7 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 		return Context{}, err
 	}
 	view.Request.MaxOutputTokens = outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())
+	view.Request.ModelRevision = model.Spec().Revision
 	view.EstimatedInput, err = estimate(ctx, model, view.Request)
 	return view, err
 }
@@ -47,10 +48,11 @@ func (s *Session) requestContext(ctx context.Context, model protocol.Model) (Con
 	if err != nil {
 		return Context{}, err
 	}
-	if err = s.agent.validateConfiguration(ctx, Configuration{SystemPrompt: view.Request.SystemPrompt, ModelID: model.Spec().ID, Tools: view.Request.Tools}); err != nil {
+	if err = s.agent.validateConfiguration(ctx, Configuration{SystemPrompt: view.Request.SystemPrompt, ModelID: model.Spec().ID, Tools: view.Request.Tools, Options: view.Request.Options}); err != nil {
 		return Context{}, err
 	}
 	view.Request.ModelID = model.Spec().ID
+	view.Request.ModelRevision = model.Spec().Revision
 	view.Request.MaxOutputTokens = outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())
 	view.EstimatedInput, err = checkBudget(ctx, model, view.Request, s.agent.config.Budget.SafetyMargin)
 	if err == nil {
@@ -76,7 +78,7 @@ func project(path []Entry) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	view := Context{ConfigurationID: configurationID, Request: protocol.Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools}}
+	view := Context{ConfigurationID: configurationID, Request: protocol.Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: configuration.Options}}
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
 	}

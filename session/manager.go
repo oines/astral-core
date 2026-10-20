@@ -39,6 +39,22 @@ func New(config Config) (*Manager, error) {
 	if err := validateModelSpec(spec); err != nil {
 		return nil, err
 	}
+	if err := config.Options.Validate(); err != nil {
+		return nil, err
+	}
+	options, err := copyJSON(config.Options)
+	if err != nil {
+		return nil, err
+	}
+	config.Options = options
+	if err := config.Compaction.Options.Validate(); err != nil {
+		return nil, err
+	}
+	compactionOptions, err := copyJSON(config.Compaction.Options)
+	if err != nil {
+		return nil, err
+	}
+	config.Compaction.Options = compactionOptions
 	if config.Retry.MaxAttempts == 0 {
 		config.Retry.MaxAttempts = 3
 	}
@@ -76,7 +92,7 @@ func New(config Config) (*Manager, error) {
 		config.Compaction.SystemPrompt = defaultSummaryPrompt
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	a := &Manager{config: config, modelID: spec.ID, tools: map[string]registeredTool{}, sessions: map[string]*Session{}, defaults: Configuration{SystemPrompt: config.SystemPrompt, ModelID: spec.ID}, lifetime: lifetime, stopLifetime: cancel}
+	a := &Manager{config: config, modelID: spec.ID, tools: map[string]registeredTool{}, sessions: map[string]*Session{}, defaults: Configuration{SystemPrompt: config.SystemPrompt, ModelID: spec.ID, Options: options}, lifetime: lifetime, stopLifetime: cancel}
 	for _, tool := range config.Tools {
 		if tool == nil {
 			return nil, fmtInvalid("nil tool")

@@ -65,7 +65,7 @@ func validateReply(reply protocol.Reply) error {
 	return validateMessage(reply.Message)
 }
 func validateModelSpec(spec protocol.ModelSpec) error {
-	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 {
+	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 || spec.MaxInputTokens < 0 {
 		return fmtInvalid("model needs a stable ID and positive token limits")
 	}
 	return nil

@@ -27,16 +27,20 @@ type ModelFunc struct {
 
 type ModelSpec struct {
 	ID              string `json:"id"`
+	Revision        string `json:"revision,omitempty"`
 	ContextWindow   int    `json:"context_window"`
+	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
 	MaxOutputTokens int    `json:"max_output_tokens"`
 }
 
 type Request struct {
-	ModelID         string           `json:"model_id"`
-	SystemPrompt    string           `json:"system_prompt"`
-	Messages        []Message        `json:"messages"`
-	Tools           []ToolDefinition `json:"tools,omitempty"`
-	MaxOutputTokens int              `json:"max_output_tokens"`
+	ModelID         string            `json:"model_id"`
+	ModelRevision   string            `json:"model_revision,omitempty"`
+	SystemPrompt    string            `json:"system_prompt"`
+	Messages        []Message         `json:"messages"`
+	Tools           []ToolDefinition  `json:"tools,omitempty"`
+	MaxOutputTokens int               `json:"max_output_tokens"`
+	Options         GenerationOptions `json:"options,omitempty"`
 }
 
 type Reply struct {
@@ -47,6 +51,11 @@ type Reply struct {
 type Usage struct {
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
+	// Available distinguishes a provider's reported zero usage from no report.
+	Available         bool `json:"available,omitempty"`
+	CachedInputTokens *int `json:"cached_input_tokens,omitempty"`
+	CacheWriteTokens  *int `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens   *int `json:"reasoning_tokens,omitempty"`
 }
 
 type FinishReason string
@@ -93,7 +102,7 @@ func (m ModelFunc) Stream(ctx context.Context, request Request, emit func(ModelE
 }
 
 func validateModelSpec(spec ModelSpec) error {
-	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 {
+	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 || spec.MaxInputTokens < 0 {
 		return fmtInvalid("model needs a stable ID and positive token limits")
 	}
 	return nil

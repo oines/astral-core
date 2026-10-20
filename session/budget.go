@@ -40,6 +40,9 @@ func checkBudget(ctx context.Context, model protocol.Model, request protocol.Req
 		return 0, err
 	}
 	spec := model.Spec()
+	if spec.MaxInputTokens > 0 && (margin > spec.MaxInputTokens || tokens > spec.MaxInputTokens-margin) {
+		return tokens, &BudgetError{Input: tokens, Margin: margin, Window: spec.MaxInputTokens}
+	}
 	// Subtraction avoids integer overflow for hostile or broken estimators.
 	if request.MaxOutputTokens > spec.ContextWindow || margin > spec.ContextWindow-request.MaxOutputTokens || tokens > spec.ContextWindow-request.MaxOutputTokens-margin {
 		return tokens, &BudgetError{Input: tokens, Output: request.MaxOutputTokens, Margin: margin, Window: spec.ContextWindow}

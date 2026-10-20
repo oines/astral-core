@@ -15,6 +15,7 @@ type Config struct {
 	Model           protocol.Model
 	Store           Store
 	SystemPrompt    string
+	Options         protocol.GenerationOptions
 	Tools           []protocol.Tool
 	ResolveModel    func(context.Context, string) (protocol.Model, error)
 	BeforeToolCall  BeforeToolCall
@@ -35,9 +36,10 @@ type Config struct {
 
 // Configuration is the immutable effective configuration recorded in a branch.
 type Configuration struct {
-	SystemPrompt string                    `json:"system_prompt"`
-	ModelID      string                    `json:"model_id"`
-	Tools        []protocol.ToolDefinition `json:"tools,omitempty"`
+	SystemPrompt string                     `json:"system_prompt"`
+	ModelID      string                     `json:"model_id"`
+	Tools        []protocol.ToolDefinition  `json:"tools,omitempty"`
+	Options      protocol.GenerationOptions `json:"options,omitempty"`
 }
 
 type BudgetPolicy struct {
@@ -53,9 +55,15 @@ type CompactionPolicy struct {
 	SystemPrompt     string
 	OutputTokens     int
 	KeepRecentTokens int
+	// Options is independent of normal generation (for example, a required
+	// tool choice or structured reply format must not constrain the summary).
+	Options protocol.GenerationOptions
 }
 
 func (a *Manager) validateConfiguration(ctx context.Context, c Configuration) error {
+	if err := c.Options.Validate(); err != nil {
+		return err
+	}
 	if _, err := a.model(ctx, c.ModelID); err != nil {
 		return err
 	}
@@ -107,9 +115,25 @@ func (s *Session) Configure(ctx context.Context, configuration Configuration) er
 
 // SelectModel is safe during an active run. Already prepared requests retain
 // their model; the next request resolves the newly committed configuration.
-func (s *Session) SelectModel(ctx context.Context, id string) error {
+// When supplied, options atomically replaces the generation selection with the
+// model. Omission preserves it; an explicit zero value restores API defaults.
+func (s *Session) SelectModel(ctx context.Context, id string, options ...protocol.GenerationOptions) error {
 	if err := s.agent.checkOpen(); err != nil {
 		return err
+	}
+	if len(options) > 1 {
+		return fmtInvalid("at most one generation options value is allowed")
+	}
+	var selected protocol.GenerationOptions
+	if len(options) == 1 {
+		if err := options[0].Validate(); err != nil {
+			return err
+		}
+		var err error
+		selected, err = copyJSON(options[0])
+		if err != nil {
+			return err
+		}
 	}
 	if _, err := s.agent.model(ctx, id); err != nil {
 		return err
@@ -124,6 +148,9 @@ func (s *Session) SelectModel(ctx context.Context, id string) error {
 	}
 	configuration := s.configurationLocked()
 	configuration.ModelID = id
+	if len(options) == 1 {
+		configuration.Options = selected
+	}
 	_, err := s.appendLocked(ctx, Entry{Kind: EntryConfiguration, Configuration: &configuration})
 	return err
 }

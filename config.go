@@ -11,6 +11,7 @@ type Config struct {
 	ID               string
 	Model            Model
 	SystemPrompt     string
+	Options          GenerationOptions
 	Tools            []Tool
 	ResolveModel     func(context.Context, string) (Model, error)
 	BeforeToolCall   BeforeToolCall
