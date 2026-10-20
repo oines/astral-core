@@ -68,6 +68,8 @@ const (
 	TransitionSelectModel    TransitionKind = "select_model"
 	TransitionTurnStart      TransitionKind = "turn_start"
 	TransitionTurnDecision   TransitionKind = "turn_decision"
+	TransitionModelRequest   TransitionKind = "model_request"
+	TransitionModelResponse  TransitionKind = "model_response"
 )
 
 // Transition describes an execution fact. IDs are assigned before Commit and
@@ -86,6 +88,8 @@ type Transition struct {
 	Contexts          []Message
 	SyntheticResults  []ToolCompletion
 	Turn              *TurnState
+	ModelRequest      *ModelRequestRecord
+	ModelResponse     *ModelResponseRecord
 }
 
 // ToolCompletion records a synthetic, unexecuted result in the same commit as

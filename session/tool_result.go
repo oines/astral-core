@@ -34,7 +34,7 @@ func (s *Session) boundResult(ctx context.Context, inv protocol.Invocation, resu
 	if err != nil {
 		return deliveryFailure(result, "result_delivery_failed", err.Error()), err
 	}
-	request := protocol.Request{ModelID: model.Spec().ID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())}
+	request := protocol.Request{ModelID: model.Spec().ID, ModelRevision: model.Spec().Revision, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: configuration.Options, MaxOutputTokens: outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())}
 	// Keep all declarations/calls and valid placeholder results; old conversation
 	// messages are deliberately excluded when deciding whether one result alone
 	// is impossible to deliver. Aggregate pressure is handled by compaction.
@@ -47,7 +47,10 @@ func (s *Session) boundResult(ctx context.Context, inv protocol.Invocation, resu
 		}
 		request.Messages = append(request.Messages, message)
 	}
-	_, err = checkBudget(ctx, model, request, s.agent.config.Budget.SafetyMargin)
+	request, err = protocol.PrepareRequest(ctx, model, request)
+	if err == nil {
+		_, err = checkBudget(ctx, model, request, s.agent.config.Budget.SafetyMargin)
+	}
 	if errors.Is(err, ErrBudget) {
 		return deliveryFailure(result, "result_too_large", "The output exceeds the model's delivery budget."), nil
 	}

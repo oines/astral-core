@@ -7,7 +7,7 @@ import (
 
 func validateEnvelope(e Entry) error {
 	n := 0
-	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Compaction != nil, e.Run != nil, e.Clear != nil, e.Turn != nil} {
+	for _, v := range []bool{e.Created != nil, e.Configuration != nil, e.Message != nil, e.Tool != nil, e.Approval != nil, e.Input != nil, e.Compaction != nil, e.Run != nil, e.Clear != nil, e.Turn != nil, e.ModelRequest != nil, e.ModelResponse != nil} {
 		if v {
 			n++
 		}
@@ -18,7 +18,16 @@ func validateEnvelope(e Entry) error {
 	valid := false
 	switch e.Kind {
 	case EntryCreated:
-		valid = e.Created != nil && e.Created.FormatVersion == FormatVersion && e.Created.SessionID != "" && e.Created.RolloutID != ""
+		valid = e.Created != nil && SupportsFormat(e.Created.FormatVersion) && e.Created.SessionID != "" && e.Created.RolloutID != ""
+	case EntryModelRequest:
+		valid = e.ModelRequest != nil && e.ModelRequest.AttemptID != "" &&
+			(e.ModelRequest.Purpose == "generation" || e.ModelRequest.Purpose == "compaction") &&
+			e.ModelRequest.Request.ModelID != "" && e.ModelRequest.Request.Options.Validate() == nil
+	case EntryModelResponse:
+		// Failed attempts may contain incomplete or invalid replies. Preserve them
+		// as diagnostic facts without admitting them into executable history.
+		valid = e.ModelResponse != nil && e.ModelResponse.AttemptID != "" &&
+			(e.ModelResponse.Purpose == "generation" || e.ModelResponse.Purpose == "compaction")
 	case EntryConfiguration:
 		valid = e.Configuration != nil && e.Configuration.ModelID != "" && e.Configuration.Options.Validate() == nil
 	case EntryContext:

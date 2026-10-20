@@ -36,6 +36,10 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 	}
 	view.Request.MaxOutputTokens = outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())
 	view.Request.ModelRevision = model.Spec().Revision
+	view.Request, err = protocol.PrepareRequest(ctx, model, view.Request)
+	if err != nil {
+		return Context{}, err
+	}
 	view.EstimatedInput, err = estimate(ctx, model, view.Request)
 	return view, err
 }
@@ -54,6 +58,10 @@ func (s *Session) requestContext(ctx context.Context, model protocol.Model) (Con
 	view.Request.ModelID = model.Spec().ID
 	view.Request.ModelRevision = model.Spec().Revision
 	view.Request.MaxOutputTokens = outputReservation(s.agent.config.Budget.OutputTokens, model.Spec())
+	view.Request, err = protocol.PrepareRequest(ctx, model, view.Request)
+	if err != nil {
+		return Context{}, err
+	}
 	view.EstimatedInput, err = checkBudget(ctx, model, view.Request, s.agent.config.Budget.SafetyMargin)
 	if err == nil {
 		raw, encodeErr := json.Marshal(view.Request)

@@ -542,7 +542,10 @@ func TestCompactionRejectsInvalidStreamReferences(t *testing.T) {
 	if _, err := s.Compact(context.Background(), ""); !errors.Is(err, astral.ErrInvalid) {
 		t.Fatalf("invalid summary stream committed: %v", err)
 	}
-	if !reflect.DeepEqual(before, s.State()) {
+	if !reflect.DeepEqual(before.Branch, s.State().Branch) {
 		t.Fatal("failed stream advanced the compaction checkpoint")
+	}
+	if s.State().Version != before.Version+2 {
+		t.Fatal("failed summarizer attempt was not recorded")
 	}
 }

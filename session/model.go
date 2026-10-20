@@ -36,3 +36,7 @@ type estimatedModel struct {
 	protocol.Model
 	estimate TokenEstimator
 }
+
+func (m estimatedModel) PrepareRequest(ctx context.Context, request protocol.Request) (protocol.Request, error) {
+	return protocol.PrepareRequest(ctx, m.Model, request)
+}

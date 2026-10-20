@@ -206,8 +206,8 @@ func TestCompactionKeepsNativeInputAndSummarizesContextNormally(t *testing.T) {
 	if record.Summary != "summary of completed work" {
 		t.Fatal("wrong summary")
 	}
-	if after.Version != before.Version+1 {
-		t.Fatalf("checkpoint/environment were not one commit: %d -> %d", before.Version, after.Version)
+	if after.Version != before.Version+3 {
+		t.Fatalf("request, response and checkpoint commits missing: %d -> %d", before.Version, after.Version)
 	}
 	if after.Entries[len(after.Entries)-1].Kind != sessions.EntryCompaction {
 		t.Fatal("unexpected context reassertion")

@@ -338,9 +338,9 @@ func TestVersionFiveUpgradeDoesNotMigrateData(t *testing.T) {
 	}
 }
 
-func TestVersionSixMarkersAgreeWithRuntimeState(t *testing.T) {
-	if sessions.FormatVersion != 6 {
-		t.Fatalf("tool control format must be version 6, got %d", sessions.FormatVersion)
+func TestCurrentFormatMarkersAgreeWithRuntimeState(t *testing.T) {
+	if sessions.FormatVersion != 7 {
+		t.Fatalf("tool control format must be version 7, got %d", sessions.FormatVersion)
 	}
 	for _, backend := range []string{"jsonl", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
@@ -351,8 +351,8 @@ func TestVersionSixMarkersAgreeWithRuntimeState(t *testing.T) {
 			})
 			a := newAgent(t, testConfig(m, store))
 			s := newSession(t, a, sessions.SessionOptions{})
-			if s.State().FormatVersion != 6 || s.State().Creation.FormatVersion != 6 {
-				t.Fatal("runtime state and creation did not adopt V6")
+			if s.State().FormatVersion != sessions.FormatVersion || s.State().Creation.FormatVersion != sessions.FormatVersion {
+				t.Fatal("runtime state and creation did not adopt the current format")
 			}
 			if err := a.Close(context.Background()); err != nil {
 				t.Fatal(err)
@@ -363,13 +363,13 @@ func TestVersionSixMarkersAgreeWithRuntimeState(t *testing.T) {
 				var marker struct {
 					Format int `json:"format_version"`
 				}
-				if err != nil || json.Unmarshal(data, &marker) != nil || marker.Format != 6 {
+				if err != nil || json.Unmarshal(data, &marker) != nil || marker.Format != sessions.FormatVersion {
 					t.Fatalf("JSONL marker: %s %v", data, err)
 				}
 				sum := sha256.Sum256([]byte(s.RolloutID()))
 				data, err = os.ReadFile(filepath.Join(dir, "journal", hex.EncodeToString(sum[:])+".jsonl"))
 				first := bytes.SplitN(data, []byte("\n"), 2)[0]
-				if err != nil || json.Unmarshal(first, &marker) != nil || marker.Format != 6 {
+				if err != nil || json.Unmarshal(first, &marker) != nil || marker.Format != sessions.FormatVersion {
 					t.Fatalf("JSONL rollout header: %s %v", first, err)
 				}
 			} else {
@@ -382,7 +382,7 @@ func TestVersionSixMarkersAgreeWithRuntimeState(t *testing.T) {
 				if err := db.QueryRow("SELECT version FROM format").Scan(&format); err != nil {
 					t.Fatal(err)
 				}
-				if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != 6 || userVersion != 6 {
+				if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != sessions.FormatVersion || userVersion != sessions.FormatVersion {
 					t.Fatalf("SQLite markers: format=%d user_version=%d %v", format, userVersion, err)
 				}
 			}

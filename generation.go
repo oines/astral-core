@@ -78,6 +78,10 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (adopted 
 			lastModel = model.Spec().ID
 			attemptID = newID()
 			lastAttempt = attemptID
+			record := ModelRequestRecord{AttemptID: attemptID, Purpose: "generation", Request: request}
+			if err := a.driver.Commit(ctx, Transition{Kind: TransitionModelRequest, ID: newID(), RunID: run.id, TurnID: turnID, ModelRequest: &record}); err != nil {
+				return Frame{}, retry.Decision{}, err
+			}
 			if !started {
 				a.Publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID})
 				started = true
@@ -106,6 +110,16 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (adopted 
 			}
 			if streamErr == nil {
 				streamErr = ctx.Err()
+			}
+			response := ModelResponseRecord{AttemptID: attemptID, Purpose: "generation", Reply: reply}
+			if streamErr != nil {
+				response.Error = streamErr.Error()
+			}
+			cleanup, finish := persistContext(ctx)
+			recordErr := a.driver.Commit(cleanup, Transition{Kind: TransitionModelResponse, ID: newID(), RunID: run.id, TurnID: turnID, ModelResponse: &response})
+			finish()
+			if recordErr != nil {
+				return Frame{}, retry.Decision{}, errors.Join(streamErr, recordErr)
 			}
 			if streamErr == nil {
 				frame := Frame{ID: messageID, TurnID: turnID, Message: reply.Message}

@@ -142,6 +142,12 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 	e := Entry{ID: t.ID, RunID: t.RunID, TurnID: t.TurnID}
 	var entries []Entry
 	switch t.Kind {
+	case protocol.TransitionModelRequest:
+		e.Kind, e.ModelRequest = EntryModelRequest, t.ModelRequest
+		entries = append(entries, e)
+	case protocol.TransitionModelResponse:
+		e.Kind, e.ModelResponse = EntryModelResponse, t.ModelResponse
+		entries = append(entries, e)
 	case protocol.TransitionRunStart:
 		if !s.maintenance || s.maintenanceContext == nil {
 			return protocol.ErrBusy

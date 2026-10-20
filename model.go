@@ -19,6 +19,62 @@ type Model interface {
 	Stream(context.Context, Request, func(ModelEvent)) (Reply, error)
 }
 
+// RequestPreparer freezes host context before estimation, persistence and
+// generation. Stream must use that snapshot, without resolving mutable files
+// or appending live environment data. Preparation may run for inspection or
+// budgeting without a subsequent model call and must have no external effects.
+type RequestPreparer interface {
+	PrepareRequest(context.Context, Request) (Request, error)
+}
+
+// PrepareRequest owns both sides of the optional preparation boundary.
+func PrepareRequest(ctx context.Context, model Model, request Request) (out Request, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("model request preparation panicked: %v", p)
+		}
+	}()
+	out, err = copyJSON(request)
+	if err != nil {
+		return Request{}, err
+	}
+	if preparer, ok := model.(RequestPreparer); ok {
+		out, err = preparer.PrepareRequest(ctx, out)
+		if err != nil {
+			return Request{}, err
+		}
+	}
+	if out.ModelID != request.ModelID || out.ModelRevision != request.ModelRevision ||
+		out.MaxOutputTokens != request.MaxOutputTokens || !sameJSON(out.Tools, request.Tools) ||
+		!sameJSON(out.Options, request.Options) {
+		return Request{}, fmtInvalid("request preparation changed model configuration")
+	}
+	if err = out.Options.Validate(); err != nil {
+		return Request{}, err
+	}
+	for _, message := range out.Messages {
+		if err = validateMessage(message); err != nil {
+			return Request{}, err
+		}
+	}
+	return copyJSON(out)
+}
+
+// ModelRequestRecord and ModelResponseRecord are operational rollout facts.
+// They are never added to the conversation or replayed as additional messages.
+type ModelRequestRecord struct {
+	AttemptID string  `json:"attempt_id"`
+	Purpose   string  `json:"purpose"`
+	Request   Request `json:"request"`
+}
+
+type ModelResponseRecord struct {
+	AttemptID string `json:"attempt_id"`
+	Purpose   string `json:"purpose"`
+	Reply     Reply  `json:"reply"`
+	Error     string `json:"error,omitempty"`
+}
+
 // ModelFunc adapts host functions without a provider-specific SDK dependency.
 type ModelFunc struct {
 	Specification ModelSpec

@@ -335,9 +335,9 @@ func TestSQLiteOpenReadsOnlyActiveContext(t *testing.T) {
 	}
 	waitOK(t, run)
 	// The actual executor's preparation (including budget checks) causes no
-	// history reads either: only the four new commits read current state.
-	if rows := st.Stats().RowsRead - before.RowsRead; rows != 4 {
-		t.Fatalf("full run read %d rows, want 4 current-state reads", rows)
+	// history reads either: six commits (including request/response) read state.
+	if rows := st.Stats().RowsRead - before.RowsRead; rows != 6 {
+		t.Fatalf("full run read %d rows, want 6 current-state reads", rows)
 	}
 }
 

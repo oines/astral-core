@@ -56,7 +56,8 @@ func (d *memoryDriver) Prepare(ctx context.Context, override string) (Model, Req
 		return nil, Request{}, err
 	}
 	spec := m.Spec()
-	return m, Request{ModelID: c.ModelID, ModelRevision: spec.Revision, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Messages: messages, MaxOutputTokens: min(16384, spec.MaxOutputTokens), Options: c.Options}, nil
+	request, err := PrepareRequest(ctx, m, Request{ModelID: c.ModelID, ModelRevision: spec.Revision, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Messages: messages, MaxOutputTokens: min(16384, spec.MaxOutputTokens), Options: c.Options})
+	return m, request, err
 }
 func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 	if err := ctx.Err(); err != nil {
@@ -65,6 +66,9 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch t.Kind {
+	case TransitionModelRequest, TransitionModelResponse:
+		// Standalone execution has no durable rollout.
+		return nil
 	case TransitionRunStart:
 		queueOnly := t.Message == nil && d.state.Last != nil && d.state.Last.Message.Role == RoleUser && d.state.LastRunStatus == "cancelled"
 		for _, s := range d.state.Calls {

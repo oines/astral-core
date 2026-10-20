@@ -336,7 +336,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 					version = e.Version
 					consumed = append(consumed, e.Input.ID)
 				}
-				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 6 {
+				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != sessions.FormatVersion {
 					t.Fatal("consumed IDs or V6 state changed during recovery")
 				}
 			})

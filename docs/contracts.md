@@ -39,7 +39,11 @@ type Store interface {
 }
 ```
 
-格式版本为 6。V6 增加工具终止控制、内部未决执行、Run.EndReason 及 Projection.ToolEntries，保存独立 Context、关联投递组、Assistant 终止状态、队列清理与 Turn 决策。V5 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供迁移或旧接口适配层。
+格式版本为 7。V7 增加 `model_request` / `model_response` 运行事实；V6 历史和存储容器仍可读取，写入新类型时 RuntimeState 升为 V7，原始 Creation 与历史记录保持不变。V5 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成。
+
+每次普通生成或摘要请求都有独立 AttemptID。完整 Request 在 Provider 调用前确认；完整 Reply 与错误在采用回复、执行工具或重试前确认。保存失败阻止依赖动作，保存失败本身不触发模型重试。请求包含实际选定的 ModelRevision、参数、系统提示词、工具声明和有序多模态内容；失败响应允许保留不完整内容，但不成为可执行消息。这些记录不改变 Head、不进入上下文窗口，历史查询可以按类型读取。
+
+模型可实现 `RequestPreparer.PrepareRequest`，将动态环境与媒体冻结到 Request。Core 对入参和返回值都取得独立副本，在估算预算、保存请求、调用 Stream 之间使用同一份快照。准备阶段可能仅用于 InspectContext 或预算检查，必须无外部副作用，不能改动模型身份、参数或工具声明。Stream 不得再次读取可变附件或追加实时环境；宿主应在输入接收时就冻结多模态 payload，以便后续重放无需源文件。Core 记录标准化 Model 请求与回复；Provider 的确定性线缆编码仍属于适配器。
 
 `Get` / `Scan` 的第一个字符串参数是 **RolloutID**。`LoadState` / `Pending` / `Commit` / `LookupCommit` 的第一个字符串参数是 **SessionID**；SessionID 在 Store 内唯一。
 
@@ -72,7 +76,7 @@ rollouts 保存状态与顺序计数；entries 按 Rollout / ID、Rollout / Sequ
 
 ### JSONL 与 Memory
 
-JSONL 目录包含版本 6 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 6 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 6，RuntimeState 与创建记录也使用 6。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
+新 JSONL 目录的 format.json 与 Rollout 日志头使用版本 7；Rollout 使用其 ID 的 SHA-256 文件名和带 SHA-256 校验和的批次。新 SQLite 的 format 表与 user_version 同为 7，新 RuntimeState 与创建记录也使用 7。原 V6 容器头仍可读取。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
 
 未以换行结束的最后一行视为未提交尾部，读取忽略它，下一次 Commit 仅截去这段。完整行损坏、校验和失败或非法状态转换返回 ErrCorrupt，不自动修复已提交历史。确认恢复在采用新读到的完整提交前执行同步。
 

@@ -7,5 +7,5 @@
 // reads; Memory and JSONL provide the same execution contract with in-memory
 // historical indexes. A host must establish one execution owner per Session.
 // Close cancels and joins owned work but never closes host models, stores or
-// tool runtimes. Format version 6 deliberately has no legacy migration layer.
+// tool runtimes. Format version 7 reads v6 records and adds model-attempt snapshots.
 package session

@@ -182,7 +182,9 @@ Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，�
 
 流式 `text_delta`、`reasoning_delta` 和 `tool_call_delta` 使用 `content_index` 对应最终 Content 数组；事件按 AttemptID 区分重试。增量用于展示，完整回复提交成功后才派发工具。协议细节见 [宿主契约](docs/contracts.md)。
 
-当前 Rollout 格式为 **6**。V5 及更早的持久数据会被明确拒绝并保持原样，不提供旧接口适配或 Session 迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
+每次模型调用先保存 `model_request`，再调用 Provider；`model_response` 保存完整返回和失败信息。记录包含已冻结的环境与多模态数据，属于运行事实，不会再次塞入对话。宿主可通过 `RequestPreparer` 在估算和提交前冻结动态上下文。
+
+当前 Rollout 格式为 **7**，可以继续读取 V6 历史，原记录不改写。V5 及更早的持久数据会被明确拒绝并保持原样。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
 
 ## 上下文与执行控制分开
 

@@ -99,7 +99,7 @@ func checkFormat(dir string) error {
 	b, err := os.ReadFile(name)
 	if err == nil {
 		var h header
-		if json.Unmarshal(b, &h) != nil || h.Format != s.FormatVersion {
+		if json.Unmarshal(b, &h) != nil || !s.SupportsFormat(h.Format) {
 			return s.ErrUnsupportedFormat
 		}
 		return nil
@@ -204,7 +204,7 @@ func (st *Store) refreshAll(ctx context.Context) error {
 			}
 			line, e := bufio.NewReader(f).ReadBytes('\n')
 			var h header
-			if e != nil || json.Unmarshal(line, &h) != nil || h.Format != s.FormatVersion {
+			if e != nil || json.Unmarshal(line, &h) != nil || !s.SupportsFormat(h.Format) {
 				f.Close()
 				return s.ErrUnsupportedFormat
 			}
@@ -255,7 +255,7 @@ func (st *Store) refresh(ctx context.Context, id string, c *cached) error {
 		}
 		if !c.header {
 			var h header
-			if json.Unmarshal(line, &h) != nil || h.Format != s.FormatVersion {
+			if json.Unmarshal(line, &h) != nil || !s.SupportsFormat(h.Format) {
 				return s.ErrUnsupportedFormat
 			}
 			if h.RolloutID != id {

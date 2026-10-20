@@ -123,17 +123,17 @@ func (s *Session) compact(ctx context.Context, instructions string, normalModel 
 		output = 4096
 	}
 	output = outputReservation(output, summaryModel.Spec())
-	request := protocol.Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.agent.config.Compaction.Options}
+	baseRequest := protocol.Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.agent.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.agent.config.Compaction.Options}
 	build := func(messages []protocol.Message) (protocol.Request, error) {
 		messages, err := summaryMessages(messages, sourceIDs, path, instructions)
 		if err != nil {
 			return protocol.Request{}, err
 		}
-		candidate := request
+		candidate := baseRequest
 		candidate.Messages = messages
-		return candidate, nil
+		return protocol.PrepareRequest(ctx, summaryModel, candidate)
 	}
-	request, err = build(selected)
+	request, err := build(selected)
 	if err != nil {
 		return CompactionRecord{}, err
 	}

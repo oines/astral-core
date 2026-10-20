@@ -57,7 +57,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 	if c.ID == "" || len(c.Entries) == 0 || c.ExpectedVersion != previous.Version {
 		return RuntimeState{}, nil, ErrConflict
 	}
-	if previous.Version > 0 && previous.FormatVersion != FormatVersion {
+	if previous.Version > 0 && !SupportsFormat(previous.FormatVersion) {
 		return RuntimeState{}, nil, ErrUnsupportedFormat
 	}
 	state, err := copyJSON(previous)
@@ -81,10 +81,10 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 		ids[e.ID] = true
 		lastSequence = e.Sequence
 		if previous.Version == 0 && len(records) == 0 {
-			if e.Kind != EntryCreated || e.Created.FormatVersion != FormatVersion {
+			if e.Kind != EntryCreated || !SupportsFormat(e.Created.FormatVersion) {
 				return RuntimeState{}, nil, ErrUnsupportedFormat
 			}
-			state.FormatVersion = FormatVersion
+			state.FormatVersion = e.Created.FormatVersion
 			state.SessionID = e.Created.SessionID
 			state.RolloutID = e.Created.RolloutID
 			if e.Created.Projection != nil {
@@ -112,6 +112,8 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			return RuntimeState{}, nil, fmt.Errorf("%w: operational parent", ErrCorrupt)
 		}
 		switch e.Kind {
+		case EntryModelRequest, EntryModelResponse:
+			state.FormatVersion = FormatVersion
 		case EntryConfiguration:
 			state.Branch.ConfigurationID = e.ID
 		case EntryContext:

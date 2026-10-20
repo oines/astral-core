@@ -51,6 +51,10 @@ func (s *Session) summarize(ctx context.Context, model protocol.Model, request p
 	p := s.agent.config.Retry
 	return retry.Do(ctx, retry.Policy{Attempts: p.MaxAttempts, Initial: p.InitialBackoff, Maximum: p.MaxBackoff}, func(int) (protocol.Reply, retry.Decision, error) {
 		attemptID := newID()
+		record := protocol.ModelRequestRecord{AttemptID: attemptID, Purpose: "compaction", Request: request}
+		if _, err := s.append(ctx, Entry{Kind: EntryModelRequest, ModelRequest: &record}); err != nil {
+			return protocol.Reply{}, retry.Decision{}, err
+		}
 		requestCtx := ctx
 		cancel := func() {}
 		if p.RequestTimeout > 0 {
@@ -67,6 +71,16 @@ func (s *Session) summarize(ctx context.Context, model protocol.Model, request p
 		}
 		if err == nil {
 			err = ctx.Err()
+		}
+		response := protocol.ModelResponseRecord{AttemptID: attemptID, Purpose: "compaction", Reply: reply}
+		if err != nil {
+			response.Error = err.Error()
+		}
+		cleanup, finish := persistContext(ctx)
+		_, recordErr := s.append(cleanup, Entry{Kind: EntryModelResponse, ModelResponse: &response})
+		finish()
+		if recordErr != nil {
+			return protocol.Reply{}, retry.Decision{}, errors.Join(err, recordErr)
 		}
 		if err == nil {
 			return reply, retry.Decision{}, nil

@@ -9,7 +9,12 @@ import (
 	"math"
 )
 
-const FormatVersion = 6
+const FormatVersion = 7
+
+// SupportsFormat includes v6, whose records remain readable without rewriting
+// history. V7 adds operational model-attempt snapshots.
+func SupportsFormat(version int) bool { return version == 6 || version == FormatVersion }
+
 const ForkCommitID = "session-fork-created"
 const DefaultPageSize = 256
 const DefaultPageBytes = 4 << 20

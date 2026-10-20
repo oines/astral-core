@@ -10,27 +10,29 @@ import (
 // History entries form the parent tree. Operational facts reference their
 // invocation or queue item instead of changing that tree's parent relation.
 type Entry struct {
-	SessionID     string              `json:"session_id"`
-	Sequence      uint64              `json:"sequence"`
-	Version       uint64              `json:"version"`
-	Usage         protocol.Usage      `json:"usage,omitempty"`
-	ID            string              `json:"id"`
-	ParentID      string              `json:"parent_id,omitempty"`
-	Kind          EntryKind           `json:"kind"`
-	Time          time.Time           `json:"time"`
-	InputID       string              `json:"input_id,omitempty"`
-	RunID         string              `json:"run_id,omitempty"`
-	TurnID        string              `json:"turn_id,omitempty"`
-	Created       *CreationRecord     `json:"created,omitempty"`
-	Configuration *Configuration      `json:"configuration,omitempty"`
-	Message       *protocol.Message   `json:"message,omitempty"`
-	Tool          *ToolRecord         `json:"tool,omitempty"`
-	Approval      *ApprovalRecord     `json:"approval,omitempty"`
-	Input         *InputRecord        `json:"input,omitempty"`
-	Compaction    *CompactionRecord   `json:"compaction,omitempty"`
-	Clear         *InputClear         `json:"clear,omitempty"`
-	Turn          *protocol.TurnState `json:"turn,omitempty"`
-	Run           *RunRecord          `json:"run,omitempty"`
+	SessionID     string                        `json:"session_id"`
+	Sequence      uint64                        `json:"sequence"`
+	Version       uint64                        `json:"version"`
+	Usage         protocol.Usage                `json:"usage,omitempty"`
+	ID            string                        `json:"id"`
+	ParentID      string                        `json:"parent_id,omitempty"`
+	Kind          EntryKind                     `json:"kind"`
+	Time          time.Time                     `json:"time"`
+	InputID       string                        `json:"input_id,omitempty"`
+	RunID         string                        `json:"run_id,omitempty"`
+	TurnID        string                        `json:"turn_id,omitempty"`
+	Created       *CreationRecord               `json:"created,omitempty"`
+	Configuration *Configuration                `json:"configuration,omitempty"`
+	Message       *protocol.Message             `json:"message,omitempty"`
+	Tool          *ToolRecord                   `json:"tool,omitempty"`
+	Approval      *ApprovalRecord               `json:"approval,omitempty"`
+	Input         *InputRecord                  `json:"input,omitempty"`
+	Compaction    *CompactionRecord             `json:"compaction,omitempty"`
+	Clear         *InputClear                   `json:"clear,omitempty"`
+	Turn          *protocol.TurnState           `json:"turn,omitempty"`
+	Run           *RunRecord                    `json:"run,omitempty"`
+	ModelRequest  *protocol.ModelRequestRecord  `json:"model_request,omitempty"`
+	ModelResponse *protocol.ModelResponseRecord `json:"model_response,omitempty"`
 }
 
 type EntryKind string
@@ -56,6 +58,8 @@ const (
 	EntryTurn              EntryKind = "turn"
 	EntryCompaction        EntryKind = "compaction"
 	EntryRun               EntryKind = "run"
+	EntryModelRequest      EntryKind = "model_request"
+	EntryModelResponse     EntryKind = "model_response"
 )
 
 func (e Entry) IsHistory() bool {
