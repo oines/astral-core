@@ -32,6 +32,7 @@ cd astral-core
 go run ./examples/basic        # 一次模型 → 工具 → 模型的完整循环
 go run ./examples/approval     # 持久审批与会话恢复
 go run ./examples/fork         # 从历史节点创建新 Session
+go run ./examples/endrun       # Host 工具无结果地结束 Run
 ```
 
 还可以运行两个使用真实文件和 Shell 的示例（需要 Unix）：
@@ -158,6 +159,10 @@ Fork 不会回滚已经改过的文件、撤销 API 调用或复制正在运行�
 
 **工具 Schema 是固定注册的；当前机器上有哪些 Skills、项目说明或可用资源，是环境上下文，不是新的工具定义。**
 
+`Tool.Execute` 和 `ToolFunc.Run` 返回 `(ToolExecution, error)`。成功时必须二选一：普通输出放在 `Result: &ToolResult{...}`；声明 `MayEndRun` 的工具也可以返回 `EndRun: &RunEnd{Reason: "nothing_to_add"}`，正常结束当前 Run，不产生工具结果，不再请求模型。
+
+`MayEndRun` 要求回复只包含这一个调用及可选 Reasoning；`Exclusive` 只要求调用独占批次，允许正文。Core 在执行任何工具前校验整个回复。终止后 `RunResult.EndReason`、Run 记录和 RunEnd 事件保存原因，全部 Pending 输入保留到下一次显式激活。原始历史保留调用与控制事实，模型上下文省略完整控制 Assistant。Host 自定义 `no_reply` 的可运行示例见 [`examples/endrun`](examples/endrun/main.go)。
+
 ## 一次回复，保留全部内容顺序
 
 Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，例如：
@@ -177,7 +182,7 @@ Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，�
 
 流式 `text_delta`、`reasoning_delta` 和 `tool_call_delta` 使用 `content_index` 对应最终 Content 数组；事件按 AttemptID 区分重试。增量用于展示，完整回复提交成功后才派发工具。协议细节见 [宿主契约](docs/contracts.md)。
 
-当前 Rollout 格式为 **5**。V4 及更早的持久数据会被明确拒绝并保持原样，本轮不提供自动迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
+当前 Rollout 格式为 **6**。V5 及更早的持久数据会被明确拒绝并保持原样，不提供旧接口适配或 Session 迁移。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
 
 ## 上下文与执行控制分开
 

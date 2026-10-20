@@ -102,6 +102,9 @@ func (a *Agent) generate(ctx context.Context, run *Run, turnID string) (adopted 
 				streamErr = validateReply(reply)
 			}
 			if streamErr == nil {
+				streamErr = validateToolBatch(reply.Message, request.Tools)
+			}
+			if streamErr == nil {
 				streamErr = ctx.Err()
 			}
 			if streamErr == nil {

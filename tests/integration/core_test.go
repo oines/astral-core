@@ -156,7 +156,7 @@ func TestCoreAndSessionShareInputAndParallelToolBoundaries(t *testing.T) {
 		entered := make(chan struct{}, 3)
 		release := make(chan struct{})
 		var running, peak atomic.Int32
-		work := tool("parallel", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		work := tool("parallel", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			n := running.Add(1)
 			defer running.Add(-1)
 			for old := peak.Load(); n > old; old = peak.Load() {
@@ -168,9 +168,9 @@ func TestCoreAndSessionShareInputAndParallelToolBoundaries(t *testing.T) {
 			select {
 			case <-release:
 			case <-ctx.Done():
-				return astral.ToolResult{}, ctx.Err()
+				return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 			}
-			return astral.ToolResult{Content: astral.Text(inv.Call.ID)}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 		})
 		m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 			if n == 1 {
@@ -238,11 +238,11 @@ func TestCoreCancelDoesNotReplayTool(t *testing.T) {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return calls(call("c", "wait", `{"value":"x"}`)), nil
 	})
-	tool := tool("wait", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	tool := tool("wait", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		count.Add(1)
 		close(entered)
 		<-ctx.Done()
-		return astral.ToolResult{}, ctx.Err()
+		return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 	})
 	a, err := astral.New(astral.Config{Model: executionOnlyModel{m}, Tools: []astral.Tool{tool}})
 	if err != nil {

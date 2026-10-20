@@ -11,6 +11,7 @@ import (
 type RunResult struct {
 	RunID         string
 	Status        string
+	EndReason     string
 	LastMessageID string
 	LastMessage   *Message
 }
@@ -66,6 +67,7 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 			e.Error = runErr.Error()
 		}
 		e.Status = result.Status
+		e.EndReason = result.EndReason
 		a.Publish(e)
 		a.active = nil
 		a.mu.Unlock()
@@ -76,16 +78,22 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 	natural := state.Last == nil || state.QueueOnly
 	if state.Last != nil && state.Last.Message.Role == RoleAssistant {
 		natural = true
-		if !state.Last.Message.Failed() && (len(state.Last.Message.ToolCalls()) > 0 || state.Turn != nil && !state.Turn.Decided) {
+		if !state.Last.Message.Failed() && state.controlEnd() == nil && (len(state.Last.Message.ToolCalls()) > 0 || state.Turn != nil && !state.Turn.Decided) {
 			// Recover a committed assistant/tool boundary without regenerating it.
 			recoverTurn := state.Turn == nil || !state.Turn.Decided
 			if recoverTurn {
 				a.Publish(Event{Type: EventTurnStart, RunID: r.id, TurnID: state.Last.TurnID})
 			}
 			if len(state.Last.Message.ToolCalls()) > 0 {
-				natural, runErr = a.executeBatch(ctx, r, *state.Last)
+				var batch batchOutcome
+				batch, runErr = a.executeBatch(ctx, r, *state.Last)
+				natural = batch.Natural
+				if runErr == nil && batch.EndRun != nil {
+					result = controlRunResult(r.id, *state.Last, *batch.EndRun)
+					finished = true
+				}
 			}
-			if runErr == nil && recoverTurn {
+			if runErr == nil && recoverTurn && !finished {
 				_, runErr = a.finishTurn(ctx, r, *state.Last)
 			}
 			if recoverTurn {
@@ -95,7 +103,7 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 				}
 				a.Publish(event)
 			}
-			if runErr != nil {
+			if runErr != nil || finished {
 				return
 			}
 		}
@@ -135,9 +143,16 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 			}
 			natural = true
 			if len(assistant.Message.ToolCalls()) > 0 {
-				natural, err = a.executeBatch(ctx, r, assistant)
+				var batch batchOutcome
+				batch, err = a.executeBatch(ctx, r, assistant)
+				natural = batch.Natural
 				if err != nil {
 					return err
+				}
+				if batch.EndRun != nil {
+					result = controlRunResult(r.id, assistant, *batch.EndRun)
+					finished = true
+					return nil
 				}
 			}
 			if err = ctx.Err(); err != nil {
@@ -146,10 +161,14 @@ func (a *Agent) drive(ctx context.Context, r *Run) {
 			_, err = a.finishTurn(ctx, r, assistant)
 			return err
 		}()
-		if runErr != nil {
+		if runErr != nil || finished {
 			return
 		}
 	}
+}
+
+func controlRunResult(id string, assistant Frame, end RunEnd) RunResult {
+	return RunResult{RunID: id, Status: "completed", EndReason: end.Reason, LastMessageID: assistant.ID, LastMessage: &assistant.Message}
 }
 
 func persistContext(ctx context.Context) (context.Context, context.CancelFunc) {

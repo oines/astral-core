@@ -20,15 +20,15 @@ func main() {
 func run(ctx context.Context) error {
 	lookup := astral.ToolFunc{
 		Spec: astral.ToolDefinition{Name: "lookup_order", Version: "1", Description: "Look up an order status.", Parameters: json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}`)},
-		Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			var args struct {
 				ID string `json:"id"`
 			}
 			if err := json.Unmarshal(inv.Call.Arguments, &args); err != nil {
-				return astral.ToolResult{}, err
+				return astral.ToolExecution{Result: &astral.ToolResult{}}, err
 			}
 			// Replace this host-owned lookup with your existing application API.
-			return astral.ToolResult{Content: astral.Text("Order " + args.ID + ": shipped")}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Order " + args.ID + ": shipped")}}, nil
 		},
 	}
 	model := demo.Model(func(request astral.Request) (astral.Reply, error) {

@@ -41,6 +41,7 @@ type Event struct {
 	Error       string        `json:"error,omitempty"`
 	Message     *Message      `json:"message,omitempty"`
 	Status      string        `json:"status,omitempty"`
+	EndReason   string        `json:"end_reason,omitempty"`
 	InputID     string        `json:"input_id,omitempty"`
 }
 

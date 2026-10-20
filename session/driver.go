@@ -15,7 +15,7 @@ type registeredTool struct {
 type frozenTool struct{ registeredTool }
 
 func (t frozenTool) Definition() protocol.ToolDefinition { return clone(t.definition) }
-func (t frozenTool) Execute(ctx context.Context, i protocol.Invocation, emit func(protocol.ToolProgress)) (protocol.ToolResult, error) {
+func (t frozenTool) Execute(ctx context.Context, i protocol.Invocation, emit func(protocol.ToolProgress)) (protocol.ToolExecution, error) {
 	return t.tool.Execute(ctx, i, emit)
 }
 func (t frozenTool) Bind(ctx context.Context, i protocol.Invocation) (json.RawMessage, error) {
@@ -58,6 +58,7 @@ func (s *Session) executionStateLocked() protocol.ExecutionState {
 	out.HasQueuedInputs = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
 	if s.state.LastRun != nil {
 		out.LastRunStatus = s.state.LastRun.Status
+		out.LastRunEndReason = s.state.LastRun.EndReason
 		out.QueueOnly = s.state.LastRun.QueueOnly
 	}
 	if e := s.lastMessageLocked(); e != nil {
@@ -86,6 +87,14 @@ func (s *Session) executionStateLocked() protocol.ExecutionState {
 				v.Result = st.result.Tool.Result
 				v.Invocation = st.result.Tool.Invocation
 				v.NeedsResolution = st.result.Tool.NeedsResolution
+			}
+			if st.control != nil {
+				v.Control = st.control.Tool.Control
+				v.Invocation = st.control.Tool.Invocation
+			}
+			if st.unresolved != nil {
+				v.NeedsResolution = true
+				v.Invocation = st.unresolved.Tool.Invocation
 			}
 			out.Calls[call.ID] = v
 		}
@@ -225,8 +234,17 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 		e.Kind = EntryTurn
 		e.Turn = t.Turn
 		entries = append(entries, e)
+	case protocol.TransitionToolControl:
+		if t.Control == nil {
+			return fmtInvalid("missing tool control")
+		}
+		var err error
+		entries, err = s.controlEntriesLocked(t.ID, t.RunID, t.Invocation, *t.Control)
+		if err != nil {
+			return err
+		}
 	default:
-		kinds := map[protocol.TransitionKind]EntryKind{protocol.TransitionPrepared: EntryToolPrepared, protocol.TransitionAuthorized: EntryToolAuthorized, protocol.TransitionStarted: EntryToolStarted, protocol.TransitionCompleted: EntryToolCompleted, protocol.TransitionResult: EntryToolResult}
+		kinds := map[protocol.TransitionKind]EntryKind{protocol.TransitionPrepared: EntryToolPrepared, protocol.TransitionAuthorized: EntryToolAuthorized, protocol.TransitionStarted: EntryToolStarted, protocol.TransitionCompleted: EntryToolCompleted, protocol.TransitionResult: EntryToolResult, protocol.TransitionToolUnresolved: EntryToolUnresolved}
 		e.Kind = kinds[t.Kind]
 		e.Tool = &ToolRecord{Invocation: t.Invocation, Decision: t.Decision, Result: t.Result, NeedsResolution: t.NeedsResolution}
 		entries = append(entries, e)
@@ -236,7 +254,34 @@ func (d sessionDriver) Commit(ctx context.Context, t protocol.Transition) error 
 		s.running = true
 		s.endMaintenanceLocked()
 	}
+	if err == nil && t.Kind == protocol.TransitionToolControl {
+		s.running = false
+	}
 	return err
+}
+
+func (s *Session) mayEndRunLocked(name string) bool {
+	i, ok := s.windowIndex[s.state.Branch.BatchConfigurationID]
+	if !ok || s.window[i].Configuration == nil {
+		return false
+	}
+	for _, definition := range s.window[i].Configuration.Tools {
+		if definition.Name == name {
+			return definition.MayEndRun
+		}
+	}
+	return false
+}
+
+func (s *Session) controlEntriesLocked(id, runID string, inv protocol.Invocation, end protocol.RunEnd) ([]Entry, error) {
+	if !s.mayEndRunLocked(inv.Call.Name) {
+		return nil, fmtInvalid("tool %q does not declare MayEndRun", inv.Call.Name)
+	}
+	return []Entry{
+		{ID: id, Kind: EntryToolControl, RunID: runID, TurnID: inv.TurnID, Tool: &ToolRecord{Invocation: inv, Control: &end}},
+		{Kind: EntryTurn, RunID: runID, TurnID: inv.TurnID, Turn: &protocol.TurnState{ID: inv.TurnID, AssistantID: inv.AssistantID, Decision: protocol.TurnEnd, Decided: true}},
+		{Kind: EntryRun, RunID: runID, Run: &RunRecord{ID: runID, Status: "completed", EndReason: end.Reason}},
+	}, nil
 }
 func (d sessionDriver) Boundary(ctx context.Context, id string, natural bool) (bool, protocol.RunResult, error) {
 	s := d.s
@@ -280,6 +325,9 @@ func (d sessionDriver) Finish(ctx context.Context, id, status string, cause erro
 	s := d.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if last := s.state.LastRun; last != nil && last.ID == id && last.Status == "completed" {
+		return s.runResultLocked(id, last.Status), nil
+	}
 	_, err := s.applyInputsLocked(ctx, id, true, false)
 	r, finishErr := s.finishLocked(ctx, id, status, cause)
 	return r, errors.Join(err, finishErr)
@@ -294,12 +342,19 @@ func (s *Session) finishLocked(ctx context.Context, id, status string, cause err
 	if err != nil {
 		status = "failed"
 	}
+	return s.runResultLocked(id, status), err
+}
+
+func (s *Session) runResultLocked(id, status string) protocol.RunResult {
 	r := protocol.RunResult{RunID: id, Status: status}
+	if s.state.LastRun != nil {
+		r.EndReason = s.state.LastRun.EndReason
+	}
 	if last := s.lastMessageLocked(); last != nil && last.Message.Role == protocol.RoleAssistant {
 		r.LastMessageID = last.ID
 		r.LastMessage = last.Message
 	}
-	return clone(r), err
+	return clone(r)
 }
 func (d sessionDriver) AcceptResult(ctx context.Context, inv protocol.Invocation, r protocol.ToolResult) (protocol.ToolResult, error) {
 	return d.s.boundResult(ctx, inv, r)

@@ -30,9 +30,9 @@ func TestHugeSingleResultReportsDeliveryFailureWithoutCompacting(t *testing.T) {
 	m.spec.MaxOutputTokens = 100
 	c := testConfig(m, memory.New())
 	c.Compaction = sessions.CompactionPolicy{SystemPrompt: "summarize", KeepRecentTokens: 1}
-	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
-		return astral.ToolResult{Content: astral.Text(large), Artifact: "artifact://output"}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(large), Artifact: "artifact://output"}}, nil
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
@@ -70,8 +70,8 @@ func TestAggregateResultPressureDoesNotRelabelIndividualSuccess(t *testing.T) {
 	m.spec.MaxOutputTokens = 100
 	m.estimator = contentEstimate
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
-		return astral.ToolResult{Content: astral.Text(strings.Repeat("x", 1000))}, nil
+	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(strings.Repeat("x", 1000))}}, nil
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	_, err := wait(t, start(t, s, "go"))
@@ -155,8 +155,8 @@ func TestAutomaticCompactionUsesCompleteBatchAndRechecksBudget(t *testing.T) {
 func largeHistory(t *testing.T, normal *testModel, summary *testModel, large string, withEnvironment bool) (*sessions.Session, string) {
 	t.Helper()
 	c := testConfig(normal, memory.New())
-	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
-		return astral.ToolResult{Content: astral.Text(large)}, nil
+	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(large)}}, nil
 	})}
 	c.Compaction = sessions.CompactionPolicy{ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }

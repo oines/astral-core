@@ -8,6 +8,8 @@
 
 Core 的 `Driver.Commit` 必须在事实被采用、依赖动作开始之前确认成功。`Boundary` 负责在同一串行边界内消费输入或完成 Run；自定义 Driver 不得把队列为空检查与完成动作拆开。事件只用于观察，不能代替提交确认。Snapshot 的 HasQueuedInputs 仅报告驱动输入，并提供 LastRunStatus / Turn 等恢复事实；Core 在创建 Continue Run 前据此检查资格，Driver 在提交时再次串行核对队列。
 
+`TransitionToolControl` 是独立的原子收尾：Driver 必须同时确认控制完成、TurnEnd 决策和 Run completed，并通过 `CallState.Control`、`LastRunStatus`、`LastRunEndReason` 返回事实。确认后 Core 直接结束执行，不再调用 Boundary 或 Finish。`CallState.Complete()` 接受普通 Result 或 Control；NeedsResolution 仍阻止执行继续。`TransitionToolUnresolved` 记录已开始但无法确认的控制执行，不得创建模型可见结果。
+
 ## 所有权与生命周期
 
 一个 Manager 内，同一 ID 的 OpenSession 返回同一已打开对象。一个 Session 同时只能有一个 Run 或独占维护操作，冲突返回 `astral.ErrBusy`。Compact、恢复预检和效果确认属于维护操作。Fork 不占用 Parent 的维护状态，也不改变 Parent 的状态。
@@ -37,7 +39,7 @@ type Store interface {
 }
 ```
 
-格式版本为 5。V5 保存独立 Context、关联投递组、Assistant 终止状态、队列清理与 Turn 决策。V4 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供静默迁移或旧消息字段兼容层。
+格式版本为 6。V6 增加工具终止控制、内部未决执行、Run.EndReason 及 Projection.ToolEntries，保存独立 Context、关联投递组、Assistant 终止状态、队列清理与 Turn 决策。V5 及更早格式返回 `ErrUnsupportedFormat`；检测在写入或调整日志模式前完成，不改写旧数据，不提供迁移或旧接口适配层。
 
 `Get` / `Scan` 的第一个字符串参数是 **RolloutID**。`LoadState` / `Pending` / `Commit` / `LookupCommit` 的第一个字符串参数是 **SessionID**；SessionID 在 Store 内唯一。
 
@@ -70,7 +72,7 @@ rollouts 保存状态与顺序计数；entries 按 Rollout / ID、Rollout / Sequ
 
 ### JSONL 与 Memory
 
-JSONL 目录包含版本 5 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 5 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 5，RuntimeState 与创建记录也使用 5。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
+JSONL 目录包含版本 6 的 format.json；每个 Rollout 使用其 ID 的 SHA-256 文件名、版本 6 的日志头和带 SHA-256 校验和的批次。SQLite 的 format 表与 user_version 同为 6，RuntimeState 与创建记录也使用 6。多个 Session 的提交、创建与回执进入同一 Rollout 日志。提交同步文件和目录后确认。首次访问日志回放并建立内存索引；以后只检查新增尾部，追加不重新校验已加载历史。
 
 未以换行结束的最后一行视为未提交尾部，读取忽略它，下一次 Commit 仅截去这段。完整行损坏、校验和失败或非法状态转换返回 ErrCorrupt，不自动修复已提交历史。确认恢复在采用新读到的完整提交前执行同步。
 
@@ -80,7 +82,7 @@ JSONL 目录包含版本 5 的 format.json；每个 Rollout 使用其 ID 的 SHA
 
 RuntimeState 包含 RolloutID、SessionID、本地版本、创建信息、Head、有效配置 / 摘要引用、当前批次执行事实、当前审批、待办数量、最近 Run 状态及 Turn 决策。队列正文留在 Store 中，按索引分页读取；旧批次不保存在运行状态中。
 
-每个历史节点保存 Projection，Fork 通过索引取得所选节点状态；Projection 保留末尾工具批次的结果引用，Child 可向 Core 提供已完成的 CallState。授权、执行中状态、审批和队列不继承。Session 保留有效 Context 与必要引用，没有完整历史树缓存。任意旧节点若没有摘要且有效路径超限，Fork 或打开会明确报预算错误。
+每个历史节点保存 Projection，Fork 通过索引取得所选节点状态；Projection.ToolEntries 保留末尾工具批次的结果、控制或未决记录引用，Child 可向 Core 提供已完成的 CallState。授权、执行中状态、审批和队列不继承。Session 保留有效 Context 与必要引用，没有完整历史树缓存。任意旧节点若没有摘要且有效路径超限，Fork 或打开会明确报预算错误。
 
 `MaxContextBytes` 默认 32 MiB，最小 4096，约束准备发送的 Request。Context 记录缓存还容纳信封、配置和当前批次，使用约两倍预算的保护上限。Token 估算与字节限制独立；模型上限仍由 EstimateTokens、输出预留和安全余量共同检查。当前工作状态、调用者持有的副本和 Backend 内存不包含在 Request 字节限制中。
 
@@ -139,10 +141,26 @@ SDK 保存协议数据，不包含真实 Chat Completions / Responses 转换器�
 
 工具声明在构造时冻结并验证 JSON Schema。默认 Draft 2020-12，允许声明内引用，拒绝外部 URL / 文件引用。恢复后实际使用的工具声明及 Version 必须与宿主实现一致。
 
+```go
+type ToolExecution struct {
+    Result *ToolResult
+    EndRun *RunEnd
+}
+type RunEnd struct { Reason string }
+// Tool.Execute 和 ToolFunc.Run 使用相同签名：
+Execute(context.Context, Invocation, func(ToolProgress)) (ToolExecution, error)
+```
+
+成功返回必须且只能设置 Result 或 EndRun；错误返回不会解释为正常终止。未声明 MayEndRun 却返回 EndRun，或返回空值 / 双值，属于接口违规，进入未知效果处理。标准工具统一返回 Result，没有旧 ToolResult 签名兼容层。
+
+ToolDefinition.Exclusive 要求整个模型回复只有一个工具调用；MayEndRun 隐含独占，且只允许 tool_call 与 reasoning，连空 text 块也不接受。完整回复在提交为有效 Assistant 之前校验，非法组合走模型错误路径，任何 Bind、审批 Hook 或工具副作用均不得开始。MayEndRun 工具可以返回普通 Result，该次调用仍走普通结果流程。
+
+普通结果路径：
+
 ```text
 参数校验 → 目标绑定 → prepared → before hook → authorized
 → started 提交确认 → Execute → completed 提交确认
-→ after hook → 交付预算 → result + 环境变更原子提交
+→ after hook → 交付预算 → result 提交
 ```
 
 prepared 固定 Invocation 与目标；authorized 固定 Hook 决定；started 在派发前确认。completed 保存 Outcome、Artifact 及 Terminate 等执行事实，不存储未处理的大输出。无效参数、Skip、Block 可直接产生 not_executed 结果。
@@ -156,11 +174,19 @@ Outcome 表达执行效果；IsError / Code 也可表达交付失败。普通错
 | 最近可靠事实 | Continue 行为 |
 | --- | --- |
 | prepared / authorized，无 started | 复用目标与已存决定，继续执行 |
-| started，无可靠终态 | 追加 outcome_unknown，返回 ErrOutcomeUnknown，不再派发 |
+| 普通工具 started，无可靠终态 | 追加 outcome_unknown，返回 ErrOutcomeUnknown，不再派发 |
+| MayEndRun 工具 started，无可靠终态 | 追加内部 EntryToolUnresolved，无普通结果，返回 ErrOutcomeUnknown，不再派发 |
 | completed，无最终结果 | 追加 result_unavailable，保留效果，不重跑 Tool 或 after hook |
 | 已有最终结果 | 直接复用 |
+| 已确认 EntryToolControl | 不重跑、不补造结果；无驱动输入时返回 ErrNotContinuable |
 
-宿主通过 UnresolvedTools 查询真实外部状态，再用 ResolveTool 追加确认结果；原记录保留，结果仍受交付预算约束。宿主也可显式接受仍未知的效果。ExecutionID 可作为业务幂等键，但这不是外部事务的 exactly-once 承诺。
+宿主通过 UnresolvedTools 查询真实外部状态，再用 `ResolveTool(ctx, executionID, ToolExecution)` 确认。Result 必须提供显式 Outcome，仍受交付预算约束；宿主也可显式接受仍未知的效果。内部未决 MayEndRun 执行可以确认为 EndRun，原子关闭未决状态并完成 Run。已提交的普通结果不能改为终止控制。原记录保留，确认不重跑工具或 Hook。ExecutionID 可作为业务幂等键，但这不是外部事务的 exactly-once 承诺。
+
+EndRun 路径跳过 completed、结果预算、AfterToolCall、普通 result 和 FinishTurn，在一次 Store.Commit 内保存 `EntryToolControl → EntryTurn(TurnEnd) → EntryRun(completed)`。控制记录保存原 Invocation 和 Host 原因，不产生 ToolResult 或合成消息。回执丢失沿用 LookupCommit 对账；确认后的完成不会被并发 Cancel 改写。
+
+执行中的 Run 确认后发布 `ToolEnd → TurnEnd → RunEnd`，RunResult、RunRecord 和 RunEnd 事件的 EndReason 保存 Host 原因。不会进入普通 Boundary，不消费或清空 Steer、FollowUp、被动 Context，不触发收尾压缩，也不终止 Host 的其他进程。下次 Start 或有驱动队列时的 Continue 才激活新 Run；仅有被动 Context 不足以继续。
+
+原始历史保留控制 Assistant（含 Reasoning）及控制完成事实。Provider 和摘要请求依据匹配的已确认控制记录，省略完整 Assistant 及控制记录，不生成空占位消息，不按工具名称过滤。Fork 和 Compaction 必须保留完整的调用 / 控制边界；控制事实按 AssistantID、CallID 和分支路径配对。
 
 ## Hook、审批、输入和事件
 
@@ -203,7 +229,7 @@ FollowUp(ctx context.Context, prompt Message, options ...InputOptions) (string, 
 
 关联 Context 和 Prompt 是不可拆分的输入组；应用顺序为各 Context 消息、Prompt、消费事实，同一次 Commit 确认后才修改队列。独立 Context、Steer、FollowUp 复用同一持久队列和边界机制。Steer 优先，FollowUp 仅在自然完成时消费；选中组按接收顺序提交，保留组内边界。Context 不占 Steering 额度。每次最多选择 64 个独立 Context 批次和配置允许的驱动批次，不等待未来到达的内容。
 
-单批超出字节预算直接拒绝；当前窗口容纳不了的已接收 Context 留队。InjectContext 只做结构、字节校验与提交，不触发模型、估算器或自动摘要。实际执行时可使用现有 Compaction 释放空间；显式 Compact 后也尝试安全应用待处理 Context。Run 收尾做一次有界被动提交，剩余批次继续 Pending，不延长执行。
+单批超出字节预算直接拒绝；当前窗口容纳不了的已接收 Context 留队。InjectContext 只做结构、字节校验与提交，不触发模型、估算器或自动摘要。实际执行时可使用现有 Compaction 释放空间；显式 Compact 后也尝试安全应用待处理 Context。普通 Run 收尾做一次有界被动提交，剩余批次继续 Pending，不延长执行；工具 EndRun 收尾保留全部 Pending。
 
 大型媒体由 Host 提供内联数据或能在重启、恢复、Fork 时解析的稳定引用。临时内存对象和即将失效的 URL 不能作为持久重放保证。Core 不上传、解码媒体，不访问引用网络资源；Model Bridge 与 Host 负责引用解析、Role / 模态降级或显式报错。摘要失败保留原始历史且不提交 Compaction。
 
@@ -241,6 +267,7 @@ Fork 的 nodeID 是包含式边界。排除消息时传其 ParentID。SelectHead
 | --- | --- |
 | User 消息 | 创建后 Continue 调用模型 |
 | 完整工具批次 | 复用历史结果，不重跑 Tool / Hook，保留 Terminate 语义 |
+| 工具终止控制完成记录 | 不重跑；无驱动输入时 Continue 返回 ErrNotContinuable |
 | Assistant 最终回复 | 无驱动输入时 Continue 返回 ErrNotContinuable；Start 可追加输入 |
 | 配置、Context、压缩节点 | 由 Projection 和最后有效消息决定 |
 | 不完整工具批次 | ErrIncompleteBatch，不创建 Child |

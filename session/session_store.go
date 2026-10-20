@@ -155,7 +155,7 @@ func (s *Session) pruneWindow() {
 	}
 	keep := map[string]bool{p.ConfigurationID: true, p.CompactionID: true, p.ThroughID: true, p.LastMessageID: true, p.BatchConfigurationID: true}
 	out := make([]Entry, 0, len(s.window)-through+len(keep))
-	for _, id := range p.Results {
+	for _, id := range p.ToolEntries {
 		keep[id] = true
 	}
 	for i, e := range s.window {
@@ -194,7 +194,7 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 		cursor = page.Next
 	}
 	references := []string{p.ConfigurationID, p.CompactionID, p.ThroughID, p.LastMessageID, p.BatchConfigurationID}
-	for _, id := range p.Results {
+	for _, id := range p.ToolEntries {
 		references = append(references, id)
 	}
 	for _, id := range references {

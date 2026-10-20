@@ -184,14 +184,14 @@ func TestContextWaitsForWholeToolBatchAndDoesNotExtendRun(t *testing.T) {
 				}
 				return answer("done"), nil
 			})
-			work := tool("work", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+			work := tool("work", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 				entered <- struct{}{}
 				select {
 				case <-release:
 				case <-ctx.Done():
-					return astral.ToolResult{}, ctx.Err()
+					return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 				}
-				return astral.ToolResult{Content: astral.Text("result")}, nil
+				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("result")}}, nil
 			})
 			e := harness(t, persistent, m, []astral.Tool{work}, nil)
 			run, err := e.Start(ctx, astral.User("work"))
@@ -623,14 +623,14 @@ func TestPassiveContextBudgetCannotFailAnActiveToolRun(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.MaxContextBytes = 4096
-	c.Tools = []astral.Tool{tool("work", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("work", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		close(entered)
 		select {
 		case <-release:
 		case <-ctx.Done():
-			return astral.ToolResult{}, ctx.Err()
+			return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 		}
-		return astral.ToolResult{Content: astral.Text(strings.Repeat("r", 900))}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(strings.Repeat("r", 900))}}, nil
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	run := start(t, s, strings.Repeat("u", 900))

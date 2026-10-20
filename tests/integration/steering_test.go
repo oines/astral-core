@@ -336,8 +336,8 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 					version = e.Version
 					consumed = append(consumed, e.Input.ID)
 				}
-				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 5 {
-					t.Fatal("consumed IDs or V5 state changed during recovery")
+				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 6 {
+					t.Fatal("consumed IDs or V6 state changed during recovery")
 				}
 			})
 		}
@@ -554,7 +554,7 @@ func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
 		s := newSession(t, newAgent(t, testConfig(m, store)), sessions.SessionOptions{})
 		seedCompletedBoundary(t, s, store)
 		message := steeringMessage(0)
-		// V5 permits the input ID to equal its queued record's entry ID. A new
+		// The input ID may equal its queued record's entry ID. A new
 		// message must keep a fresh history identity when this input is consumed.
 		queued := sessions.Entry{ID: "existing-input", Kind: sessions.EntryInputQueued, Input: &sessions.InputRecord{ID: "existing-input", Kind: sessions.InputSteer, Message: &message}}
 		if err := appendStore(ctx, store, s.ID(), s.State().Version, []sessions.Entry{queued}); err != nil {
@@ -569,7 +569,7 @@ func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
 		}
 		waitOK(t, run)
 		if len(m.observed()) != 1 || !reflect.DeepEqual(userMessages(m.observed()[0]), []astral.Message{message}) {
-			t.Fatal("existing V5 queued identity could not be consumed")
+			t.Fatal("existing queued identity could not be consumed")
 		}
 		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{Kind: sessions.EntryInputQueued})
 		if err != nil || len(pending.Records) != 0 {

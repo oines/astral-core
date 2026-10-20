@@ -110,16 +110,20 @@ func project(path []Entry) (Context, error) {
 	}
 	results := map[string]Entry{}
 	assistants := map[string]Entry{}
+	controls := map[string]bool{}
 	for _, e := range visible {
 		if e.Kind == EntryMessage && e.Message.Role == protocol.RoleAssistant {
 			assistants[e.ID] = e
 		}
-		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution {
+		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution || e.Kind == EntryToolControl {
 			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
 			if prev, ok := results[key]; ok && e.Kind != EntryToolResolution {
 				return Context{}, fmt.Errorf("%w: duplicate result for %s (%s)", ErrCorrupt, key, prev.ID)
 			}
 			results[key] = e
+			if e.Kind == EntryToolControl {
+				controls[e.Tool.Invocation.AssistantID] = true
+			}
 		}
 	}
 	for _, e := range results {
@@ -137,6 +141,16 @@ func project(path []Entry) (Context, error) {
 		if !matched {
 			return Context{}, fmt.Errorf("%w: unmatched tool result", protocol.ErrIncompleteBatch)
 		}
+		if e.Kind == EntryToolControl {
+			if len(assistant.Message.ToolCalls()) != 1 {
+				return Context{}, fmt.Errorf("%w: control in mixed batch", ErrCorrupt)
+			}
+			for _, part := range assistant.Message.Content {
+				if part.Type != "tool_call" && part.Type != "reasoning" {
+					return Context{}, fmt.Errorf("%w: control with assistant output", ErrCorrupt)
+				}
+			}
+		}
 	}
 	add := func(message protocol.Message, id string) {
 		view.Request.Messages = append(view.Request.Messages, message)
@@ -145,7 +159,7 @@ func project(path []Entry) (Context, error) {
 	for _, e := range visible {
 		switch e.Kind {
 		case EntryMessage:
-			if e.Message.Failed() {
+			if e.Message.Failed() || controls[e.ID] {
 				continue
 			}
 			if e.Message.Role == protocol.RoleTool {
@@ -194,16 +208,30 @@ func validateToolTimeline(path []Entry) error {
 		case EntryToolResult:
 			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
 			call, ok := pending[key]
-			if !ok || !sameJSON(call, e.Tool.Invocation.Call) {
+			if !ok || !sameJSON(call, e.Tool.Invocation.Call) || completed[key].Tool != nil {
 				return fmt.Errorf("%w: out-of-sequence tool result", protocol.ErrIncompleteBatch)
 			}
 			delete(pending, key)
+			completed[key] = e
+		case EntryToolControl, EntryToolUnresolved:
+			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
+			call, ok := pending[key]
+			previous := completed[key]
+			if !ok || !sameJSON(call, e.Tool.Invocation.Call) || previous.Tool != nil && (e.Kind != EntryToolControl || previous.Kind != EntryToolUnresolved || !sameJSON(previous.Tool.Invocation, e.Tool.Invocation)) {
+				return fmt.Errorf("%w: out-of-sequence control", protocol.ErrIncompleteBatch)
+			}
+			if e.Kind == EntryToolControl {
+				delete(pending, key)
+			}
 			completed[key] = e
 		case EntryToolResolution:
 			key := resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)
 			previous, ok := completed[key]
 			if !ok || !previous.Tool.NeedsResolution || !sameJSON(previous.Tool.Invocation, e.Tool.Invocation) {
 				return fmt.Errorf("%w: resolution without unresolved result", protocol.ErrIncompleteBatch)
+			}
+			if previous.Kind == EntryToolUnresolved {
+				delete(pending, key)
 			}
 			completed[key] = e
 		}

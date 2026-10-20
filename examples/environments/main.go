@@ -126,20 +126,20 @@ func run(ctx context.Context) error {
 	selected := "target-a"
 	current := func() string { mu.RLock(); defer mu.RUnlock(); return selected }
 	var live *sessions.Session
-	// Target selection and its persistence are host policy. A sequential tool
-	// changes it before later calls in the same batch are bound.
-	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Description: "Select an authorized execution target.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	// Target selection and its persistence are host policy. An exclusive batch
+	// confirms the switch before later calls bind their targets.
+	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Exclusive: true, Description: "Select an authorized execution target in a separate tool batch.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		target, err := targetOf(inv.Call.Arguments)
 		if err != nil || router[target] == nil {
-			return astral.ToolResult{}, errors.New("target not authorized")
+			return astral.ToolExecution{Result: &astral.ToolResult{}}, errors.New("target not authorized")
 		}
 		mu.Lock()
 		selected = target
 		mu.Unlock()
 		if _, err = live.InjectContext(ctx, []astral.Message{contextFor(target, filepath.Join(root, target))}); err != nil {
-			return astral.ToolResult{Outcome: astral.OutcomeSucceeded}, err
+			return astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeSucceeded}}, err
 		}
-		return astral.ToolResult{Content: astral.Text("Host target updated.")}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Host target updated.")}}, nil
 	}}
 	var tools []astral.Tool
 	for _, base := range set.Tools() {
@@ -160,13 +160,16 @@ func run(ctx context.Context) error {
 			return demo.Calls(demo.Call("current", "exec_command", `{"cmd":"printf 'current cwd: '; pwd","login":false}`)), nil
 		}
 		if result := demo.LastTool(request, "exec_command"); result != nil {
+			if demo.LastTool(request, "switch_environment") == nil {
+				return demo.Calls(demo.Call("switch", "switch_environment", `{"target":"target-b"}`)), nil
+			}
 			match := regexp.MustCompile(`Process running with session ID (\d+)`).FindStringSubmatch(result.Content[0].Text)
 			if len(match) != 2 {
 				return astral.Reply{}, errors.New("command did not return a live session")
 			}
 			id, _ := strconv.Atoi(match[1])
 			args, _ := json.Marshal(standardtools.StdinRequest{SessionID: id, Chars: "continue\n"})
-			return demo.Calls(demo.Call("switch", "switch_environment", `{"target":"target-b"}`), demo.Call("poll", "write_stdin", string(args))), nil
+			return demo.Calls(demo.Call("poll", "write_stdin", string(args))), nil
 		}
 		return demo.Calls(demo.Call("start", "exec_command", `{"cmd":"printf 'ready\\n'; IFS= read -r line; printf 'original cwd: '; pwd","tty":true,"login":false,"yield_time_ms":0}`)), nil
 	})

@@ -207,7 +207,7 @@ func TestRunningCommandUsesFrozenEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := command(t, result)
+	r := command(t, *result.Result)
 	args, _ = json.Marshal(map[string]any{"session_id": r.SessionID})
 	current := astral.Invocation{SessionID: "owner", Binding: json.RawMessage(`{"target":"remote"}`), Call: astral.ToolCall{Arguments: args}}
 	binding, err := h.tools["write_stdin"].(astral.TargetedTool).Bind(context.Background(), current)
@@ -219,7 +219,7 @@ func TestRunningCommandUsesFrozenEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := command(t, result); got.ExitCode == nil || !strings.Contains(got.Output, h.dir) {
+	if got := command(t, *result.Result); got.ExitCode == nil || !strings.Contains(got.Output, h.dir) {
 		t.Fatal(fmt.Sprintf("wrong target: %+v", got))
 	}
 }

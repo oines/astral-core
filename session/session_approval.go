@@ -54,7 +54,7 @@ func (s *Session) pendingApprovalsLocked() []PendingApproval {
 			continue
 		}
 		for _, work := range s.state.Tools {
-			if work.Prepared == nil || work.Prepared.Tool.Invocation.ExecutionID != execution || work.Result != nil {
+			if work.Prepared == nil || work.Prepared.Tool.Invocation.ExecutionID != execution || work.Result != nil || work.Control != nil || work.Unresolved != nil {
 				continue
 			}
 			out = append(out, PendingApproval{ID: record.ID, Invocation: work.Prepared.Tool.Invocation, Request: record.Request})

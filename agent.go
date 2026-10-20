@@ -193,6 +193,7 @@ func (a *Agent) Close(ctx context.Context) error {
 	if d, ok := a.driver.(*memoryDriver); ok {
 		d.mu.Lock()
 		d.messages = nil
+		d.hidden = nil
 		d.inputs = nil
 		d.state = ExecutionState{}
 		d.mu.Unlock()

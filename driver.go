@@ -31,18 +31,22 @@ type CallState struct {
 	Started         bool          `json:"started,omitempty"`
 	Completed       *ToolResult   `json:"completed,omitempty"`
 	Result          *ToolResult   `json:"result,omitempty"`
+	Control         *RunEnd       `json:"control,omitempty"`
 	NeedsResolution bool          `json:"needs_resolution,omitempty"`
 }
 
+func (s CallState) Complete() bool { return s.Result != nil || s.Control != nil }
+
 // ExecutionState is only the current execution boundary, not a history tree.
 type ExecutionState struct {
-	ID            string
-	Configuration Configuration
-	BatchTools    []ToolDefinition
-	Last          *Frame
-	Calls         map[string]CallState
-	LastRunStatus string
-	Turn          *TurnState
+	ID               string
+	Configuration    Configuration
+	BatchTools       []ToolDefinition
+	Last             *Frame
+	Calls            map[string]CallState
+	LastRunStatus    string
+	LastRunEndReason string
+	Turn             *TurnState
 	// HasQueuedInputs counts driving inputs only; passive context cannot wake a run.
 	HasQueuedInputs bool
 	// QueueOnly lets queued input lead after cancellation before model generation.
@@ -52,16 +56,18 @@ type ExecutionState struct {
 type TransitionKind string
 
 const (
-	TransitionRunStart     TransitionKind = "run_start"
-	TransitionMessage      TransitionKind = "message"
-	TransitionPrepared     TransitionKind = "prepared"
-	TransitionAuthorized   TransitionKind = "authorized"
-	TransitionStarted      TransitionKind = "started"
-	TransitionCompleted    TransitionKind = "completed"
-	TransitionResult       TransitionKind = "result"
-	TransitionSelectModel  TransitionKind = "select_model"
-	TransitionTurnStart    TransitionKind = "turn_start"
-	TransitionTurnDecision TransitionKind = "turn_decision"
+	TransitionRunStart       TransitionKind = "run_start"
+	TransitionMessage        TransitionKind = "message"
+	TransitionPrepared       TransitionKind = "prepared"
+	TransitionAuthorized     TransitionKind = "authorized"
+	TransitionStarted        TransitionKind = "started"
+	TransitionCompleted      TransitionKind = "completed"
+	TransitionResult         TransitionKind = "result"
+	TransitionToolControl    TransitionKind = "tool_control"
+	TransitionToolUnresolved TransitionKind = "tool_unresolved"
+	TransitionSelectModel    TransitionKind = "select_model"
+	TransitionTurnStart      TransitionKind = "turn_start"
+	TransitionTurnDecision   TransitionKind = "turn_decision"
 )
 
 // Transition describes an execution fact. IDs are assigned before Commit and
@@ -73,6 +79,7 @@ type Transition struct {
 	Invocation        Invocation
 	Decision          *ToolDecision
 	Result            *ToolResult
+	Control           *RunEnd
 	NeedsResolution   bool
 	ModelID           string
 	Usage             Usage
@@ -100,6 +107,9 @@ func (s ExecutionState) Continuable(queued bool) bool {
 	if s.Last.Message.Role != RoleAssistant {
 		return false
 	}
+	if s.controlEnd() != nil {
+		return queued
+	}
 	if s.Turn != nil && s.Turn.Decided && s.Turn.Decision == TurnEnd {
 		if s.LastRunStatus == "completed" {
 			return queued
@@ -122,6 +132,15 @@ func (s ExecutionState) Continuable(queued bool) bool {
 		return true
 	}
 	return queued
+}
+
+func (s ExecutionState) controlEnd() *RunEnd {
+	for _, call := range s.Calls {
+		if call.Control != nil {
+			return call.Control
+		}
+	}
+	return nil
 }
 
 type Configuration struct {

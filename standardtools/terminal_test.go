@@ -95,10 +95,10 @@ func TestWorkerPanicsBecomeResultsAndRetainCleanupOwnership(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			result, err := execTool(set).Execute(ctx, commandInvocation(), nil)
-			if err != nil || !result.IsError {
+			if err != nil || result.Result == nil || !result.Result.IsError {
 				t.Fatalf("missing process error: %+v %v", result, err)
 			}
-			if test.waitFailure && result.Outcome != astral.OutcomeUnknown {
+			if test.waitFailure && result.Result.Outcome != astral.OutcomeUnknown {
 				t.Fatal("unknown wait status was treated as known")
 			}
 			if err := set.Close(ctx); err != nil {

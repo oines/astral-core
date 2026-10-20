@@ -112,7 +112,7 @@ func (d *Data) AddPending(r s.Record) {
 		d.Pending["approval:"+e.Approval.ID] = r
 	case s.EntryApprovalDecided:
 		delete(d.Pending, "approval:"+e.Approval.ID)
-	case s.EntryToolResult, s.EntryToolResolution, s.EntryMessage:
+	case s.EntryToolResult, s.EntryToolResolution, s.EntryToolControl, s.EntryToolUnresolved, s.EntryMessage:
 		for key, p := range d.Pending {
 			if p.Entry.Approval != nil && (e.Kind == s.EntryMessage || p.Entry.Approval.ExecutionID == e.Tool.Invocation.ExecutionID) {
 				delete(d.Pending, key)

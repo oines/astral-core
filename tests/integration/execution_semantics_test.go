@@ -209,13 +209,13 @@ func TestParallelPreflightPinsTargetsBeforeAnyDispatch(t *testing.T) {
 				target.Store("target-a")
 				var effects, preflights atomic.Int32
 				bound := make(chan string, 2)
-				base := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "work", Version: "1", Sequential: sequential, Parameters: json.RawMessage(valueSchema)}, Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+				base := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "work", Version: "1", Sequential: sequential, Parameters: json.RawMessage(valueSchema)}, Run: func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 					effects.Add(1)
 					bound <- inv.Call.ID + ":" + bindingOf(inv.Binding).Target
 					if inv.Call.ID == "first" {
 						target.Store("target-b")
 					}
-					return astral.ToolResult{Content: astral.Text("done")}, nil
+					return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 				}}
 				wrapped := hostTargetTool{Tool: base, target: func() json.RawMessage {
 					raw, _ := json.Marshal(hostBinding{Target: target.Load().(string)})
@@ -258,12 +258,12 @@ func TestPreparedInvocationKeepsOriginalOpaqueTargetAfterReopen(t *testing.T) {
 		var binds, effects atomic.Int32
 		target := json.RawMessage(`{"target":"original","revision":900719925474099312345}`)
 		want := append(json.RawMessage(nil), target...)
-		base := tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		base := tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			effects.Add(1)
 			if !reflect.DeepEqual(inv.Binding, want) {
-				return astral.ToolResult{}, errors.New("prepared target was rebound")
+				return astral.ToolExecution{Result: &astral.ToolResult{}}, errors.New("prepared target was rebound")
 			}
-			return astral.ToolResult{Content: astral.Text("done")}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 		})
 		wrapped := hostTargetTool{Tool: base, target: func() json.RawMessage { binds.Add(1); return target }}
 		m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
@@ -519,11 +519,11 @@ func TestOpaqueInvocationTargetsRoundTripWithoutEnteringModelContext(t *testing.
 					target = json.RawMessage(raw)
 				}
 				want := append(json.RawMessage(nil), target...)
-				work := hostTargetTool{Tool: tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+				work := hostTargetTool{Tool: tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 					if !reflect.DeepEqual(inv.Binding, want) {
-						return astral.ToolResult{}, errors.New("opaque target changed")
+						return astral.ToolExecution{Result: &astral.ToolResult{}}, errors.New("opaque target changed")
 					}
-					return astral.ToolResult{Content: astral.Text("done")}, nil
+					return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 				}), target: func() json.RawMessage { return target }}
 				m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 					if n == 1 {

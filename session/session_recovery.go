@@ -8,7 +8,7 @@ import (
 	protocol "github.com/oines/astral-core"
 )
 
-// UnresolvedTools returns durable terminal markers that require a host decision.
+// UnresolvedTools returns durable execution facts that require a host decision.
 func (s *Session) UnresolvedTools() []ToolRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -24,21 +24,28 @@ func (s *Session) unresolvedLocked() []ToolRecord {
 	return out
 }
 
-// ResolveTool appends the host's reconciled result. OutcomeUnknown is permitted
-// as an explicit acknowledgement to continue while preserving uncertainty.
+// ResolveTool appends the host's reconciled result or completes an unresolved
+// control. OutcomeUnknown is permitted in a Result as an explicit acknowledgement.
 // It never executes the tool. Historical entries remain readable unchanged.
-func (s *Session) ResolveTool(ctx context.Context, executionID string, result protocol.ToolResult) error {
-	owned, err := copyJSON(result)
+func (s *Session) ResolveTool(ctx context.Context, executionID string, execution protocol.ToolExecution) error {
+	owned, err := copyJSON(execution)
 	if err != nil {
 		return err
 	}
-	result = owned
-	if !validOutcome(result.Outcome) {
-		return fmtInvalid("explicit outcome required")
-	}
-	result = normalizeResult(result)
-	if err := validateToolResult(result); err != nil {
+	execution = owned
+	if err := execution.Validate(); err != nil {
 		return err
+	}
+	var result protocol.ToolResult
+	if execution.Result != nil {
+		result = *execution.Result
+		if !validOutcome(result.Outcome) {
+			return fmtInvalid("explicit outcome required")
+		}
+		result = normalizeResult(result)
+		if err := validateToolResult(result); err != nil {
+			return err
+		}
 	}
 	ctx, finish, err := s.beginMaintenance(ctx)
 	if err != nil {
@@ -50,12 +57,29 @@ func (s *Session) ResolveTool(ctx context.Context, executionID string, result pr
 	s.mu.Unlock()
 	for _, record := range unresolved {
 		if record.Invocation.ExecutionID == executionID {
+			if execution.EndRun != nil {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if record.Result != nil {
+					return fmtInvalid("a committed ordinary result cannot become an EndRun control")
+				}
+				runID := record.Invocation.RunID
+				if s.state.LastRun != nil {
+					runID = s.state.LastRun.ID
+				}
+				entries, err := s.controlEntriesLocked(newID(), runID, record.Invocation, *execution.EndRun)
+				if err != nil {
+					return err
+				}
+				_, err = s.appendLocked(ctx, entries...)
+				return err
+			}
 			result = normalizeResult(result)
 			bounded, budgetErr := s.boundResult(ctx, record.Invocation, result)
 			result = bounded
 			record.Result = &result
 			record.NeedsResolution = false
-			_, err := s.append(ctx, Entry{Kind: EntryToolResolution, Tool: &record})
+			_, err := s.append(ctx, Entry{Kind: EntryToolResolution, RunID: record.Invocation.RunID, TurnID: record.Invocation.TurnID, Tool: &record})
 			return errors.Join(budgetErr, err)
 		}
 	}
@@ -80,11 +104,22 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 		for _, call := range calls {
 			s.mu.Lock()
 			state := s.toolStateLocked(assistant.ID, call.ID)
+			mayEndRun := s.mayEndRunLocked(call.Name)
 			s.mu.Unlock()
-			if state.result != nil || state.started == nil {
+			if state.result != nil || state.control != nil || state.started == nil {
 				continue
 			}
 			inv := clone(state.started.Tool.Invocation)
+			if mayEndRun && state.completed == nil {
+				if state.unresolved == nil {
+					_, err := s.append(ctx, Entry{Kind: EntryToolUnresolved, RunID: inv.RunID, TurnID: inv.TurnID, Tool: &ToolRecord{Invocation: inv, NeedsResolution: true}})
+					if err != nil {
+						return err
+					}
+				}
+				unknown = &protocol.UnknownOutcomeError{ExecutionID: inv.ExecutionID}
+				continue
+			}
 			result := toolFailure("outcome_unknown", "Execution started before interruption; the operation may have partially or fully completed. The host must reconcile its effects. Do not automatically repeat it.", protocol.OutcomeUnknown)
 			needsResolution := true
 			if state.completed != nil {
@@ -109,20 +144,27 @@ func (s *Session) recoverInterrupted(ctx context.Context) error {
 
 // toolState includes only execution facts belonging to assistant entries on the
 // selected branch. A decision from a sibling branch must never authorize a call.
-type toolState struct{ prepared, authorized, started, completed, result *Entry }
+type toolState struct{ prepared, authorized, started, completed, result, control, unresolved *Entry }
 
 func (s *Session) toolStateLocked(assistantID, callID string) toolState {
 	if assistantID != s.state.Branch.LastMessageID {
 		return toolState{}
 	}
 	v := s.state.Tools[callID]
-	if v.Result == nil {
-		if i, ok := s.windowIndex[s.state.Branch.Results[callID]]; ok {
+	if v.Result == nil && v.Control == nil && v.Unresolved == nil {
+		if i, ok := s.windowIndex[s.state.Branch.ToolEntries[callID]]; ok {
 			e := s.window[i]
 			if e.Tool != nil && e.Tool.Invocation.AssistantID == assistantID && e.Tool.Invocation.Call.ID == callID {
-				v.Result = &e
+				switch e.Kind {
+				case EntryToolControl:
+					v.Control = &e
+				case EntryToolUnresolved:
+					v.Unresolved = &e
+				default:
+					v.Result = &e
+				}
 			}
 		}
 	}
-	return toolState{prepared: v.Prepared, authorized: v.Authorized, started: v.Started, completed: v.Completed, result: v.Result}
+	return toolState{prepared: v.Prepared, authorized: v.Authorized, started: v.Started, completed: v.Completed, result: v.Result, control: v.Control, unresolved: v.Unresolved}
 }

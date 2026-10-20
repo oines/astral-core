@@ -64,6 +64,7 @@ go run ./examples/fork
 | `memory_driver_test.go`（根目录） | Standalone 字节预算前缀与输入保留 |
 | `context_injection_test.go` | 多模态原样往返、被动注入、安全批次、关联提交、失确认、冷重开、Fork 和摘要 |
 | `execution_semantics_test.go` | Continue 准入、FinishTurn 与恢复、串行预检、不可变目标引用、终止事件 |
+| `tool_control*_test.go` | Host 终止工具、原子收尾、输入保留、提交故障恢复、重开、Fork 与 Compaction 投影 |
 | `steering_test.go` | 默认逐条 / 显式批量、配置边界、Core / Session 一致性、FIFO、Metadata、预算、三后端原子提交 / 确认丢失 / 冷重开 / Cancel |
 | `ordered_content_test.go` | 交错流式索引、提交前不派发、乱序结果排序、Retry / Fallback 隔离、三后端冷重开 / 压缩 / Fork / 恢复 |
 | `core_test.go` | 仅 Model / Tools 启动；Core 与 Session 的请求、事件、Retry、输入、顺序、并行上限一致；取消不重跑 |
@@ -95,6 +96,6 @@ go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/.*/Deta
 
 ## 范围
 
-存储格式为 5，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
+存储格式为 6，没有旧 API 兼容层、旧格式迁移、真实 Provider 转换器、分布式执行租约或后台 GC。Memory / JSONL 冷打开与历史内存用量允许随历史增长；长会话保证针对 SQLite。
 
 模块地址为 `github.com/oines/astral-core`，项目使用 [Apache-2.0 许可证](../LICENSE)。标准工具参考来源及许可证见 [第三方声明](../THIRD_PARTY_NOTICES.md)。本地验证环境为 macOS / arm64，不能把离线协议测试视为真实 Provider 或所有平台的兼容性认证。

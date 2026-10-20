@@ -34,9 +34,9 @@ func run(ctx context.Context) error {
 	changes := 0
 	tool := astral.ToolFunc{
 		Spec: astral.ToolDefinition{Name: "update_record", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
-		Run: func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+		Run: func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			changes++
-			return astral.ToolResult{Content: astral.Text("Record updated.")}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Record updated.")}}, nil
 		},
 	}
 	config := sessions.Config{EstimateTokens: demo.EstimateTokens,

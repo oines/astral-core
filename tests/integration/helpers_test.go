@@ -70,12 +70,12 @@ func call(id, name, args string) astral.ToolCall {
 
 const valueSchema = `{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}`
 
-func tool(name string, fn func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error)) astral.Tool {
+func tool(name string, fn func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error)) astral.Tool {
 	return astral.ToolFunc{Spec: astral.ToolDefinition{Name: name, Version: "1", Parameters: json.RawMessage(valueSchema)}, Run: fn}
 }
 
 func echoTool(counter *atomic.Int32) astral.Tool {
-	return tool("echo", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	return tool("echo", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		if counter != nil {
 			counter.Add(1)
 		}
@@ -83,7 +83,7 @@ func echoTool(counter *atomic.Int32) astral.Tool {
 			Value string `json:"value"`
 		}
 		_ = json.Unmarshal(inv.Call.Arguments, &args)
-		return astral.ToolResult{Content: astral.Text(args.Value)}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(args.Value)}}, nil
 	})
 }
 

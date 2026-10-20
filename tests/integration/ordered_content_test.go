@@ -96,17 +96,17 @@ func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
 		})
 		c := testConfig(m, store)
 		c.MaxParallelTools = 2
-		c.Tools = []astral.Tool{tool("work", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		c.Tools = []astral.Tool{tool("work", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			executions.Add(1)
 			started <- inv.Call.ID
 			if inv.Call.ID == "first" {
 				select {
 				case <-releaseFirst:
 				case <-ctx.Done():
-					return astral.ToolResult{}, ctx.Err()
+					return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 				}
 			}
-			return astral.ToolResult{Content: astral.Text(inv.Call.ID)}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 		})}
 		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 		sub := s.Subscribe(512)
@@ -208,9 +208,9 @@ func TestInterleavedAttemptsDoNotShareStreamOrFinalContent(t *testing.T) {
 				return answer("done"), nil
 			})
 			c := testConfig(m, memory.New())
-			c.Tools = []astral.Tool{tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+			c.Tools = []astral.Tool{tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 				effects.Add(1)
-				return astral.ToolResult{Content: astral.Text(inv.Call.ID)}, nil
+				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 			})}
 			c.Retry = astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
 			if fallback {
@@ -282,9 +282,9 @@ func TestInvalidStreamReferencesCannotCommitOrDispatch(t *testing.T) {
 					}
 					return interleavedReply(), nil
 				})
-				work := tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+				work := tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 					effects.Add(1)
-					return astral.ToolResult{Content: astral.Text("must not execute")}, nil
+					return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("must not execute")}}, nil
 				})
 				var run *astral.Run
 				if persistent {
@@ -361,9 +361,9 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 			})
 			summary.spec.ID = "ordered-summary"
 			c := testConfig(m, store)
-			c.Tools = []astral.Tool{tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+			c.Tools = []astral.Tool{tool("work", func(_ context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 				effects.Add(1)
-				return astral.ToolResult{Content: astral.Text(inv.Call.ID)}, nil
+				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 			})}
 			c.Compaction = sessions.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
 			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
@@ -477,14 +477,14 @@ func TestInterleavedInterruptedBatchRetainsExecutionFacts(t *testing.T) {
 	store := memory.New()
 	c := testConfig(m, store)
 	c.MaxParallelTools = 1
-	c.Tools = []astral.Tool{tool("work", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("work", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
 		if inv.Call.ID == "second" {
 			close(entered)
 			<-ctx.Done()
-			return astral.ToolResult{}, ctx.Err()
+			return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 		}
-		return astral.ToolResult{Content: astral.Text("first")}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("first")}}, nil
 	})}
 	parent := newSession(t, newAgent(t, c), sessions.SessionOptions{ID: "ordered-recovery"})
 	run := start(t, parent, "work")
@@ -509,7 +509,7 @@ func TestInterleavedInterruptedBatchRetainsExecutionFacts(t *testing.T) {
 		if len(unknown) != 1 || unknown[0].Invocation.Call.ID != "second" {
 			t.Fatal("wrong unfinished call recovered")
 		}
-		if err := reopened.ResolveTool(ctx, unknown[0].Invocation.ExecutionID, astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text("second")}); err != nil {
+		if err := reopened.ResolveTool(ctx, unknown[0].Invocation.ExecutionID, astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text("second")}}); err != nil {
 			t.Fatal(err)
 		}
 		run, err := reopened.Continue(ctx)

@@ -105,14 +105,14 @@ func crashConfig(st sessions.Store, dir, stage string) sessions.Config {
 		return calls(call("effect", "effect", `{"value":"once"}`)), nil
 	})
 	c := testConfig(m, st)
-	c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		if err := durableCount(dir, "effects"); err != nil {
-			return astral.ToolResult{}, err
+			return astral.ToolExecution{Result: &astral.ToolResult{}}, err
 		}
 		if stage == "executed" {
 			crashBarrier()
 		}
-		return astral.ToolResult{Content: astral.Text("original output"), Outcome: astral.OutcomeSucceeded}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("original output"), Outcome: astral.OutcomeSucceeded}}, nil
 	})}
 	c.BeforeToolCall = func(context.Context, sessions.ToolContext) (astral.ToolDecision, error) {
 		return astral.ToolDecision{}, durableCount(dir, "before")

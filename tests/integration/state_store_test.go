@@ -279,17 +279,17 @@ func TestOldFormatsAreRejectedWithoutMutation(t *testing.T) {
 	})
 }
 
-func TestVersionFourUpgradeDoesNotMigrateData(t *testing.T) {
+func TestVersionFiveUpgradeDoesNotMigrateData(t *testing.T) {
 	for _, backend := range []string{"jsonl", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			dir := t.TempDir()
-			legacy := []byte(`{"role":"assistant","content":[{"type":"text","text":"old"}],"tool_calls":[{"id":"old-call","name":"work","arguments":{}}]}`)
+			legacy := []byte(`{"role":"assistant","content":[{"type":"tool_call","tool_call":{"id":"old-call","name":"work","arguments":{}}}],"finish_reason":"tool_calls"}`)
 			path := filepath.Join(dir, "old.db")
 			if backend == "jsonl" {
 				for name, data := range map[string][]byte{
-					"format.json":         []byte(`{"format_version":4,"rollout_id":""}`),
+					"format.json":         []byte(`{"format_version":5,"rollout_id":""}`),
 					"old.jsonl":           legacy,
-					"unpublished.pending": []byte("unpublished V4 data"),
+					"unpublished.pending": []byte("unpublished V5 data"),
 				} {
 					if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
 						t.Fatal(err)
@@ -300,7 +300,7 @@ func TestVersionFourUpgradeDoesNotMigrateData(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, err = db.Exec("CREATE TABLE format(version INTEGER); INSERT INTO format VALUES(4); CREATE TABLE entries(payload BLOB); PRAGMA user_version=4;")
+				_, err = db.Exec("CREATE TABLE format(version INTEGER); INSERT INTO format VALUES(5); CREATE TABLE entries(payload BLOB); PRAGMA user_version=5;")
 				if err == nil {
 					_, err = db.Exec("INSERT INTO entries VALUES(?)", legacy)
 				}
@@ -332,15 +332,15 @@ func TestVersionFourUpgradeDoesNotMigrateData(t *testing.T) {
 				_, err = sqlite.Open(path)
 			}
 			if !errors.Is(err, sessions.ErrUnsupportedFormat) || !reflect.DeepEqual(before, snapshot()) {
-				t.Fatalf("V4 data changed or was silently migrated: %v", err)
+				t.Fatalf("V5 data changed or was silently migrated: %v", err)
 			}
 		})
 	}
 }
 
-func TestVersionFiveMarkersAgreeWithRuntimeState(t *testing.T) {
-	if sessions.FormatVersion != 5 {
-		t.Fatalf("ordered message format must be version 5, got %d", sessions.FormatVersion)
+func TestVersionSixMarkersAgreeWithRuntimeState(t *testing.T) {
+	if sessions.FormatVersion != 6 {
+		t.Fatalf("tool control format must be version 6, got %d", sessions.FormatVersion)
 	}
 	for _, backend := range []string{"jsonl", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
@@ -351,8 +351,8 @@ func TestVersionFiveMarkersAgreeWithRuntimeState(t *testing.T) {
 			})
 			a := newAgent(t, testConfig(m, store))
 			s := newSession(t, a, sessions.SessionOptions{})
-			if s.State().FormatVersion != 5 || s.State().Creation.FormatVersion != 5 {
-				t.Fatal("runtime state and creation did not adopt V5")
+			if s.State().FormatVersion != 6 || s.State().Creation.FormatVersion != 6 {
+				t.Fatal("runtime state and creation did not adopt V6")
 			}
 			if err := a.Close(context.Background()); err != nil {
 				t.Fatal(err)
@@ -363,13 +363,13 @@ func TestVersionFiveMarkersAgreeWithRuntimeState(t *testing.T) {
 				var marker struct {
 					Format int `json:"format_version"`
 				}
-				if err != nil || json.Unmarshal(data, &marker) != nil || marker.Format != 5 {
+				if err != nil || json.Unmarshal(data, &marker) != nil || marker.Format != 6 {
 					t.Fatalf("JSONL marker: %s %v", data, err)
 				}
 				sum := sha256.Sum256([]byte(s.RolloutID()))
 				data, err = os.ReadFile(filepath.Join(dir, "journal", hex.EncodeToString(sum[:])+".jsonl"))
 				first := bytes.SplitN(data, []byte("\n"), 2)[0]
-				if err != nil || json.Unmarshal(first, &marker) != nil || marker.Format != 5 {
+				if err != nil || json.Unmarshal(first, &marker) != nil || marker.Format != 6 {
 					t.Fatalf("JSONL rollout header: %s %v", first, err)
 				}
 			} else {
@@ -382,7 +382,7 @@ func TestVersionFiveMarkersAgreeWithRuntimeState(t *testing.T) {
 				if err := db.QueryRow("SELECT version FROM format").Scan(&format); err != nil {
 					t.Fatal(err)
 				}
-				if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != 5 || userVersion != 5 {
+				if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != 6 || userVersion != 6 {
 					t.Fatalf("SQLite markers: format=%d user_version=%d %v", format, userVersion, err)
 				}
 			}

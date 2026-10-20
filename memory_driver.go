@@ -16,12 +16,25 @@ type memoryDriver struct {
 	agent    *Agent
 	state    ExecutionState
 	messages []Message
+	hidden   map[int]bool
 	inputs   []queuedInput
 	rendered bool
 }
 
 func newMemoryDriver(a *Agent, c Configuration) *memoryDriver {
-	return &memoryDriver{agent: a, state: ExecutionState{ID: a.config.ID, Configuration: c, Calls: map[string]CallState{}}}
+	return &memoryDriver{agent: a, state: ExecutionState{ID: a.config.ID, Configuration: c, Calls: map[string]CallState{}}, hidden: map[int]bool{}}
+}
+
+// Keep the original messages for execution facts while omitting completed
+// controls (and failed replies) from every model/budget projection.
+func (d *memoryDriver) projectMessages(messages []Message) []Message {
+	out := make([]Message, 0, len(messages))
+	for i, m := range messages {
+		if !d.hidden[i] && !m.Failed() {
+			out = append(out, clone(m))
+		}
+	}
+	return out
 }
 func (d *memoryDriver) Snapshot() ExecutionState {
 	d.mu.Lock()
@@ -33,12 +46,7 @@ func (d *memoryDriver) Snapshot() ExecutionState {
 func (d *memoryDriver) Prepare(ctx context.Context, override string) (Model, Request, error) {
 	d.mu.Lock()
 	c := clone(d.state.Configuration)
-	var messages []Message
-	for _, m := range d.messages {
-		if !m.Failed() {
-			messages = append(messages, clone(m))
-		}
-	}
+	messages := d.projectMessages(d.messages)
 	d.mu.Unlock()
 	if override != "" {
 		c.ModelID = override
@@ -62,7 +70,7 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 			if s.NeedsResolution {
 				return &UnknownOutcomeError{ExecutionID: s.Invocation.ExecutionID}
 			}
-			if t.Message != nil && s.Result == nil {
+			if t.Message != nil && !s.Complete() {
 				return ErrIncompleteBatch
 			}
 		}
@@ -83,6 +91,7 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 		}
 		d.state.QueueOnly = queueOnly
 		d.state.LastRunStatus = "started"
+		d.state.LastRunEndReason = ""
 	case TransitionMessage:
 		d.addMessage(t.ID, t.TurnID, *t.Message)
 		for _, r := range t.SyntheticResults {
@@ -103,6 +112,26 @@ func (d *memoryDriver) Commit(ctx context.Context, t Transition) error {
 		d.state.Turn = clone(t.Turn)
 	case TransitionSelectModel:
 		d.state.Configuration.ModelID = t.ModelID
+	case TransitionToolControl:
+		call := d.state.Calls[t.Invocation.Call.ID]
+		if t.Control == nil || !call.Started || call.Complete() || len(d.state.Calls) != 1 {
+			return fmtInvalid("invalid tool control boundary")
+		}
+		call.Control = clone(t.Control)
+		call.NeedsResolution = false
+		d.state.Calls[t.Invocation.Call.ID] = call
+		d.state.Turn = &TurnState{ID: t.TurnID, AssistantID: t.Invocation.AssistantID, Decision: TurnEnd, Decided: true}
+		d.state.LastRunStatus = "completed"
+		d.state.LastRunEndReason = t.Control.Reason
+		d.hidden[len(d.messages)-1] = true
+		d.rendered = true
+	case TransitionToolUnresolved:
+		call := d.state.Calls[t.Invocation.Call.ID]
+		if !call.Started || call.Complete() || call.NeedsResolution {
+			return fmtInvalid("invalid unresolved tool boundary")
+		}
+		call.NeedsResolution = true
+		d.state.Calls[t.Invocation.Call.ID] = call
 	default:
 		c := d.state.Calls[t.Invocation.Call.ID]
 		c.Invocation = clone(t.Invocation)
@@ -194,7 +223,7 @@ func (d *memoryDriver) inject(ctx context.Context, batch []Message, running bool
 }
 func (d *memoryDriver) complete() bool {
 	for _, s := range d.state.Calls {
-		if s.Result == nil {
+		if !s.Complete() || s.NeedsResolution {
 			return false
 		}
 	}
@@ -267,7 +296,7 @@ func (d *memoryDriver) applyPending(passiveOnly, natural bool) (bool, error) {
 			passive++
 		}
 	}
-	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: append([]Message(nil), d.messages...)}
+	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: d.projectMessages(d.messages)}
 	applied := map[int]bool{}
 	driven := false
 	passiveBlocked := false
@@ -319,7 +348,7 @@ func (d *memoryDriver) applyPending(passiveOnly, natural bool) (bool, error) {
 	return driven, nil
 }
 func (d *memoryDriver) steeringPrefix(selected []int, maxBytes int) ([]int, error) {
-	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: append([]Message(nil), d.messages...)}
+	request := Request{ModelID: d.state.Configuration.ModelID, SystemPrompt: d.state.Configuration.SystemPrompt, Tools: d.state.Configuration.Tools, MaxOutputTokens: 16384, Messages: d.projectMessages(d.messages)}
 	for n, index := range selected {
 		request.Messages = append(request.Messages, d.inputs[index].Messages()...)
 		raw, err := json.Marshal(request)
@@ -336,7 +365,7 @@ func (d *memoryDriver) steeringPrefix(selected []int, maxBytes int) ([]int, erro
 	return selected, nil
 }
 func (d *memoryDriver) result(id, status string) RunResult {
-	r := RunResult{RunID: id, Status: status}
+	r := RunResult{RunID: id, Status: status, EndReason: d.state.LastRunEndReason}
 	if d.state.Last != nil && d.state.Last.Message.Role == RoleAssistant {
 		r.LastMessageID = d.state.Last.ID
 		r.LastMessage = &d.state.Last.Message
@@ -346,6 +375,9 @@ func (d *memoryDriver) result(id, status string) RunResult {
 func (d *memoryDriver) Finish(ctx context.Context, id, status string, _ error) (RunResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.state.LastRunStatus == "completed" && d.state.controlEnd() != nil {
+		return d.result(id, "completed"), nil
+	}
 	d.state.LastRunStatus = status
 	_, err := d.applyPending(true, false)
 	return d.result(id, status), err
@@ -361,7 +393,7 @@ func (d *memoryDriver) startInput(t Transition, q QueuedInput) error {
 	messages := append([]Message(nil), d.messages...)
 	fits := func(prefix []Message) (bool, error) {
 		candidate := request
-		candidate.Messages = append(append([]Message(nil), prefix...), q.Messages()...)
+		candidate.Messages = append(d.projectMessages(prefix), q.Messages()...)
 		raw, err := json.Marshal(candidate)
 		return len(raw) <= standaloneSteeringContextBytes, err
 	}

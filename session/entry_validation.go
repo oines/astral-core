@@ -30,13 +30,21 @@ func validateEnvelope(e Entry) error {
 				return fmt.Errorf("%w: %v", ErrCorrupt, err)
 			}
 		}
-	case EntryToolPrepared, EntryToolAuthorized, EntryToolStarted, EntryToolCompleted, EntryToolResult, EntryToolResolution:
+	case EntryToolPrepared, EntryToolAuthorized, EntryToolStarted, EntryToolCompleted, EntryToolResult, EntryToolResolution, EntryToolControl, EntryToolUnresolved:
 		valid = e.Tool != nil && e.Tool.Invocation.ExecutionID != "" && e.Tool.Invocation.AssistantID != "" && e.Tool.Invocation.Call.ID != ""
 		if valid && (e.Kind == EntryToolResult || e.Kind == EntryToolResolution || e.Kind == EntryToolCompleted) {
 			valid = e.Tool.Result != nil && validOutcome(e.Tool.Result.Outcome)
 		}
 		if valid && e.Kind == EntryToolAuthorized {
 			valid = e.Tool.Decision != nil
+		}
+		if valid && e.Kind == EntryToolControl {
+			valid = e.Tool.Control != nil && e.Tool.Result == nil && !e.Tool.NeedsResolution
+		} else if valid {
+			valid = e.Tool.Control == nil
+		}
+		if valid && e.Kind == EntryToolUnresolved {
+			valid = e.Tool.Result == nil && e.Tool.NeedsResolution
 		}
 	case EntryApprovalRequested, EntryApprovalDecided:
 		valid = e.Approval != nil && e.Approval.ID != "" && e.Approval.ExecutionID != ""

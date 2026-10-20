@@ -81,10 +81,10 @@ func TestCancellationPreservesUnknownEffectAndCancelledRunStatus(t *testing.T) {
 		return calls(call("effect", "effect", `{"value":"x"}`)), nil
 	})
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{tool("effect", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("effect", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		close(entered)
 		<-ctx.Done()
-		return astral.ToolResult{}, ctx.Err()
+		return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	r := start(t, s, "go")
@@ -141,7 +141,7 @@ func TestToolConcurrencyLimit(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.MaxParallelTools = 2
-	c.Tools = []astral.Tool{tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		n := current.Add(1)
 		for previous := peak.Load(); n > previous; previous = peak.Load() {
 			if peak.CompareAndSwap(previous, n) {
@@ -151,7 +151,7 @@ func TestToolConcurrencyLimit(t *testing.T) {
 		time.Sleep(time.Millisecond)
 		current.Add(-1)
 		executed.Add(1)
-		return astral.ToolResult{Content: astral.Text("done")}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
@@ -170,16 +170,16 @@ func TestResolvedOutputUsesDeliveryBudget(t *testing.T) {
 	})
 	m.spec.ContextWindow = 6000
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+	c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
-		return astral.ToolResult{Outcome: astral.OutcomeUnknown, Content: astral.Text("uncertain")}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeUnknown, Content: astral.Text("uncertain")}}, nil
 	})}
 	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 	if _, err := wait(t, start(t, s, "go")); !errors.Is(err, astral.ErrOutcomeUnknown) {
 		t.Fatal(err)
 	}
 	id := s.UnresolvedTools()[0].Invocation.ExecutionID
-	if err := s.ResolveTool(context.Background(), id, astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text(strings.Repeat("large", 10000)), Artifact: "host://output"}); err != nil {
+	if err := s.ResolveTool(context.Background(), id, astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text(strings.Repeat("large", 10000)), Artifact: "host://output"}}); err != nil {
 		t.Fatal(err)
 	}
 	var resolved *astral.ToolResult
@@ -271,8 +271,8 @@ func TestAfterHookPatchKeepsUnspecifiedFields(t *testing.T) {
 		return calls(call("c", "work", `{"value":"x"}`)), nil
 	})
 	c := testConfig(m, memory.New())
-	c.Tools = []astral.Tool{tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
-		return astral.ToolResult{Content: astral.Text("original"), IsError: true, Code: "original_code", Artifact: "host://artifact"}, nil
+	c.Tools = []astral.Tool{tool("work", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("original"), IsError: true, Code: "original_code", Artifact: "host://artifact"}}, nil
 	})}
 	c.AfterToolCall = func(context.Context, astral.Invocation, astral.ToolResult) (astral.ToolResultPatch, error) {
 		isError, terminate := false, true

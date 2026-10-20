@@ -102,14 +102,14 @@ func TestRunningParentRejectsIncompleteFork(t *testing.T) {
 			return answer("done"), nil
 		})
 		c := testConfig(m, st)
-		c.Tools = []astral.Tool{tool("wait", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+		c.Tools = []astral.Tool{tool("wait", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			close(entered)
 			select {
 			case <-release:
 			case <-ctx.Done():
-				return astral.ToolResult{}, ctx.Err()
+				return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 			}
-			return astral.ToolResult{Content: astral.Text("done")}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 		})}
 		parent := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 		run := start(t, parent, "go")
@@ -159,9 +159,9 @@ func TestLostAckDoesNotAuthorizeAfterOwnerVersionChanges(t *testing.T) {
 			return calls(call("c", "never", `{"value":"x"}`)), nil
 		})
 		c := testConfig(m, st)
-		c.Tools = []astral.Tool{tool("never", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+		c.Tools = []astral.Tool{tool("never", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 			t.Error("execution continued after ownership changed")
-			return astral.ToolResult{Content: astral.Text("unexpected")}, nil
+			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("unexpected")}}, nil
 		})}
 		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
 		if _, err := wait(t, start(t, s, "go")); !errors.Is(err, sessions.ErrConflict) {

@@ -9,7 +9,7 @@ import (
 	"math"
 )
 
-const FormatVersion = 5
+const FormatVersion = 6
 const ForkCommitID = "session-fork-created"
 const DefaultPageSize = 256
 const DefaultPageBytes = 4 << 20

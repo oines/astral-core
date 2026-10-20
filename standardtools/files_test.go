@@ -56,7 +56,8 @@ func (h *harness) invoke(ctx context.Context, name string, args any) (astral.Too
 		return astral.ToolResult{}, err
 	}
 	inv := astral.Invocation{SessionID: "owner", Call: astral.ToolCall{ID: "call", Name: name, Arguments: data}}
-	return h.tools[name].Execute(ctx, inv, nil)
+	execution, err := h.tools[name].Execute(ctx, inv, nil)
+	return *execution.Result, err
 }
 
 func (h *harness) run(t *testing.T, name string, args any) astral.ToolResult {

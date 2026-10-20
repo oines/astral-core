@@ -44,7 +44,7 @@ func (st *Store) Close() error { return st.db.Close() }
 
 const schema = `
 CREATE TABLE format(version INTEGER NOT NULL);
-INSERT INTO format VALUES(5);
+INSERT INTO format VALUES(6);
 CREATE TABLE rollouts(id TEXT PRIMARY KEY,status TEXT NOT NULL,seq INTEGER NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY,rollout_id TEXT NOT NULL,ready INTEGER NOT NULL,state BLOB NOT NULL,fork_digest TEXT NOT NULL DEFAULT '');
 CREATE INDEX session_rollout ON sessions(rollout_id,id);
@@ -60,7 +60,7 @@ CREATE TABLE pending(rollout_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT
 CREATE INDEX pending_order ON pending(session_id,kind,input_kind,seq);
 CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
-PRAGMA user_version=5;
+PRAGMA user_version=6;
 `
 
 // CROSS JOIN keeps the bounded chain on the outside of each indexed lookup.
@@ -588,7 +588,7 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []s.Record, pend
 			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(s.EntryInputQueued), e.Input.ID)
 		case s.EntryApprovalDecided:
 			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(s.EntryApprovalRequested), e.Approval.ID)
-		case s.EntryToolResult, s.EntryToolResolution:
+		case s.EntryToolResult, s.EntryToolResolution, s.EntryToolControl, s.EntryToolUnresolved:
 			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND owner=?", e.SessionID, string(s.EntryApprovalRequested), e.Tool.Invocation.ExecutionID)
 		case s.EntryMessage:
 			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=?", e.SessionID, string(s.EntryApprovalRequested))

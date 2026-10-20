@@ -16,15 +16,15 @@ func TestParallelResultsArePresentedInCallOrder(t *testing.T) {
 	bothStarted := make(chan struct{}, 2)
 	release := make(chan struct{})
 	var effects atomic.Int32
-	parallel := tool("parallel", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	parallel := tool("parallel", func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
 		bothStarted <- struct{}{}
 		select {
 		case <-ctx.Done():
-			return astral.ToolResult{}, ctx.Err()
+			return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 		case <-release:
 		}
-		return astral.ToolResult{Content: astral.Text(inv.Call.ID)}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 	})
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {

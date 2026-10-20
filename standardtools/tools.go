@@ -94,7 +94,12 @@ func (t backendTool) Definition() astral.ToolDefinition {
 	return d
 }
 
-func (t backendTool) Execute(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolResult, error) {
+func (t backendTool) Execute(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolExecution, error) {
+	result, err := t.execute(ctx, inv, emit)
+	return astral.ToolExecution{Result: &result}, err
+}
+
+func (t backendTool) execute(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolResult, error) {
 	t.set.mu.Lock()
 	if t.set.closed {
 		t.set.mu.Unlock()

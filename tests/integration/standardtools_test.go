@@ -29,6 +29,69 @@ func closeStandard(t *testing.T, set *standardtools.Set) {
 	})
 }
 
+func TestToolEndRunPreservesHostProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("optional local process backend requires Unix")
+	}
+	eachControlEngine(t, func(t *testing.T, st sessions.Store) {
+		backend, err := local.New(local.Options{CWD: t.TempDir(), Shell: "/bin/sh"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		set, err := standardtools.New(backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeStandard(t, set)
+		stop := controlTool("no_reply", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+			return astral.ToolExecution{EndRun: &astral.RunEnd{Reason: "waiting"}}, nil
+		})
+		processID := 0
+		m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+			switch n {
+			case 1:
+				return calls(call("process", "exec_command", `{"cmd":"IFS= read -r line; printf 'survived:%s\\n' \"$line\"","tty":true,"login":false,"yield_time_ms":0}`)), nil
+			case 2:
+				for _, msg := range r.Messages {
+					if msg.Role == astral.RoleTool {
+						match := regexp.MustCompile(`Process running with session ID (\d+)`).FindStringSubmatch(msg.Content[0].Text)
+						if len(match) == 2 {
+							processID, _ = strconv.Atoi(match[1])
+						}
+					}
+				}
+				if processID == 0 {
+					return astral.Reply{}, errors.New("missing live process")
+				}
+				return controlReply(stop.Spec.Name), nil
+			case 3:
+				args, _ := json.Marshal(standardtools.StdinRequest{SessionID: processID, Chars: "ok\n"})
+				return calls(call("resume", "write_stdin", string(args))), nil
+			default:
+				for _, msg := range r.Messages {
+					if msg.Role == astral.RoleTool && msg.Name == "write_stdin" && !msg.IsError && strings.Contains(msg.Content[0].Text, "survived:ok") {
+						return answer("host process survived EndRun"), nil
+					}
+				}
+				return astral.Reply{}, errors.New("EndRun lost the host process")
+			}
+		})
+		e, _ := controlEndpoint(t, st, astral.Config{Model: m, Tools: append(set.Tools(), stop)})
+		run, err := e.Start(context.Background(), astral.User("start and wait"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result := waitOK(t, run); result.EndReason != "waiting" || len(m.observed()) != 2 {
+			t.Fatalf("control did not end the first activation: %+v", result)
+		}
+		run, err = e.Start(context.Background(), astral.User("resume the process"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitOK(t, run)
+	})
+}
+
 func TestEmptyBindingUsesLocalDefaults(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("optional local process backend requires Unix")
@@ -111,9 +174,9 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 			return raw
 		}})
 	}
-	tools = append(tools, astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object"}`)}, Run: func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
+	tools = append(tools, astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Sequential: true, Parameters: json.RawMessage(`{"type":"object"}`)}, Run: func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		current = "target-two"
-		return astral.ToolResult{Content: astral.Text("Host target updated.")}, nil
+		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Host target updated.")}}, nil
 	}})
 	m := model(func(_ context.Context, n int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		switch n {

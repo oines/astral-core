@@ -46,6 +46,8 @@ const (
 	EntryToolCompleted     EntryKind = "tool_completed"
 	EntryToolResult        EntryKind = "tool_result"
 	EntryToolResolution    EntryKind = "tool_resolution"
+	EntryToolControl       EntryKind = "tool_control"
+	EntryToolUnresolved    EntryKind = "tool_unresolved"
 	EntryApprovalRequested EntryKind = "approval_requested"
 	EntryApprovalDecided   EntryKind = "approval_decided"
 	EntryInputQueued       EntryKind = "input_queued"
@@ -58,7 +60,7 @@ const (
 
 func (e Entry) IsHistory() bool {
 	switch e.Kind {
-	case EntryConfiguration, EntryContext, EntryMessage, EntryToolResult, EntryToolResolution, EntryCompaction:
+	case EntryConfiguration, EntryContext, EntryMessage, EntryToolResult, EntryToolResolution, EntryToolControl, EntryToolUnresolved, EntryCompaction:
 		return true
 	default:
 		return false
@@ -81,6 +83,7 @@ type ToolRecord struct {
 	Invocation protocol.Invocation    `json:"invocation"`
 	Decision   *protocol.ToolDecision `json:"decision,omitempty"`
 	Result     *protocol.ToolResult   `json:"result,omitempty"`
+	Control    *protocol.RunEnd       `json:"control,omitempty"`
 	// An automatically recovered unknown result stops execution until the host
 	// explicitly resolves it. A resolution may acknowledge remaining uncertainty.
 	NeedsResolution bool `json:"needs_resolution,omitempty"`
@@ -111,5 +114,6 @@ type RunRecord struct {
 	ID        string `json:"id"`
 	Status    string `json:"status"`
 	Error     string `json:"error,omitempty"`
+	EndReason string `json:"end_reason,omitempty"`
 	QueueOnly bool   `json:"queue_only,omitempty"`
 }

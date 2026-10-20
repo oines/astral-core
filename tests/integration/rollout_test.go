@@ -356,8 +356,8 @@ func TestUnknownEffectAndForeignRolloutRejectFork(t *testing.T) {
 			return calls(call("effect", "effect", `{"value":"x"}`)), nil
 		})
 		c := testConfig(m, st)
-		c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolResult, error) {
-			return astral.ToolResult{Outcome: astral.OutcomeUnknown, Content: astral.Text("uncertain")}, nil
+		c.Tools = []astral.Tool{tool("effect", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+			return astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeUnknown, Content: astral.Text("uncertain")}}, nil
 		})}
 		a := newAgent(t, c)
 		parent := newSession(t, a, sessions.SessionOptions{})

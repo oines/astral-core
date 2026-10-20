@@ -17,7 +17,7 @@ type Projection struct {
 	ThroughID            string                       `json:"through_id,omitempty"`
 	LastMessageID        string                       `json:"last_message_id,omitempty"`
 	BatchConfigurationID string                       `json:"batch_configuration_id,omitempty"`
-	Results              map[string]string            `json:"results,omitempty"`
+	ToolEntries          map[string]string            `json:"tool_entries,omitempty"`
 	PendingCalls         map[string]protocol.ToolCall `json:"pending_calls,omitempty"`
 	Unresolved           map[string]ToolRecord        `json:"unresolved,omitempty"`
 }
@@ -32,6 +32,8 @@ type ToolState struct {
 	Started    *Entry `json:"started,omitempty"`
 	Completed  *Entry `json:"completed,omitempty"`
 	Result     *Entry `json:"result,omitempty"`
+	Control    *Entry `json:"control,omitempty"`
+	Unresolved *Entry `json:"unresolved,omitempty"`
 }
 type RuntimeState struct {
 	FormatVersion    int                       `json:"format_version"`
@@ -65,7 +67,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 	records := make([]Record, 0, len(c.Entries))
 	ids := map[string]bool{}
 	var lastSequence uint64
-	for _, entry := range c.Entries {
+	for entryIndex, entry := range c.Entries {
 		e, err := copyJSON(entry)
 		if err != nil {
 			return RuntimeState{}, nil, err
@@ -126,7 +128,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.LastMessageID = e.ID
 			state.Branch.BatchConfigurationID = state.Branch.ConfigurationID
 			state.Branch.PendingCalls = nil
-			state.Branch.Results = nil
+			state.Branch.ToolEntries = nil
 			state.Tools = nil
 			state.Approvals = nil
 			state.Turn = nil
@@ -139,9 +141,11 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 					state.Branch.PendingCalls[call.ID] = call
 				}
 			}
-		case EntryToolPrepared, EntryToolAuthorized, EntryToolStarted, EntryToolCompleted, EntryToolResult, EntryToolResolution:
+		case EntryToolPrepared, EntryToolAuthorized, EntryToolStarted, EntryToolCompleted, EntryToolResult, EntryToolResolution, EntryToolControl, EntryToolUnresolved:
 			inv := e.Tool.Invocation
-			if e.Kind == EntryToolResolution {
+			_, resolvingControl := state.Branch.Unresolved[inv.ExecutionID]
+			resolvingControl = resolvingControl && e.Kind == EntryToolControl
+			if e.Kind == EntryToolResolution || resolvingControl {
 				old, ok := state.Branch.Unresolved[inv.ExecutionID]
 				if !ok || !sameJSON(old.Invocation, inv) {
 					return RuntimeState{}, nil, fmt.Errorf("%w: unresolved execution missing", ErrCorrupt)
@@ -184,15 +188,39 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 					return RuntimeState{}, nil, ErrCorrupt
 				}
 				work.Completed = &e
+			case EntryToolUnresolved:
+				if work.Started == nil || work.Completed != nil || work.Result != nil || work.Control != nil || work.Unresolved != nil || len(state.Branch.PendingCalls) != 1 {
+					return RuntimeState{}, nil, fmt.Errorf("%w: invalid unresolved control", ErrCorrupt)
+				}
+				work.Unresolved = &e
+				if state.Branch.Unresolved == nil {
+					state.Branch.Unresolved = map[string]ToolRecord{}
+				}
+				state.Branch.Unresolved[inv.ExecutionID] = *e.Tool
+			case EntryToolControl:
+				if work.Started == nil || work.Completed != nil || work.Result != nil || work.Control != nil || len(state.Branch.PendingCalls) != 1 {
+					return RuntimeState{}, nil, fmt.Errorf("%w: invalid tool control", ErrCorrupt)
+				}
+				// Completion and Run termination form one durable transaction.
+				if entryIndex+2 >= len(c.Entries) {
+					return RuntimeState{}, nil, fmt.Errorf("%w: missing control termination", ErrCorrupt)
+				}
+				turn, run := c.Entries[entryIndex+1], c.Entries[entryIndex+2]
+				if turn.Kind != EntryTurn || turn.Turn == nil || turn.Turn.AssistantID != inv.AssistantID || turn.Turn.ID != inv.TurnID || !turn.Turn.Decided || turn.Turn.Decision != protocol.TurnEnd || run.Kind != EntryRun || run.Run == nil || run.Run.ID != e.RunID || run.Run.Status != "completed" || run.Run.EndReason != e.Tool.Control.Reason {
+					return RuntimeState{}, nil, fmt.Errorf("%w: inconsistent control termination", ErrCorrupt)
+				}
+				work.Control = &e
+				work.Unresolved = nil
+				delete(state.Branch.PendingCalls, inv.Call.ID)
+				if len(state.Branch.PendingCalls) == 0 {
+					state.Branch.PendingCalls = nil
+				}
 			case EntryToolResult, EntryToolResolution:
 				if e.Kind == EntryToolResult && work.Completed != nil && work.Completed.Tool.Result.Outcome != e.Tool.Result.Outcome {
 					return RuntimeState{}, nil, fmt.Errorf("%w: completed effect changed", ErrCorrupt)
 				}
 				work.Result = &e
-				if state.Branch.Results == nil {
-					state.Branch.Results = map[string]string{}
-				}
-				state.Branch.Results[inv.Call.ID] = e.ID
+				work.Unresolved = nil
 				delete(state.Branch.PendingCalls, inv.Call.ID)
 				if len(state.Branch.PendingCalls) == 0 {
 					state.Branch.PendingCalls = nil
@@ -203,6 +231,12 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 					}
 					state.Branch.Unresolved[inv.ExecutionID] = *e.Tool
 				}
+			}
+			if e.Kind == EntryToolResult || e.Kind == EntryToolResolution || e.Kind == EntryToolControl || e.Kind == EntryToolUnresolved {
+				if state.Branch.ToolEntries == nil {
+					state.Branch.ToolEntries = map[string]string{}
+				}
+				state.Branch.ToolEntries[inv.Call.ID] = e.ID
 			}
 			state.Tools[inv.Call.ID] = work
 		case EntryInputQueued:
@@ -239,7 +273,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 		case EntryApprovalRequested, EntryApprovalDecided:
 			prepared := false
 			for _, work := range state.Tools {
-				if work.Prepared != nil && work.Prepared.Tool.Invocation.ExecutionID == e.Approval.ExecutionID && work.Authorized == nil && work.Result == nil {
+				if work.Prepared != nil && work.Prepared.Tool.Invocation.ExecutionID == e.Approval.ExecutionID && work.Authorized == nil && work.Result == nil && work.Control == nil && work.Unresolved == nil {
 					prepared = true
 					break
 				}

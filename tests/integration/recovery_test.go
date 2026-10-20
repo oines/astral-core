@@ -113,11 +113,11 @@ func TestApprovalDecisionSurvivesRestartAndHookReentry(t *testing.T) {
 func TestInterruptedToolBecomesUnknownAndIsNeverReplayed(t *testing.T) {
 	entered := make(chan struct{})
 	var effects atomic.Int32
-	work := tool("effect", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolResult, error) {
+	work := tool("effect", func(ctx context.Context, _ astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
 		close(entered)
 		<-ctx.Done()
-		return astral.ToolResult{}, ctx.Err()
+		return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 	})
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		if n == 1 {
@@ -149,7 +149,7 @@ func TestInterruptedToolBecomesUnknownAndIsNeverReplayed(t *testing.T) {
 	if len(unknown) != 1 || effects.Load() != 1 {
 		t.Fatal("unknown operation replayed or hidden")
 	}
-	if err = reopened.ResolveTool(context.Background(), unknown[0].Invocation.ExecutionID, astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text("Host confirmed the operation completed.")}); err != nil {
+	if err = reopened.ResolveTool(context.Background(), unknown[0].Invocation.ExecutionID, astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeSucceeded, Content: astral.Text("Host confirmed the operation completed.")}}); err != nil {
 		t.Fatal(err)
 	}
 	r2, err := reopened.Continue(context.Background())
