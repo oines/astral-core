@@ -12,7 +12,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -74,7 +74,7 @@ func assertInterleavedRequest(t *testing.T, request astral.Request, expected ast
 }
 
 func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		partial, finishStream, releaseFirst := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		started := make(chan string, 2)
@@ -108,7 +108,7 @@ func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
 			}
 			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 		})}
-		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		sub := s.Subscribe(512)
 		defer sub.Close()
 		run := start(t, s, "work")
@@ -140,7 +140,7 @@ func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
 				t.Fatal("second call did not finish before the first")
 			}
 		}
-		if _, err := s.Fork(ctx, s.Head(), sessions.ForkOptions{ID: "incomplete-ordered"}); !errors.Is(err, astral.ErrIncompleteBatch) {
+		if _, err := s.Fork(ctx, s.Head(), astral.ForkOptions{ID: "incomplete-ordered"}); !errors.Is(err, astral.ErrIncompleteBatch) {
 			t.Fatalf("incomplete interleaved batch forked: %v", err)
 		}
 		close(releaseFirst)
@@ -191,7 +191,7 @@ func TestInterleavedStreamCommitsBeforeParallelDispatch(t *testing.T) {
 }
 
 func TestInterleavedAttemptsDoNotShareStreamOrFinalContent(t *testing.T) {
-	for _, fallback := range []bool{false, true} {
+	for _, fallback := range []bool{false} {
 		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
 			var effects atomic.Int32
 			want := interleavedReply()
@@ -213,23 +213,7 @@ func TestInterleavedAttemptsDoNotShareStreamOrFinalContent(t *testing.T) {
 				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 			})}
 			c.Retry = astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
-			if fallback {
-				c.Retry.MaxAttempts = 1
-				replacement := model(func(_ context.Context, n int, request astral.Request, emit func(astral.ModelEvent)) (astral.Reply, error) {
-					if n == 1 {
-						emitInterleaved(emit, want)
-						return want, nil
-					}
-					assertInterleavedRequest(t, request, want.Message)
-					return answer("done"), nil
-				})
-				replacement.spec.ID = "replacement"
-				c.ResolveModel = func(context.Context, string) (astral.Model, error) { return replacement, nil }
-				c.Fallback = func(context.Context, astral.ModelFailure) (astral.Fallback, error) {
-					return astral.Fallback{ModelID: "replacement"}, nil
-				}
-			}
-			s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+			s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 			sub := s.Subscribe(512)
 			defer sub.Close()
 			waitOK(t, start(t, s, "work"))
@@ -290,7 +274,7 @@ func TestInvalidStreamReferencesCannotCommitOrDispatch(t *testing.T) {
 				if persistent {
 					c := testConfig(m, memory.New())
 					c.Tools = []astral.Tool{work}
-					s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+					s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 					run = start(t, s, "invalid stream")
 					_, err := wait(t, run)
 					if !errors.Is(err, astral.ErrInvalid) {
@@ -302,12 +286,12 @@ func TestInvalidStreamReferencesCannotCommitOrDispatch(t *testing.T) {
 						}
 					}
 				} else {
-					a, err := astral.New(astral.Config{Model: m, Tools: []astral.Tool{work}, Retry: astral.RetryPolicy{MaxAttempts: 1}})
+					a, err := newMemorySession(astral.Config{Model: m, Tools: []astral.Tool{work}, Retry: astral.RetryPolicy{MaxAttempts: 1}})
 					if err != nil {
 						t.Fatal(err)
 					}
 					defer a.Close(context.Background())
-					run, err = a.Start(context.Background(), astral.User("invalid stream"))
+					run, err = prompt(a, context.Background(), astral.User("invalid stream"))
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -324,11 +308,11 @@ func TestInvalidStreamReferencesCannotCommitOrDispatch(t *testing.T) {
 }
 
 func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
-	for _, backend := range []string{"memory", "jsonl", "sqlite"} {
+	for _, backend := range []string{"memory", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			var store sessions.Store = memory.New()
+			var store astral.Store = memory.New()
 			closeStore := func() {}
 			if backend != "memory" {
 				store, closeStore = durableStore(t, backend, dir)
@@ -365,17 +349,17 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 				effects.Add(1)
 				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 			})}
-			c.Compaction = sessions.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
+			c.Compaction = astral.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
 			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-			a := newAgent(t, c)
-			parent := newSession(t, a, sessions.SessionOptions{ID: "ordered-parent"})
+			a := newSessions(t, c)
+			parent := newSession(t, a, astral.SessionOptions{ID: "ordered-parent"})
 			waitOK(t, start(t, parent, "work"))
 			var assistantID, completeID string
 			for _, entry := range entries(parent) {
 				if entry.Message != nil && len(entry.Message.ToolCalls()) > 0 {
 					assistantID = entry.ID
 				}
-				if entry.Kind == sessions.EntryToolResult {
+				if entry.Kind == astral.EntryToolResult {
 					completeID = entry.ID
 				}
 			}
@@ -395,7 +379,7 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 				store, closeStore = durableStore(t, backend, dir)
 			}
 			c.Store = store
-			a = newAgent(t, c)
+			a = newSessions(t, c)
 			parent, err = a.OpenSession(ctx, "ordered-parent")
 			if err != nil {
 				t.Fatal(err)
@@ -405,8 +389,8 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertInterleavedRequest(t, view.Request, want.Message)
-			for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
-				child, err := parent.Fork(ctx, completeID, sessions.ForkOptions{ID: fmt.Sprintf("ordered-child-%d", mode), Mode: mode})
+			for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
+				child, err := parent.Fork(ctx, completeID, astral.ForkOptions{ID: fmt.Sprintf("ordered-child-%d", mode), Mode: mode})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -432,7 +416,7 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 				store, closeStore = durableStore(t, backend, dir)
 			}
 			c.Store = store
-			a = newAgent(t, c)
+			a = newSessions(t, c)
 			for _, id := range []string{"ordered-parent", "ordered-child-0", "ordered-child-1"} {
 				s, err := a.OpenSession(ctx, id)
 				if err != nil {
@@ -486,7 +470,7 @@ func TestInterleavedInterruptedBatchRetainsExecutionFacts(t *testing.T) {
 		}
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("first")}}, nil
 	})}
-	parent := newSession(t, newAgent(t, c), sessions.SessionOptions{ID: "ordered-recovery"})
+	parent := newSession(t, newSessions(t, c), astral.SessionOptions{ID: "ordered-recovery"})
 	run := start(t, parent, "work")
 	signal(t, entered)
 	snapshot, err := readStore(ctx, store, parent.ID())
@@ -495,10 +479,10 @@ func TestInterleavedInterruptedBatchRetainsExecutionFacts(t *testing.T) {
 	}
 	run.Cancel()
 	_, _ = wait(t, run)
-	eachStore(t, func(t *testing.T, target sessions.Store) {
+	eachStore(t, func(t *testing.T, target astral.Store) {
 		seedHistory(t, target, parent.ID(), snapshot)
 		c.Store = target
-		reopened, err := newAgent(t, c).OpenSession(ctx, parent.ID())
+		reopened, err := newSessions(t, c).OpenSession(ctx, parent.ID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -533,9 +517,9 @@ func TestCompactionRejectsInvalidStreamReferences(t *testing.T) {
 	})
 	summary.spec.ID = "summary"
 	c := testConfig(m, memory.New())
-	c.Compaction = sessions.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1}
+	c.Compaction = astral.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	waitOK(t, start(t, s, "second"))
 	before := s.State()

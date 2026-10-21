@@ -6,8 +6,6 @@ import (
 	"fmt"
 )
 
-type BeforeToolCall func(context.Context, Invocation) (ToolDecision, error)
-
 type AfterToolCall func(context.Context, Invocation, ToolResult) (ToolResultPatch, error)
 
 type ToolDecision struct {
@@ -28,7 +26,7 @@ type ToolResultPatch struct {
 	Terminate *bool
 }
 
-func beforeTool(ctx context.Context, hook BeforeToolCall, inv Invocation) (decision ToolDecision, err error) {
+func beforeTool(ctx context.Context, hook BeforeToolCall, inv ToolContext) (decision ToolDecision, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("before-tool hook panicked: %v", p)

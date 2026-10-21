@@ -2,47 +2,52 @@ package astral
 
 import (
 	"sync"
+	"time"
 )
 
 type EventType string
 
 const (
-	EventRunStart       EventType = "run_start"
-	EventRunEnd         EventType = "run_end"
-	EventTurnStart      EventType = "turn_start"
-	EventTurnEnd        EventType = "turn_end"
-	EventMessageStart   EventType = "message_start"
-	EventMessageUpdate  EventType = "message_update"
-	EventMessageEnd     EventType = "message_end"
-	EventAttemptFailed  EventType = "attempt_failed"
-	EventAttemptStart   EventType = "attempt_start"
-	EventContextApplied EventType = "context_applied"
-	EventRetry          EventType = "retry"
-	EventToolStart      EventType = "tool_execution_start"
-	EventToolUpdate     EventType = "tool_execution_update"
-	EventToolEnd        EventType = "tool_execution_end"
-	EventCommitted      EventType = "entry_committed"
-	EventApproval       EventType = "approval_requested"
+	EventRunStart         EventType = "run_start"
+	EventRunEnd           EventType = "run_end"
+	EventTurnStart        EventType = "turn_start"
+	EventTurnEnd          EventType = "turn_end"
+	EventMessageStart     EventType = "message_start"
+	EventMessageUpdate    EventType = "message_update"
+	EventMessageEnd       EventType = "message_end"
+	EventAttemptFailed    EventType = "attempt_failed"
+	EventAttemptStart     EventType = "attempt_start"
+	EventAttemptEnd       EventType = "attempt_end"
+	EventContextApplied   EventType = "context_applied"
+	EventRetry            EventType = "retry"
+	EventToolStart        EventType = "tool_execution_start"
+	EventToolUpdate       EventType = "tool_execution_update"
+	EventToolEnd          EventType = "tool_execution_end"
+	EventCommitted        EventType = "entry_committed"
+	EventApproval         EventType = "approval_requested"
+	EventMaintenanceStart EventType = "maintenance_start"
+	EventMaintenanceEnd   EventType = "maintenance_end"
 )
 
 type Event struct {
-	Type        EventType     `json:"type"`
-	Sequence    uint64        `json:"sequence"`
-	SessionID   string        `json:"session_id"`
-	RunID       string        `json:"run_id,omitempty"`
-	TurnID      string        `json:"turn_id,omitempty"`
-	AttemptID   string        `json:"attempt_id,omitempty"`
-	EntryID     string        `json:"entry_id,omitempty"`
-	ToolCallID  string        `json:"tool_call_id,omitempty"`
-	ExecutionID string        `json:"execution_id,omitempty"`
-	ApprovalID  string        `json:"approval_id,omitempty"`
-	Model       *ModelEvent   `json:"model,omitempty"`
-	Progress    *ToolProgress `json:"progress,omitempty"`
-	Error       string        `json:"error,omitempty"`
-	Message     *Message      `json:"message,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	EndReason   string        `json:"end_reason,omitempty"`
-	InputID     string        `json:"input_id,omitempty"`
+	Attempt     *AttemptStatus `json:"attempt,omitempty"`
+	Type        EventType      `json:"type"`
+	Sequence    uint64         `json:"sequence"`
+	SessionID   string         `json:"session_id"`
+	RunID       string         `json:"run_id,omitempty"`
+	TurnID      string         `json:"turn_id,omitempty"`
+	AttemptID   string         `json:"attempt_id,omitempty"`
+	EntryID     string         `json:"entry_id,omitempty"`
+	ToolCallID  string         `json:"tool_call_id,omitempty"`
+	ExecutionID string         `json:"execution_id,omitempty"`
+	ApprovalID  string         `json:"approval_id,omitempty"`
+	Model       *ModelEvent    `json:"model,omitempty"`
+	Progress    *ToolProgress  `json:"progress,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Message     *Message       `json:"message,omitempty"`
+	Status      string         `json:"status,omitempty"`
+	EndReason   string         `json:"end_reason,omitempty"`
+	InputID     string         `json:"input_id,omitempty"`
 }
 
 // Subscription closes on overflow; emitting never blocks the executor.
@@ -114,4 +119,43 @@ func (h *eventHub) close(err error) {
 	for s := range h.subscribers {
 		h.remove(s, err)
 	}
+}
+
+// AttemptStatus is operational state. It is never projected into model messages.
+type AttemptStatus struct {
+	RunID       string    `json:"run_id,omitempty"`
+	TurnID      string    `json:"turn_id,omitempty"`
+	AttemptID   string    `json:"attempt_id"`
+	Purpose     string    `json:"purpose"`
+	Attempt     int       `json:"attempt"`
+	MaxAttempts int       `json:"max_attempts"`
+	State       string    `json:"state"`
+	NextRetryAt time.Time `json:"next_retry_at,omitempty"`
+	Error       string    `json:"error,omitempty"`
+}
+type SessionSnapshot struct {
+	EventSequence uint64            `json:"event_sequence"`
+	State         RuntimeState      `json:"state"`
+	Approvals     []PendingApproval `json:"approvals"`
+	Unresolved    []ToolRecord      `json:"unresolved"`
+	Stopping      bool              `json:"stopping"`
+	Error         string            `json:"error,omitempty"`
+	Running       bool              `json:"running"`
+	Maintenance   bool              `json:"maintenance"`
+	RunID         string            `json:"run_id,omitempty"`
+	Attempt       *AttemptStatus    `json:"attempt,omitempty"`
+}
+
+func (s *Session) Snapshot() SessionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := SessionSnapshot{State: clone(s.state), Approvals: clone(s.pendingApprovalsLocked()), Unresolved: clone(s.unresolvedLocked()), Running: s.active != nil, Maintenance: s.maintenance, Attempt: clone(s.attempt), Error: s.operationError}
+	s.events.mu.Lock()
+	snapshot.EventSequence = s.events.sequence
+	s.events.mu.Unlock()
+	snapshot.Stopping = s.active != nil && s.active.ctx.Err() != nil || s.maintenanceContext != nil && s.maintenanceContext.Err() != nil
+	if s.active != nil {
+		snapshot.RunID = s.active.id
+	}
+	return snapshot
 }

@@ -2,7 +2,7 @@
 // loading the backlog. Reducer owns counts; adapters own the pending index.
 package pending
 
-import s "github.com/oines/astral-core/session"
+import s "github.com/oines/astral-core"
 
 func Validate(entries []s.Entry, lookup func(string) (s.InputKind, bool, error)) error {
 	queued := map[string]bool{}

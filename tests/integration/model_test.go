@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -30,7 +31,7 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
 	c.Retry = astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	sub := s.Subscribe(256)
 	defer sub.Close()
 	waitOK(t, start(t, s, "go"))
@@ -59,76 +60,29 @@ func TestRetryDiscardsPartialRepliesAndDoesNotReplayTools(t *testing.T) {
 
 func TestLengthFinishNeverExecutesEvenValidToolJSON(t *testing.T) {
 	var executed atomic.Int32
-	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		if n > 1 {
-			return answer("handled truncation"), nil
-		}
+	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		r := calls(call("c1", "echo", `{"value":"complete looking"}`))
 		r.Message.FinishReason = astral.FinishLength
 		return r, nil
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&executed)}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
-	_, err := wait(t, start(t, s, "go"))
-	if err != nil || executed.Load() != 0 || len(m.observed()) != 2 {
-		t.Fatalf("truncated output executed: %v", err)
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
+	result, err := wait(t, start(t, s, "go"))
+	if !errors.Is(err, astral.ErrIncompleteResponse) || executed.Load() != 0 || len(m.observed()) != 1 || result.LastMessage != nil || len(toolResults(s)) != 0 {
+		t.Fatalf("truncated output entered execution: %v", err)
 	}
-	results := toolResults(s)
-	if len(results) != 1 || results[0].Outcome != astral.OutcomeNotExecuted || results[0].Code != "response_length" {
-		t.Fatal("truncated calls did not receive synthetic results")
-	}
-	found := false
+	audited := false
 	for _, e := range entries(s) {
-		if e.Message != nil && e.Message.FinishReason == astral.FinishLength {
-			found = true
+		if e.Message != nil && e.Message.Role == astral.RoleAssistant {
+			t.Fatal("truncated assistant entered conversation")
+		}
+		if e.ModelResponse != nil && e.ModelResponse.Reply.Message.FinishReason == astral.FinishLength {
+			audited = true
 		}
 	}
-	if !found {
-		t.Fatal("truncated assistant was not preserved")
-	}
-
-}
-
-func TestFallbackAndOpaqueMetadata(t *testing.T) {
-	opaque := json.RawMessage(`{"signature":"opaque-proof","provider":"a"}`)
-	var effects atomic.Int32
-	aModel := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		if n == 1 {
-			reply := calls(call("signed", "echo", `{"value":"result"}`))
-			reply.Message.Metadata = opaque
-			reply.Message.Content[0].ToolCall.Metadata = opaque
-			reply.Message.Content = append([]astral.Content{{Type: "reasoning", Text: "reasoning", Metadata: opaque}}, reply.Message.Content...)
-			return reply, nil
-		}
-		return astral.Reply{}, &astral.ModelError{Transient: true, Message: "unavailable"}
-	})
-	bModel := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		found := false
-		for _, m := range r.Messages {
-			if m.Role == astral.RoleAssistant {
-				found = string(m.Metadata) == string(opaque) && string(m.ToolCalls()[0].Metadata) == string(opaque) && string(m.Content[0].Metadata) == string(opaque)
-			}
-		}
-		if !found {
-			return astral.Reply{}, errors.New("opaque fields lost")
-		}
-		if r.ModelID != "fallback" || r.MaxOutputTokens != 1000 {
-			return astral.Reply{}, errors.New("fallback budget not rebuilt")
-		}
-		return answer("recovered"), nil
-	})
-	bModel.spec = astral.ModelSpec{ID: "fallback", ContextWindow: 20000, MaxOutputTokens: 1000}
-	c := testConfig(aModel, memory.New())
-	c.Tools = []astral.Tool{echoTool(&effects)}
-	c.ResolveModel = func(_ context.Context, id string) (astral.Model, error) { return bModel, nil }
-	c.Fallback = func(context.Context, astral.ModelFailure) (astral.Fallback, error) {
-		return astral.Fallback{ModelID: "fallback"}, nil
-	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
-	waitOK(t, start(t, s, "go"))
-	if effects.Load() != 1 || s.Configuration().ModelID != "test" {
-		t.Fatal("fallback replayed tools or changed preference")
+	if !audited {
+		t.Fatal("failed response audit was lost")
 	}
 }
 
@@ -151,7 +105,7 @@ func TestModelSelectionTakesEffectOnNextRequest(t *testing.T) {
 	c := testConfig(first, memory.New())
 	c.Tools = []astral.Tool{echoTool(nil)}
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return second, nil }
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
 	if err := s.SelectModel(context.Background(), "second"); err != nil {

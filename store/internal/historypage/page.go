@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 
-	s "github.com/oines/astral-core/session"
+	s "github.com/oines/astral-core"
 )
 
 type Reader interface {

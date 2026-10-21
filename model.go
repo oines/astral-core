@@ -137,17 +137,6 @@ type ModelEvent struct {
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
-type ModelFailure struct {
-	SessionID, ModelID string
-	Attempts           int
-	Err                error
-}
-
-type Fallback struct {
-	ModelID    string
-	Persistent bool
-}
-
 func (m ModelFunc) Spec() ModelSpec { return m.Specification }
 
 func (m ModelFunc) Stream(ctx context.Context, request Request, emit func(ModelEvent)) (Reply, error) {
@@ -162,32 +151,6 @@ func validateModelSpec(spec ModelSpec) error {
 		return fmtInvalid("model needs a stable ID and positive token limits")
 	}
 	return nil
-}
-
-func (a *Agent) model(ctx context.Context, id string) (Model, error) {
-	var m Model
-	var err error
-	if id == a.modelID {
-		m = a.config.Model
-	} else if a.config.ResolveModel != nil {
-		m, err = a.config.ResolveModel(ctx, id)
-	} else {
-		return nil, fmtInvalid("model %q has no host resolver", id)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if m == nil {
-		return nil, fmtInvalid("model resolver returned nil for %q", id)
-	}
-	spec := m.Spec()
-	if err = validateModelSpec(spec); err != nil {
-		return nil, err
-	}
-	if spec.ID != id {
-		return nil, fmtInvalid("model resolver returned %q for %q", spec.ID, id)
-	}
-	return m, nil
 }
 
 func stream(ctx context.Context, model Model, request Request, emit func(ModelEvent)) (reply Reply, err error) {
@@ -240,7 +203,7 @@ func validateReply(reply Reply) error {
 	if reply.Message.FinishReason == FinishCancelled {
 		return context.Canceled
 	}
-	if reply.Message.FinishReason != FinishStop && reply.Message.FinishReason != FinishToolCalls && reply.Message.FinishReason != FinishLength {
+	if reply.Message.FinishReason != FinishStop && reply.Message.FinishReason != FinishToolCalls {
 		return fmt.Errorf("%w: finish reason %q: %s", ErrIncompleteResponse, reply.Message.FinishReason, reply.Message.ErrorMessage)
 	}
 	if reply.Message.Role != RoleAssistant {

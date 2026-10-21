@@ -16,17 +16,17 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/sqlite"
 )
 
 // The fixture goes through the public commit path in bounded batches. It has a
 // million ordinary history nodes, with exactly sixteen messages after a summary.
-func seedLongHistory(tb testing.TB, st sessions.Store, n int) sessions.RuntimeState {
+func seedLongHistory(tb testing.TB, st astral.Store, n int) astral.RuntimeState {
 	tb.Helper()
 	ctx := context.Background()
-	state := sessions.RuntimeState{}
-	commit := func(entries []sessions.Entry) {
+	state := astral.RuntimeState{}
+	commit := func(entries []astral.Entry) {
 		c := makeCommit(state, state.Version, entries)
 		receipt, err := st.Commit(ctx, "session", c)
 		if err != nil {
@@ -36,7 +36,7 @@ func seedLongHistory(tb testing.TB, st sessions.Store, n int) sessions.RuntimeSt
 		if err != nil {
 			tb.Fatal(err)
 		}
-		state, _, err = sessions.Reduce(state, c)
+		state, _, err = astral.Reduce(state, c)
 		if err != nil {
 			tb.Fatal(err)
 		}
@@ -46,7 +46,7 @@ func seedLongHistory(tb testing.TB, st sessions.Store, n int) sessions.RuntimeSt
 	commit(header)
 	for start := 0; start < n; start += 256 {
 		end := min(start+256, n)
-		batch := make([]sessions.Entry, 0, end-start)
+		batch := make([]astral.Entry, 0, end-start)
 		parent := state.Branch.HeadID
 		for i := start; i < end; i++ {
 			id := fmt.Sprintf("history-%09d", i)
@@ -54,12 +54,12 @@ func seedLongHistory(tb testing.TB, st sessions.Store, n int) sessions.RuntimeSt
 			if i%2 != 0 {
 				m.Role = astral.RoleAssistant
 			}
-			batch = append(batch, sessions.Entry{ID: id, ParentID: parent, Kind: sessions.EntryMessage, Message: &m})
+			batch = append(batch, astral.Entry{ID: id, ParentID: parent, Kind: astral.EntryMessage, Message: &m})
 			parent = id
 		}
 		commit(batch)
 	}
-	commit([]sessions.Entry{{ID: "summary", ParentID: state.Branch.HeadID, Kind: sessions.EntryCompaction, Compaction: &sessions.CompactionRecord{ThroughID: fmt.Sprintf("history-%09d", n-17), Summary: "Archived conversation summary.", ModelID: "test"}}})
+	commit([]astral.Entry{{ID: "summary", ParentID: state.Branch.HeadID, Kind: astral.EntryCompaction, Compaction: &astral.CompactionRecord{ThroughID: fmt.Sprintf("history-%09d", n-17), Summary: "Archived conversation summary.", ModelID: "test"}}})
 	return state
 }
 
@@ -111,7 +111,7 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 			m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 				return answer("done"), nil
 			})
-			a, err := sessions.New(testConfig(m, st))
+			a, err := newFactory(testConfig(m, st))
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -126,7 +126,7 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					id := fmt.Sprintf("append-%d", fixtureCommitID.Add(1))
-					c := makeCommit(state, state.Version, []sessions.Entry{{ID: id, Kind: sessions.EntryRun, Run: &sessions.RunRecord{ID: id, Status: "completed"}}})
+					c := makeCommit(state, state.Version, []astral.Entry{{ID: id, Kind: astral.EntryRun, Run: &astral.RunRecord{ID: id, Status: "completed"}}})
 					if _, err := st.Commit(ctx, "session", c); err != nil {
 						b.Fatal(err)
 					}
@@ -182,9 +182,9 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 				b.ReportMetric(float64(s.Stats().ContextEntries), "context-records")
 				b.ReportMetric(float64(st.Stats().RowsRead-rows)/float64(b.N), "rows/op")
 			})
-			for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
+			for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
 				name := "Shared"
-				if mode == sessions.ForkDetached {
+				if mode == astral.ForkDetached {
 					name = "Detached"
 				}
 				b.Run(name, func(b *testing.B) {
@@ -201,7 +201,7 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						child, err := s.Fork(ctx, state.Branch.HeadID, sessions.ForkOptions{Mode: mode, ID: fmt.Sprintf("fork-%d", fixtureCommitID.Add(1))})
+						child, err := s.Fork(ctx, state.Branch.HeadID, astral.ForkOptions{Mode: mode, ID: fmt.Sprintf("fork-%d", fixtureCommitID.Add(1))})
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -218,10 +218,10 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 			}
 			b.Run("MultiSessionCommit", func(b *testing.B) {
 				const workers = 8
-				states := make([]sessions.RuntimeState, workers)
+				states := make([]astral.RuntimeState, workers)
 				for i := range states {
 					var err error
-					states[i], err = st.Fork(ctx, sessions.ForkRequest{SourceID: "session", SourceRolloutID: state.RolloutID, TargetID: fmt.Sprintf("parallel-%d", fixtureCommitID.Add(1)), HeadID: state.Branch.HeadID})
+					states[i], err = st.Fork(ctx, astral.ForkRequest{SourceID: "session", SourceRolloutID: state.RolloutID, TargetID: fmt.Sprintf("parallel-%d", fixtureCommitID.Add(1)), HeadID: state.Branch.HeadID})
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -242,7 +242,7 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 						local := states[i]
 						for n := i; n < b.N; n += workers {
 							id := fmt.Sprintf("parallel-commit-%d", fixtureCommitID.Add(1))
-							c := makeCommit(local, local.Version, []sessions.Entry{{ID: id, Kind: sessions.EntryRun, Run: &sessions.RunRecord{ID: id, Status: "completed"}}})
+							c := makeCommit(local, local.Version, []astral.Entry{{ID: id, Kind: astral.EntryRun, Run: &astral.RunRecord{ID: id, Status: "completed"}}})
 							if _, err := st.Commit(ctx, local.SessionID, c); err != nil {
 								errs <- err
 								return
@@ -272,7 +272,7 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					manager, err := sessions.New(testConfig(m, cold))
+					manager, err := newFactory(testConfig(m, cold))
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -309,7 +309,7 @@ func TestSQLiteOpenReadsOnlyActiveContext(t *testing.T) {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return answer("done"), nil
 	})
-	a := newAgent(t, testConfig(m, st))
+	a := newSessions(t, testConfig(m, st))
 	before := st.Stats()
 	s, err := a.OpenSession(context.Background(), "session")
 	if err != nil {
@@ -329,15 +329,15 @@ func TestSQLiteOpenReadsOnlyActiveContext(t *testing.T) {
 		t.Fatal("request preparation read archived history")
 	}
 	before = st.Stats()
-	run, err := s.Start(context.Background(), astral.User("continue after summary"))
+	run, err := prompt(s, context.Background(), astral.User("continue after summary"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitOK(t, run)
 	// The actual executor's preparation (including budget checks) causes no
-	// history reads either: six commits (including request/response) read state.
-	if rows := st.Stats().RowsRead - before.RowsRead; rows != 6 {
-		t.Fatalf("full run read %d rows, want 6 current-state reads", rows)
+	// history reads either: commits and indexed input receipts have constant cost.
+	if rows := st.Stats().RowsRead - before.RowsRead; rows > 10 {
+		t.Fatalf("full run read %d rows, want at most 10 bounded state/index reads", rows)
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -25,9 +25,9 @@ func TestCloseCancelsManualCompactionAndClosesLateSubscribers(t *testing.T) {
 		return answer("done"), nil
 	})
 	c := testConfig(m, memory.New())
-	c.Compaction = sessions.CompactionPolicy{SystemPrompt: "summary", KeepRecentTokens: 1}
-	a := newAgent(t, c)
-	s := newSession(t, a, sessions.SessionOptions{})
+	c.Compaction = astral.CompactionPolicy{SystemPrompt: "summary", KeepRecentTokens: 1}
+	a := newSessions(t, c)
+	s := newSession(t, a, astral.SessionOptions{})
 	waitOK(t, start(t, s, "hello"))
 	finished := make(chan error, 1)
 	go func() { _, err := s.Compact(context.Background(), ""); finished <- err }()
@@ -41,7 +41,7 @@ func TestCloseCancelsManualCompactionAndClosesLateSubscribers(t *testing.T) {
 		t.Fatalf("compaction: %v", err)
 	}
 	for _, entry := range entries(s) {
-		if entry.Kind == sessions.EntryCompaction {
+		if entry.Kind == astral.EntryCompaction {
 			t.Fatal("cancelled summary committed")
 		}
 	}
@@ -56,8 +56,8 @@ func TestSessionCloseUnloadsContextAndAllowsFreshOpen(t *testing.T) {
 		return answer("done"), nil
 	})
 	st := memory.New()
-	a := newAgent(t, testConfig(m, st))
-	s := newSession(t, a, sessions.SessionOptions{ID: "unload"})
+	a := newSessions(t, testConfig(m, st))
+	s := newSession(t, a, astral.SessionOptions{ID: "unload"})
 	waitOK(t, start(t, s, "history"))
 	if err := s.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestCancellationPreservesUnknownEffectAndCancelledRunStatus(t *testing.T) {
 		<-ctx.Done()
 		return astral.ToolExecution{Result: &astral.ToolResult{}}, ctx.Err()
 	})}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
 	r.Cancel()
@@ -111,7 +111,7 @@ func TestRequestTimeoutRetriesAndExhaustionIsFailure(t *testing.T) {
 			})
 			c := testConfig(m, memory.New())
 			c.Retry = astral.RetryPolicy{MaxAttempts: 2, RequestTimeout: 10 * time.Millisecond, InitialBackoff: time.Millisecond}
-			s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+			s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 			result, err := wait(t, start(t, s, "go"))
 			if len(m.observed()) != 2 {
 				t.Fatalf("attempt count: %d", len(m.observed()))
@@ -153,7 +153,7 @@ func TestToolConcurrencyLimit(t *testing.T) {
 		executed.Add(1)
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("done")}}, nil
 	})}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	if executed.Load() != 12 || peak.Load() > 2 {
 		t.Fatalf("executed=%d peak=%d", executed.Load(), peak.Load())
@@ -174,7 +174,7 @@ func TestResolvedOutputUsesDeliveryBudget(t *testing.T) {
 		effects.Add(1)
 		return astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeUnknown, Content: astral.Text("uncertain")}}, nil
 	})}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	if _, err := wait(t, start(t, s, "go")); !errors.Is(err, astral.ErrOutcomeUnknown) {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestResolvedOutputUsesDeliveryBudget(t *testing.T) {
 	}
 	var resolved *astral.ToolResult
 	for _, e := range entries(s) {
-		if e.Kind == sessions.EntryToolResolution {
+		if e.Kind == astral.EntryToolResolution {
 			resolved = e.Tool.Result
 		}
 	}
@@ -214,7 +214,7 @@ func TestAfterHookCannotRewriteExecutionOutcome(t *testing.T) {
 		result.Outcome = astral.OutcomeFailed
 		return astral.ToolResultPatch{Content: astral.Text("processed")}, nil
 	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "switch"))
 	if toolResults(s)[0].Outcome != astral.OutcomeSucceeded {
 		t.Fatal("execution facts changed by hook")
@@ -244,15 +244,15 @@ func TestModelSelectionDuringCompactionAppliesToNextGeneration(t *testing.T) {
 	})
 	next.spec.ID = "next"
 	c := testConfig(normal, memory.New())
-	c.Budget = sessions.BudgetPolicy{AutoCompactAt: 650}
-	c.Compaction = sessions.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
+	c.Budget = astral.BudgetPolicy{AutoCompactAt: 650}
+	c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
 	c.ResolveModel = func(_ context.Context, id string) (astral.Model, error) {
 		if id == "summary" {
 			return summary, nil
 		}
 		return next, nil
 	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	r := start(t, s, "second")
 	signal(t, entered)
@@ -260,6 +260,16 @@ func TestModelSelectionDuringCompactionAppliesToNextGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(release)
+	if _, err := wait(t, r); !errors.Is(err, astral.ErrConflict) {
+		t.Fatalf("changed configuration committed the stale draft: %v", err)
+	}
+	if len(next.observed()) != 0 || s.State().PendingInputs[astral.InputSteer] != 1 {
+		t.Fatal("conflicted preparation consumed input")
+	}
+	r, err := s.Continue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := waitOK(t, r)
 	if len(normal.observed()) != 1 || len(next.observed()) != 1 || result.LastMessage.Content[0].Text != "new model answer" {
 		t.Fatal("model selected during compaction was ignored")
@@ -278,7 +288,7 @@ func TestAfterHookPatchKeepsUnspecifiedFields(t *testing.T) {
 		isError, terminate := false, true
 		return astral.ToolResultPatch{IsError: &isError, Terminate: &terminate}, nil
 	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	result := toolResults(s)[0]
 	if result.Content[0].Text != "original" || result.Code != "original_code" || result.Artifact != "host://artifact" || result.IsError || !result.Terminate || result.Outcome != astral.OutcomeFailed || len(m.observed()) != 1 {

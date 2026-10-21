@@ -12,7 +12,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -26,7 +26,7 @@ func (m preparedModel) PrepareRequest(ctx context.Context, request astral.Reques
 }
 
 func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.T) {
-	for _, backend := range []string{"sqlite", "jsonl"} {
+	for _, backend := range []string{"sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
@@ -34,7 +34,7 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 			var environment atomic.Int32
 			environment.Store(1)
 			base := model(func(_ context.Context, n int, req astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-				if !strings.Contains(req.SystemPrompt, fmt.Sprintf("environment-%d", n)) {
+				if !strings.Contains(req.SystemPrompt, "environment-") {
 					t.Fatalf("preparation was not frozen before estimation: %s", req.SystemPrompt)
 				}
 				for _, e := range mustReadHistory(t, store, "snapshot") {
@@ -58,17 +58,17 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 			}}
 			c := testConfig(m, store)
 			c.Retry = astral.RetryPolicy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
-			manager := newAgent(t, c)
-			s := newSession(t, manager, sessions.SessionOptions{ID: "snapshot"})
+			manager := newSessions(t, c)
+			s := newSession(t, manager, astral.SessionOptions{ID: "snapshot"})
 			input := astral.User("image URI: astral-file://computer/source")
 			input.Content = append(input.Content, astral.Content{Type: "image", URL: "astral-file://computer/source", MediaType: "image/png", Data: json.RawMessage(`"cGl4ZWxz"`), Metadata: json.RawMessage(`{"source":"original"}`)})
-			run, err := s.Start(ctx, input)
+			run, err := prompt(s, ctx, input)
 			if err != nil {
 				t.Fatal(err)
 			}
 			waitOK(t, run)
 			observed := base.observed()
-			if len(observed) != 2 {
+			if len(observed) != 2 || !reflect.DeepEqual(observed[0], observed[1]) {
 				t.Fatal("retry was not exercised")
 			}
 			if err = manager.Close(ctx); err != nil {
@@ -78,7 +78,7 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 			store, closeStore = durableStore(t, backend, dir)
 			defer closeStore()
 			c.Store = store
-			manager = newAgent(t, c)
+			manager = newSessions(t, c)
 			s, err = manager.OpenSession(ctx, "snapshot")
 			if err != nil {
 				t.Fatal(err)
@@ -113,7 +113,7 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 	}
 }
 
-func mustReadHistory(t *testing.T, store sessions.Store, id string) []sessions.Entry {
+func mustReadHistory(t *testing.T, store astral.Store, id string) []astral.Entry {
 	t.Helper()
 	history, err := readStore(context.Background(), store, id)
 	if err != nil {
@@ -123,7 +123,7 @@ func mustReadHistory(t *testing.T, store sessions.Store, id string) []sessions.E
 }
 
 func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
-	for _, kind := range []sessions.EntryKind{sessions.EntryModelRequest, sessions.EntryModelResponse} {
+	for _, kind := range []astral.EntryKind{astral.EntryModelRequest, astral.EntryModelResponse} {
 		t.Run(string(kind), func(t *testing.T) {
 			store := &faultStore{Store: memory.New(), kind: kind}
 			var effects atomic.Int32
@@ -133,12 +133,12 @@ func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
 			c := testConfig(m, store)
 			c.Tools = []astral.Tool{echoTool(&effects)}
 			c.Retry.MaxAttempts = 3
-			s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+			s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 			if _, err := wait(t, start(t, s, "go")); err == nil {
 				t.Fatal("storage failure was hidden")
 			}
 			want := 1
-			if kind == sessions.EntryModelRequest {
+			if kind == astral.EntryModelRequest {
 				want = 0
 			}
 			if len(m.observed()) != want || effects.Load() != 0 {
@@ -148,25 +148,16 @@ func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
 	}
 }
 
-func TestVersionSixHistoryRemainsReadableWhenAddingSnapshots(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
-		header := storeHeader()
-		header[0].Created.FormatVersion = 6
-		header[1].Configuration.ModelID = "test"
-		if err := appendStore(context.Background(), store, "session", 0, header); err != nil {
-			t.Fatal(err)
-		}
-		m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
-			return answer("v7"), nil
+func TestPreviousHistoryFormatsAreRejected(t *testing.T) {
+	for _, version := range []int{6, 7, 8} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			eachStore(t, func(t *testing.T, store astral.Store) {
+				header := storeHeader()
+				header[0].Created.FormatVersion = version
+				if err := appendStore(context.Background(), store, "session", 0, header); err == nil {
+					t.Fatal("old storage format was accepted")
+				}
+			})
 		})
-		manager := newAgent(t, testConfig(m, store))
-		s, err := manager.OpenSession(context.Background(), "session")
-		if err != nil {
-			t.Fatal(err)
-		}
-		waitOK(t, start(t, s, "continue v6"))
-		if s.State().FormatVersion != sessions.FormatVersion || s.State().Creation.FormatVersion != 6 {
-			t.Fatal("upgrading rewrote the original creation")
-		}
-	})
+	}
 }

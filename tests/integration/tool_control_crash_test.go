@@ -12,24 +12,23 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
 )
 
 type controlCrashStore struct {
-	sessions.Store
+	astral.Store
 	stage string
 }
 
-func (s controlCrashStore) Commit(ctx context.Context, id string, c sessions.Commit) (sessions.Receipt, error) {
+func (s controlCrashStore) Commit(ctx context.Context, id string, c astral.Commit) (astral.Receipt, error) {
 	for _, e := range c.Entries {
-		if s.stage == "before-control" && e.Kind == sessions.EntryToolControl {
+		if s.stage == "before-control" && e.Kind == astral.EntryToolControl {
 			crashBarrier()
 		}
 	}
 	r, err := s.Store.Commit(ctx, id, c)
 	if err == nil {
 		for _, e := range c.Entries {
-			if s.stage == "started" && e.Kind == sessions.EntryToolStarted || s.stage == "committed" && e.Kind == sessions.EntryToolControl {
+			if s.stage == "started" && e.Kind == astral.EntryToolStarted || s.stage == "committed" && e.Kind == astral.EntryToolControl {
 				crashBarrier()
 			}
 		}
@@ -37,7 +36,7 @@ func (s controlCrashStore) Commit(ctx context.Context, id string, c sessions.Com
 	return r, err
 }
 
-func controlCrashConfig(st sessions.Store, dir string) sessions.Config {
+func controlCrashConfig(st astral.Store, dir string) astral.Config {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		if err := durableCount(dir, "models"); err != nil {
 			return astral.Reply{}, err
@@ -61,13 +60,13 @@ func TestToolControlCrashWorker(t *testing.T) {
 	dir, backend, stage := os.Getenv("ASTRAL_CRASH_DIR"), os.Getenv("ASTRAL_CRASH_BACKEND"), os.Getenv("ASTRAL_CRASH_STAGE")
 	st, closeStore := durableStore(t, backend, dir)
 	defer closeStore()
-	s := newSession(t, newAgent(t, controlCrashConfig(controlCrashStore{st, stage}, dir)), sessions.SessionOptions{ID: "crash"})
+	s := newSession(t, newSessions(t, controlCrashConfig(controlCrashStore{st, stage}, dir)), astral.SessionOptions{ID: "crash"})
 	waitOK(t, start(t, s, "go"))
 	t.Fatal("worker missed its crash barrier")
 }
 
 func TestToolControlSurvivesProcessCrash(t *testing.T) {
-	for _, backend := range []string{"jsonl", "sqlite"} {
+	for _, backend := range []string{"sqlite"} {
 		for _, stage := range []string{"started", "before-control", "committed"} {
 			t.Run(backend+"/"+stage, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -102,7 +101,7 @@ func TestToolControlSurvivesProcessCrash(t *testing.T) {
 				}
 				st, closeStore := durableStore(t, backend, dir)
 				defer closeStore()
-				s, err := newAgent(t, controlCrashConfig(st, dir)).OpenSession(ctx, "crash")
+				s, err := newSessions(t, controlCrashConfig(st, dir)).OpenSession(ctx, "crash")
 				if err != nil {
 					t.Fatal(err)
 				}

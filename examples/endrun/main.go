@@ -10,7 +10,6 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	"github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -47,23 +46,19 @@ func run(ctx context.Context) error {
 		}
 		return demo.Answer("This new input starts a separate Run."), nil
 	})
-	manager, err := session.New(session.Config{
+	chat, err := astral.NewSession(ctx, astral.Config{
 		Model: model, Tools: []astral.Tool{noReply}, Store: memory.New(),
 		EstimateTokens: demo.EstimateTokens,
-	})
+	}, astral.SessionOptions{ID: "host-endrun"})
 	if err != nil {
 		return err
 	}
-	defer manager.Close(context.Background())
-	chat, err := manager.NewSession(ctx, session.SessionOptions{ID: "host-endrun"})
+	defer chat.Close(context.Background())
+	activity, err := chat.Prompt(ctx, astral.Input{ID: "first", Message: astral.User("No action is needed.")})
 	if err != nil {
 		return err
 	}
-	activity, err := chat.Start(ctx, astral.User("No action is needed."))
-	if err != nil {
-		return err
-	}
-	result, err := activity.Wait(ctx)
+	result, err := activity.Run.Wait(ctx)
 	if err != nil {
 		return err
 	}
@@ -73,11 +68,11 @@ func run(ctx context.Context) error {
 	}
 	// The raw assistant/control history remains available through History().
 	// EndRun leaves all pending input and host-owned processes alone.
-	activity, err = chat.Start(ctx, astral.User("Here is a new task."))
+	activity, err = chat.Prompt(ctx, astral.Input{ID: "next", Message: astral.User("Here is a new task.")})
 	if err != nil {
 		return err
 	}
-	result, err = activity.Wait(ctx)
+	result, err = activity.Run.Wait(ctx)
 	if err != nil {
 		return err
 	}

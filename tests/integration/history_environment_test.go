@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -20,8 +20,8 @@ func TestSharedForkPreservesSiblingPathsAndIndependentHeads(t *testing.T) {
 	})
 	c := testConfig(m, store)
 	c.SystemPrompt = "first config"
-	a := newAgent(t, c)
-	s := newSession(t, a, sessions.SessionOptions{ID: "tree"})
+	a := newSessions(t, c)
+	s := newSession(t, a, astral.SessionOptions{ID: "tree"})
 	first := waitOK(t, start(t, s, "one"))
 	configuration := s.Configuration()
 	configuration.SystemPrompt = "second config"
@@ -30,7 +30,7 @@ func TestSharedForkPreservesSiblingPathsAndIndependentHeads(t *testing.T) {
 	}
 	second := waitOK(t, start(t, s, "two"))
 	originalCount := len(entries(s))
-	child, err := s.Fork(context.Background(), first.LastMessageID, sessions.ForkOptions{ID: "sibling"})
+	child, err := s.Fork(context.Background(), first.LastMessageID, astral.ForkOptions{ID: "sibling"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestSharedForkPreservesSiblingPathsAndIndependentHeads(t *testing.T) {
 	if err = a.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := newAgent(t, c).OpenSession(context.Background(), s.ID())
+	opened, err := newSessions(t, c).OpenSession(context.Background(), s.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestDetachedParentBoundaryCopiesPathButNoOperationalState(t *testing.T) {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return answer("answer"), nil
 	})
-	s := newSession(t, newAgent(t, testConfig(m, memory.New())), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, testConfig(m, memory.New())), astral.SessionOptions{})
 	waitOK(t, start(t, s, "one"))
 	waitOK(t, start(t, s, "two"))
 	var target string
@@ -82,15 +82,15 @@ func TestDetachedParentBoundaryCopiesPathButNoOperationalState(t *testing.T) {
 			target = entry.ParentID
 		}
 	}
-	if _, err := s.FollowUp(context.Background(), astral.User("source-only queue")); err != nil {
+	if _, err := followUp(s, context.Background(), astral.User("source-only queue")); err != nil {
 		t.Fatal(err)
 	}
-	fork, err := s.Fork(context.Background(), target, sessions.ForkOptions{ID: "fork", Mode: sessions.ForkDetached})
+	fork, err := s.Fork(context.Background(), target, astral.ForkOptions{ID: "fork", Mode: astral.ForkDetached})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries(fork) {
-		if !entry.IsHistory() && entry.Kind != sessions.EntryCreated {
+		if !entry.IsHistory() && entry.Kind != astral.EntryCreated {
 			t.Fatalf("operational state copied: %s", entry.Kind)
 		}
 	}
@@ -105,7 +105,7 @@ func TestDetachedParentBoundaryCopiesPathButNoOperationalState(t *testing.T) {
 	if len(m.observed()) != 3 {
 		t.Fatal("source queue copied to fork")
 	}
-	if _, err = s.Fork(context.Background(), fork.Head(), sessions.ForkOptions{ID: "foreign"}); err == nil {
+	if _, err = s.Fork(context.Background(), fork.Head(), astral.ForkOptions{ID: "foreign"}); err == nil {
 		t.Fatal("cross-session entry accepted")
 	}
 }
@@ -120,7 +120,7 @@ func TestHistoricalPartialToolBatchCannotExecute(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = []astral.Tool{echoTool(&effects)}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "go"))
 	var boundary string
 	for _, entry := range entries(s) {
@@ -128,7 +128,7 @@ func TestHistoricalPartialToolBatchCannotExecute(t *testing.T) {
 			boundary = entry.ID
 		}
 	}
-	if _, err := s.Fork(context.Background(), boundary, sessions.ForkOptions{ID: "incomplete"}); !errors.Is(err, astral.ErrIncompleteBatch) {
+	if _, err := s.Fork(context.Background(), boundary, astral.ForkOptions{ID: "incomplete"}); !errors.Is(err, astral.ErrIncompleteBatch) {
 		t.Fatalf("partial fork created: %v", err)
 	}
 	if effects.Load() != 1 {

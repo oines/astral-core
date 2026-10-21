@@ -1,241 +1,128 @@
 # astral-core
 
-**An embeddable Go SDK for agents that outlive a single request.**
+An embeddable Go SDK for durable agent sessions.
 
-把 Agent Loop、工具执行和长期会话直接嵌进你的 Go 应用。你决定使用哪个模型、连接什么工具、在哪里执行、如何保存数据；`astral-core` 负责让 Agent **可靠地运行、继续运行，并记住发生过什么**。
+`astral-core` 把输入接收、模型调用、工具执行、审批、历史分支和恢复集中到一个 `Session`。Host 提供模型、Store、TokenEstimator 和工具，并管理业务资源与执行所有权。Memory 与 SQLite 使用同一个执行实现。
 
-它是一个 SDK，**不是**需要单独部署的 Agent 服务，也不替你决定 UI、工作区或产品形态。
+## 快速开始
 
-## 为什么用它？
+需要 Go 1.23+。以下示例使用离线模型，运行时不需要模型账号：
 
-一次模型调用并不难。难的是把它变成一个可以长期运行的 Agent：用户中途追加要求、工具执行到一半断线、服务重启后继续、从过去某一步分出新的尝试，而且不能因为恢复会话就重复执行有副作用的命令。
-
-`astral-core` 把这些执行语义集中在一个地方：
-
-- **完整的 Agent Loop**：流式生成、工具调用、并行执行、模型重试与 Fallback。
-- **随时介入**：Steer、Follow-up、Cancel、实时事件与工具审批。
-- **持久 Session**：保存对话和执行轨迹；重启后从已确认的状态继续。
-- **长上下文管理**：Token 预算、自动/手动 Compaction，不删除原始历史。
-- **历史分支**：从任意合法历史节点 Fork，尝试另一条路径，不影响原会话。
-- **可插拔执行环境**：工具可以在本机、远程机器或自定义 Runtime 运行，环境发现完全由宿主负责。
-
-不必采用某种 Agent Framework 的全部约定。可以只用 Core，也可以按需加入持久化、标准工具和上下文注入。
-
-## 五分钟试跑
-
-需要 **Go 1.23+**。仓库提供无需 API Key 的离线示例，使用确定性测试模型演示真实的 Agent 调用流程。
-
-```bash
-git clone https://github.com/oines/astral-core.git
-cd astral-core
-
-go run ./examples/basic        # 一次模型 → 工具 → 模型的完整循环
-go run ./examples/approval     # 持久审批与会话恢复
-go run ./examples/fork         # 从历史节点创建新 Session
-go run ./examples/endrun       # Host 工具无结果地结束 Run
-```
-
-还可以运行两个使用真实文件和 Shell 的示例（需要 Unix）：
-
-```bash
+```sh
+go run ./examples/basic
+go run ./examples/approval
+go run ./examples/fork
+go run ./examples/endrun
+# 以下两个示例使用真实临时目录和 Unix Shell / PTY：
 go run ./examples/tools
 go run ./examples/environments
 ```
 
-在自己的 Go 项目中安装：
-
-```bash
-go get github.com/oines/astral-core
-```
-
-## 使用方式
-
-### 1. 只需要一个 Agent Loop
-
-```go
-import astral "github.com/oines/astral-core"
-
-agent, err := astral.New(astral.Config{
-    Model: model,
-    Tools: []astral.Tool{myTool},
-})
-if err != nil { return err }
-defer agent.Close(context.Background())
-
-run, err := agent.Start(ctx, astral.User("帮我完成这项任务"))
-if err != nil { return err }
-result, err := run.Wait(ctx)
-```
-
-`model` 是你接入的模型适配器（实现 `Spec` / `Stream`），`myTool` 是可选的自定义工具。完整的可运行实现见 [`examples/basic`](examples/basic/main.go)。
-
-这个模式不需要数据库，适合短任务、测试或自己管理会话的应用。
-
-### 2. 需要跨重启的长期会话？
-
-加入 `session` 和 Store 即可，不需要换一套 Agent Loop。
+接入自己的模型和工具：
 
 ```go
 import (
-    astral "github.com/oines/astral-core"
-    "github.com/oines/astral-core/session"
+    "context"
+    core "github.com/oines/astral-core"
     "github.com/oines/astral-core/store/sqlite"
 )
 
-db, err := sqlite.Open("astral.db")
+store, err := sqlite.Open("history.db")
 if err != nil { return err }
-defer db.Close()
+defer store.Close()
 
-manager, err := session.New(session.Config{
-    Model:          model,
-    Store:          db,
+config := core.Config{
+    Model: model,
+    Store: store,
     EstimateTokens: estimateTokens,
-    Tools:          tools,
+    Tools: tools,
+}
+chat, err := core.NewSession(ctx, config, core.SessionOptions{ID: "conversation"})
+if err != nil { return err }
+defer chat.Close(context.Background())
+
+submission, err := chat.Prompt(ctx, core.Input{
+    ID: "request-001", // 重试同一提交时复用此 ID
+    Message: core.User("检查项目并运行测试"),
 })
 if err != nil { return err }
-defer manager.Close(context.Background())
-
-chat, err := manager.NewSession(ctx, session.SessionOptions{ID: "my-agent"})
-if err != nil { return err }
-
-run, err := chat.Start(ctx, astral.User("检查项目并运行测试"))
-if err != nil { return err }
-_, err = run.Wait(ctx)
-
-// 以后可以使用 manager.OpenSession(ctx, "my-agent") 重新打开。
+if submission.Run != nil {
+    result, err := submission.Run.Wait(ctx)
+    if err != nil { return err }
+    _ = result
+}
+// 重复提交返回原输入回执，Run 为 nil，不再次启动。
+// 关闭旧句柄后：core.OpenSession(ctx, config, "conversation")。
 ```
 
-以上是接入示意：`model`、`estimateTokens`、`tools` 由你的应用提供。Token 估算器负责计算目标模型的输入预算。
+`Model` 实现 `Spec` / `Stream`；`EstimateTokens` 计算目标模型请求的输入 Token。测试和临时会话可使用 `store/memory.New()`，依赖与执行契约相同。
 
-Store 有三种选择：
+## 输入与生命周期
 
-| Store | 适合场景 |
+| API | 行为 |
 | --- | --- |
-| [`memory`](store/memory) | 测试、临时会话 |
-| [`jsonl`](store/jsonl) | 简单的文件持久化，日志可检查 |
-| [`sqlite`](store/sqlite) | 长期运行的应用，支持索引和分页历史；纯 Go、无需 CGO |
+| `Prompt(ctx, Input)` | 空闲且工具协议完整时接收并启动；忙时返回 `ErrBusy`，不接收新输入 |
+| `Steer(ctx, Input)` | 只入队，在下一完整工具批次后的安全边界优先应用 |
+| `FollowUp(ctx, Input)` | 只入队，在当前任务自然结束时应用 |
+| `Continue(ctx)` | 显式处理队列或恢复未完成执行；无工作返回 `ErrNotContinuable` |
+| `InjectContext(ctx, Input)` | 接收被动上下文，不启动模型或自动摘要 |
+| `LookupInput(ctx, id)` | 按索引读取冻结载荷、首次接收时间与 `pending/applied/cleared` 状态 |
+| `Cancel()` / `Run.Cancel()` | 取消执行并保留未消费输入 |
+| `Compact(ctx, instructions)` | 空闲时显式压缩，不消费驱动输入、不生成普通回答 |
+| `Snapshot()` / `Subscribe()` | 读取执行状态、尝试进度并订阅事件 |
+| `History()` / `InspectContext()` | 读取历史与有效上下文，不启动执行或收集环境 |
+| `Fork(ctx, entryID, options)` | 在完整历史边界创建共享或独立 Rollout 的 Session |
 
-## 让 Agent 真正可控
+所有输入都要求稳定 ID，包括第一条 Prompt。相同 ID、相同 Digest 返回既有回执；内容或投递类别不同返回冲突。Host 可提供原始业务提交的 Digest，并在重新生成时间戳或读取附件前先查询回执。Core 保存第一次接收的完整载荷，不再用重试时构造的内容替换它。
 
-```text
-用户输入 → 模型生成 → Tool Call → 执行工具 → 模型继续 → 最终回复
-                         ↑
-                 审批 / 取消 / 状态记录
-```
+输入的 `Contexts` 与 `Message` 是不可拆分的投递组。Steer 默认每次一组，`MaxSteeringPerTurn` 可设为 1–16；FollowUp 每次一组。准备开始时冻结有限选择范围；预算不够时整批不消费。取消和失败不自动重启，Host 可以显式 Continue。已接受的 Run 使用 Session 生命周期，不因提交请求的 Context 或浏览器断开而取消；`Run.Wait` 的 Context 只控制等待。
 
-使用持久 Session 时，每次工具调用都会记录执行阶段。**如果服务在工具启动后崩溃，SDK 不会猜测命令是否成功，更不会自动盲目重跑。** 它会保留未知结果，交给宿主确认。
+## 原子上下文准备
 
-| 想做什么 | API |
-| --- | --- |
-| 追加新任务 | `Start` |
-| 恢复未完成执行或消费保留队列 | `Continue` |
-| 被动更新模型上下文 | `InjectContext` |
-| 查看或清理待处理输入 | `PeekQueuedInputs` / `ClearQueuedInputs` |
-| 工作中修改方向 | `Steer` |
-| 当前任务结束后再处理 | `FollowUp` |
-| 停止工作 | `Cancel` |
-| 订阅实时输出 | `Subscribe` |
-| 查看模型实际上下文 | `InspectContext` |
-| 压缩长对话 | `Compact` |
-| 查看历史 | `History().Scan` / `Path` / `Children` |
-| 从历史重新尝试 | `Fork` |
-| 人工审批 | `PendingApprovals` / `DecideApproval` |
+普通模型轮次先预览队列与旧上下文，必要时仅对已提交历史生成摘要草稿，再同步调用 `Config.CollectContext` 采集环境。最终顺序为：摘要与保留历史、选中的被动上下文、最新环境、驱动输入组。
 
-Core 和持久 Session 都默认每个安全边界消费一条 Steer。宿主可在各自 Config 中设置 `MaxSteeringPerTurn: 2` 到 `16`，将已排队的多条 Steer 按 FIFO 放进下一次模型请求；每条仍是独立 User Message。0 等同默认值 1，超出范围报错。FollowUp 始终逐条处理，Steer 优先；字节预算不足时剩余输入继续留队。
-
-### Fork 的是历史，不是文件系统
-
-每个 Session 有自己的执行状态和当前 Head；它们可以共享同一份 Rollout 历史，也可以将选中的历史路径复制成独立 Rollout（Detached Fork）。
-
-Fork 不会回滚已经改过的文件、撤销 API 调用或复制正在运行的进程。那些外部副作用始终由宿主管理。
-
-## 工具由你决定
-
-任何实现 `astral.Tool` 的 Go 类型都能成为工具。你可以自己定义工具名称、参数 Schema 和执行逻辑，也可以直接使用可选的 [`standardtools`](docs/standardtools.md)：
-
-`read` · `write` · `edit` · `exec_command` · `write_stdin`
-
-它们通过 `Backend` 访问文件系统和进程。SDK 提供本地 Unix Shell / PTY 实现；远程 Computer、容器、SSH 或其他执行方式都可以由应用接入自己的 Backend。
-
-**工具 Schema 是固定注册的；当前机器上有哪些 Skills、项目说明或可用资源，是环境上下文，不是新的工具定义。**
-
-`Tool.Execute` 和 `ToolFunc.Run` 返回 `(ToolExecution, error)`。成功时必须二选一：普通输出放在 `Result: &ToolResult{...}`；声明 `MayEndRun` 的工具也可以返回 `EndRun: &RunEnd{Reason: "nothing_to_add"}`，正常结束当前 Run，不产生工具结果，不再请求模型。
-
-`MayEndRun` 要求回复只包含这一个调用及可选 Reasoning；`Exclusive` 只要求调用独占批次，允许正文。Core 在执行任何工具前校验整个回复。终止后 `RunResult.EndReason`、Run 记录和 RunEnd 事件保存原因，全部 Pending 输入保留到下一次显式激活。原始历史保留调用与控制事实，模型上下文省略完整控制 Assistant。Host 自定义 `no_reply` 的可运行示例见 [`examples/endrun`](examples/endrun/main.go)。
-
-## 一次回复，保留全部内容顺序
-
-Assistant 的 `Message.Content` 同时保存 Reasoning、Text 和 Tool Call，例如：
-
-```json
-{"role":"assistant","content":[
-  {"type":"reasoning","text":"先检查第一项"},
-  {"type":"text","text":"正在查询"},
-  {"type":"tool_call","tool_call":{"id":"a","name":"lookup","arguments":{"key":"a"}}},
-  {"type":"reasoning","text":"再检查第二项"},
-  {"type":"text","text":"继续查询"},
-  {"type":"tool_call","tool_call":{"id":"b","name":"lookup","arguments":{"key":"b"}}}
-]}
-```
-
-没有独立的 `Message.ToolCalls` 字段；`message.ToolCalls()` 按块顺序提取调用。并行工具可以乱序完成，下一轮模型上下文仍按调用块顺序排列结果。Reasoning 签名、各层 Metadata、多模态和 Provider 扩展数据随原始消息保存，重新打开或 Fork 后保留相同顺序。
-
-流式 `text_delta`、`reasoning_delta` 和 `tool_call_delta` 使用 `content_index` 对应最终 Content 数组；事件按 AttemptID 区分重试。增量用于展示，完整回复提交成功后才派发工具。协议细节见 [宿主契约](docs/contracts.md)。
-
-每次模型调用先保存 `model_request`，再调用 Provider；`model_response` 保存完整返回和失败信息。记录包含已冻结的环境与多模态数据，属于运行事实，不会再次塞入对话。宿主可通过 `RequestPreparer` 在估算和提交前冻结动态上下文。
-
-当前 Rollout 格式为 **7**，可以继续读取 V6 历史，原记录不改写。V5 及更早的持久数据会被明确拒绝并保持原样。历史 V3 性能测量仍见 [基准报告](docs/benchmarks.md)。
-
-## 上下文与执行控制分开
-
-`InjectContext` 追加模型可见信息，支持 `user` / `developer` 目标 Role 和有序多模态 Content，不修改 System Prompt，也不触发模型或自动摘要。
+完整候选请求必须同时满足 Token 与字节预算。摘要、环境、输入和消费记录通过一次 Store Commit 确认，然后发送冻结请求。采集失败、预算失败或提交前冲突不会改变有效上下文；摘要草稿可以在下一次激活重新计算。每次准备最多自动压缩一次，摘要请求也独立检查预算。自动压缩的近期保留目标会为新输入预留空间。
 
 ```go
-observations := []astral.Message{{
-    Role: astral.RoleUser,
-    ContextKind: "observation",
-    Content: []astral.Content{
-        {Type: "text", Text: "用户分享了这张图片。"},
-        {Type: "image", MediaType: "image/png", URL: "asset://stable-image-id"},
-    },
-}}
-id, err := chat.InjectContext(ctx, observations)
-
-// 必须随这条 Prompt 一起生效的 Context，与输入整体接收、整体提交。
-run, err := chat.Start(ctx, astral.User("分析刚才的图片"),
-    astral.InputOptions{Contexts: observations})
+config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary) ([]core.Message, error) {
+    // Host 负责扫描、授权和相对当前分支的内容去重。
+    // boundary.CompactionID 非空时，摘要草稿已完成，应重新采集完整环境。
+    return []core.Message{{
+        Role: core.RoleUser,
+        ContextKind: "environment",
+        Content: core.Text("当前 Computer 与 CWD 的实际状态"),
+    }}, nil
+}
 ```
 
-这两种调用方式可独立使用。返回 ID 表示接收成功；运行中先持久排队，在整批工具结果之后安全应用。被动 Context 不使 Run 继续，也不能单独使 Continue 合法。Context 正常参与 Compaction，原始多模态消息留在历史中。大型媒体由 Host 保存并提供可重放的稳定引用，Model Bridge 负责解析及能力适配。
+回调只返回消息，不修改 Core。模型和 Computer I/O 在 Session 锁及数据库事务之外执行。摘要后新环境失败时没有半完成的压缩检查点。OpenSession、历史读取和 InspectContext 不运行此回调。
 
-`Continue()` 不生成“继续”提示词。空历史、仅有 Context，或已经完成且没有驱动队列的会话返回 `ErrNotContinuable`。Cancel 保留未消费队列，恢复需要 Host 显式调用；它不会自动重启。
+## 重试与模型记录
 
-环境发现、授权、连接、目标选择及其持久一致性由 Host 管理。Host 工具通过 `TargetedTool.Bind` 为每次调用提供不透明 `Invocation.Binding`，Core 在 Prepared 前保存它，恢复时复用原引用。环境说明可作为普通 Context 注入；SDK 没有专用 Snapshot 或 Session 级当前 Binding。
+普通生成和摘要共用一套尝试策略：默认总共 3 次，包含首次；从 1 秒指数退避到 5 秒，较长的有效 Retry-After 优先；每次请求超时 4 分钟。明确永久错误和用户取消直接停止。网络重试复用冻结请求，不重新消费输入、扫描环境、摘要或执行工具。
 
-Assistant 的终止原因保存在 `Message.FinishReason`，错误说明保存在 `Message.ErrorMessage`。失败和取消保留合法部分快照，历史可见、模型投影跳过；length 回复保留，工具调用以 NotExecuted 结果交回模型。`FinishTurn` 可选择结束或继续一次，其确认后的决策可恢复。
+`ModelRequestRecoverer` 可以对明确拒绝的 Provider 回放状态修复一次请求副本，占用同一个总尝试预算，并重新检查协议及 Token/字节预算。没有自动模型 fallback。
 
-## 边界清晰，才能真正嵌入
+每次调用在 Provider 前保存 `model_request`，在采用结果或重试前保存 `model_response`。失败片段、网络错误和重试信息只属于执行记录；只有完整且校验通过的 Stop / ToolCalls 回复进入对话。失败、取消和 Length 回复不会触发工具，也不会进入后续普通请求或摘要。
 
-`astral-core` **负责** Agent Loop、工具调用语义、Session / Rollout、历史分支、压缩、审批与恢复。
+事件和 Snapshot 提供 Run / Turn / Attempt ID、用途、当前次数、上限、下一次重试时间与安全错误代码。客户端按 Attempt 隔离临时输出；重连只恢复事件流和快照，不重发模型请求。
 
-它**不提供**模型 API 聚合、托管 Sandbox、设备连接协议、身份系统、UI、Subagent 编排或 Workflow Engine。你可以把它嵌入 CLI、Web 服务、IM Agent 或已有产品，而不必反过来适应 SDK 的应用架构。
+## 工具、审批与恢复
 
-目前也没有内置 OpenAI Responses / Chat Completions 适配器或精确 Tokenizer；通过 `Model` 和 `TokenEstimator` 接入你选择的实现。
+`Tool.Execute` / `ToolFunc.Run` 返回 `(ToolExecution, error)`。普通结果使用 `Result: &ToolResult{...}`。固定工具声明支持 JSON Schema、串行批次、并行上限、调用前审批和结果处理。可选标准工具为 `read`、`write`、`edit`、`exec_command`、`write_stdin`，详见 [标准工具](docs/standardtools.md)。
 
-## 更多资料
+`TargetedTool.Bind` 产生 Host 私有的 `Invocation.Binding`，Core 在执行前保存并在恢复时复用。切换 Computer 不改变已绑定调用、旧进程或历史文件的目标。
 
-- [Basic：最小 Agent 示例](examples/basic/main.go)
-- [Approval：审批与持久化](examples/approval/main.go)
-- [Environments：跨执行目标与进程绑定](examples/environments/main.go)
-- [Tools：文件与 Shell](examples/tools/main.go)
-- [Fork：历史分支](examples/fork/main.go)
-- [标准工具与自定义 Backend](docs/standardtools.md)
-- [宿主与持久化契约](docs/contracts.md)
-- [开发与验证](docs/development.md)
-- [性能基准](docs/benchmarks.md)
+工具依次记录 prepared、authorized、started、completed 和结果。已 started 但无法确认结果的操作必须由 Host 核对；Core 不重做可能有副作用的操作。审批决定、已完成的结果和未知效果记录可跨重启恢复。
 
-```bash
-go test ./...
-```
+声明 `MayEndRun` 的工具可以返回 `EndRun`，在同一提交中记录控制事实与 Run 完成。它不产生普通 ToolResult，模型投影省略完整控制 Assistant。Core 随后为已经排队的独立输入启动新的 Run；错误或取消不会触发这一步。Host 的 `no_reply` 示例见 [endrun](examples/endrun/main.go)。
 
-**一句话：你负责 Agent 能做什么，`astral-core` 负责它如何可靠地做下去。**
+Assistant 的 `Content` 按原顺序保存 Reasoning、Text、ToolCall、多模态及 Provider 扩展。并行工具可以乱序完成，下一请求仍按调用顺序排列结果。流式 delta 的 `content_index` 必须对应最终回复；完整回复提交后才派发工具。
+
+## 存储与所有权
+
+当前 Core 格式为 **9**，只支持本格式。没有旧接口、旧格式读取或迁移；已有旧数据库返回 `ErrUnsupportedFormat`，使用全新数据目录初始化。SQLite 是持久运行后端，Memory 用于临时会话；不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
+
+Host 对每个 Session ID 保留一个活动句柄，并保证进程间执行所有权。Store 的 CAS 不能撤销已发生的外部副作用。Close 取消并等待 Session 的执行、维护与 Fork，释放缓存；Model、Store 和工具环境仍由 Host 关闭。Fork 复制或共享历史，不复制工作文件或活动进程。
+
+更多实现约束见 [宿主契约](docs/contracts.md)，验证入口见 [开发与验证](docs/development.md)。[性能报告](docs/benchmarks.md) 保留早期版本的历史测量，不代表格式 9 的最新性能结果。

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	s "github.com/oines/astral-core/session"
 )
 
 func TestHistoryPathPlanUsesEntryPointLookups(t *testing.T) {
@@ -49,24 +48,24 @@ func TestHistoryPathPlanUsesEntryPointLookups(t *testing.T) {
 	}
 }
 
-func fixture(t *testing.T, st *Store) (s.RuntimeState, s.ForkRequest) {
+func fixture(t *testing.T, st *Store) (astral.RuntimeState, astral.ForkRequest) {
 	t.Helper()
-	entries := []s.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: s.EntryCreated, Created: &s.CreationRecord{FormatVersion: s.FormatVersion, SessionID: "parent", RolloutID: "parent"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: s.EntryConfiguration, Configuration: &s.Configuration{ModelID: "test"}}}
+	entries := []astral.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: astral.FormatVersion, SessionID: "parent", RolloutID: "parent"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{ModelID: "test"}}}
 	parent := "config"
 	for i := 0; i < 1024; i++ {
 		id := fmt.Sprintf("message-%d", i)
 		msg := astral.User("history")
-		entries = append(entries, s.Entry{ID: id, ParentID: parent, Version: 1, SessionID: "parent", Kind: s.EntryMessage, Message: &msg})
+		entries = append(entries, astral.Entry{ID: id, ParentID: parent, Version: 1, SessionID: "parent", Kind: astral.EntryMessage, Message: &msg})
 		parent = id
 	}
-	if _, err := st.Commit(context.Background(), "parent", s.Commit{ID: "seed", Entries: entries}); err != nil {
+	if _, err := st.Commit(context.Background(), "parent", astral.Commit{ID: "seed", Entries: entries}); err != nil {
 		t.Fatal(err)
 	}
 	state, err := st.LoadState(context.Background(), "parent")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := s.ForkRequest{SourceID: "parent", SourceRolloutID: "parent", TargetID: "child", HeadID: parent, Mode: s.ForkDetached}
+	r := astral.ForkRequest{SourceID: "parent", SourceRolloutID: "parent", TargetID: "child", HeadID: parent, Mode: astral.ForkDetached}
 	return state, r
 }
 
@@ -91,16 +90,16 @@ func TestForkPagesYieldWriterAndCancelAtomically(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("fork did not reach its first page")
 	}
-	if _, err = st.LoadState(context.Background(), "child"); !errors.Is(err, s.ErrNotFound) {
+	if _, err = st.LoadState(context.Background(), "child"); !errors.Is(err, astral.ErrNotFound) {
 		t.Fatalf("unpublished child visible: %v", err)
 	}
-	if _, err = st.Get(context.Background(), request.RolloutID(), request.HeadID); !errors.Is(err, s.ErrNotFound) {
+	if _, err = st.Get(context.Background(), request.RolloutID(), request.HeadID); !errors.Is(err, astral.ErrNotFound) {
 		t.Fatalf("unpublished entry visible: %v", err)
 	}
 	writeCtx, writeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer writeCancel()
 	msg := astral.User("parent continued")
-	_, err = st.Commit(writeCtx, "parent", s.Commit{ID: "parent-continues", ExpectedVersion: state.Version, Entries: []s.Entry{{ID: "continued", ParentID: state.Branch.HeadID, SessionID: "parent", Version: state.Version + 1, Kind: s.EntryMessage, Message: &msg}}})
+	_, err = st.Commit(writeCtx, "parent", astral.Commit{ID: "parent-continues", ExpectedVersion: state.Version, Entries: []astral.Entry{{ID: "continued", ParentID: state.Branch.HeadID, SessionID: "parent", Version: state.Version + 1, Kind: astral.EntryMessage, Message: &msg}}})
 	if err != nil {
 		t.Fatalf("fork held writer lock: %v", err)
 	}
@@ -109,7 +108,7 @@ func TestForkPagesYieldWriterAndCancelAtomically(t *testing.T) {
 	if err = <-finished; !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel: %v", err)
 	}
-	if _, err = st.LoadState(context.Background(), "child"); !errors.Is(err, s.ErrNotFound) {
+	if _, err = st.LoadState(context.Background(), "child"); !errors.Is(err, astral.ErrNotFound) {
 		t.Fatalf("cancelled child visible: %v", err)
 	}
 	var n int
@@ -119,7 +118,7 @@ func TestForkPagesYieldWriterAndCancelAtomically(t *testing.T) {
 	if _, err = st.Fork(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = st.Get(context.Background(), request.RolloutID(), "continued"); !errors.Is(err, s.ErrNotFound) {
+	if _, err = st.Get(context.Background(), request.RolloutID(), "continued"); !errors.Is(err, astral.ErrNotFound) {
 		t.Fatal("parent advance leaked into fixed fork boundary")
 	}
 }
@@ -172,13 +171,13 @@ func TestCrashDuringForkNeverPublishesPartialSession(t *testing.T) {
 	if _, err = st.LoadState(ctx, "parent"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = st.LoadState(ctx, "child"); !errors.Is(err, s.ErrNotFound) {
+	if _, err = st.LoadState(ctx, "child"); !errors.Is(err, astral.ErrNotFound) {
 		t.Fatalf("partial fork exposed after process death: %v", err)
 	}
 	if err = st.DiscardUnpublished(ctx, "child"); err != nil {
 		t.Fatal(err)
 	}
-	if err = st.DiscardUnpublished(ctx, "parent"); !errors.Is(err, s.ErrConflict) {
+	if err = st.DiscardUnpublished(ctx, "parent"); !errors.Is(err, astral.ErrConflict) {
 		t.Fatal("cleanup accepted published session")
 	}
 }
@@ -194,7 +193,7 @@ func TestRolloutHistoryFiltersUseOrderedIndexes(t *testing.T) {
 		where, index string
 		args         []any
 	}{
-		{"e.kind=?", "entry_kind", []any{"parent", string(s.EntryMessage), 2}},
+		{"e.kind=?", "entry_kind", []any{"parent", string(astral.EntryMessage), 2}},
 		{"e.projection IS NOT NULL", "entry_history", []any{"parent", 2}},
 		{"e.parent_id=? AND e.projection IS NOT NULL", "entry_parent", []any{"parent", "config", 2}},
 		{"e.session_id=?", "entry_writer", []any{"parent", "parent", 2}},

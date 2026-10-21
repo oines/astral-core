@@ -10,11 +10,10 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
 )
 
 func TestToolControlForksAndCompaction(t *testing.T) {
-	eachStore(t, func(t *testing.T, st sessions.Store) {
+	eachStore(t, func(t *testing.T, st astral.Store) {
 		ctx := context.Background()
 		var effects atomic.Int32
 		stop := controlTool("host_control", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
@@ -35,18 +34,18 @@ func TestToolControlForksAndCompaction(t *testing.T) {
 		summary.spec.ID = "summary"
 		c := testConfig(m, st)
 		c.Tools = []astral.Tool{stop}
-		c.Compaction = sessions.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
+		c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
 		c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-		manager := newAgent(t, c)
-		parent := newSession(t, manager, sessions.SessionOptions{ID: "parent"})
+		manager := newSessions(t, c)
+		parent := newSession(t, manager, astral.SessionOptions{ID: "parent"})
 		first := waitOK(t, start(t, parent, "control"))
 		controlID := checkControlHistory(t, parent, "done")
 		parentBefore := parent.State()
-		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
-			if _, err := parent.Fork(ctx, first.LastMessageID, sessions.ForkOptions{ID: fmt.Sprintf("incomplete-%d", mode), Mode: mode}); !errors.Is(err, astral.ErrIncompleteBatch) {
+		for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
+			if _, err := parent.Fork(ctx, first.LastMessageID, astral.ForkOptions{ID: fmt.Sprintf("incomplete-%d", mode), Mode: mode}); !errors.Is(err, astral.ErrIncompleteBatch) {
 				t.Fatalf("forked a control without its completion: %v", err)
 			}
-			child, err := parent.Fork(ctx, controlID, sessions.ForkOptions{ID: fmt.Sprintf("child-%d", mode), Mode: mode})
+			child, err := parent.Fork(ctx, controlID, astral.ForkOptions{ID: fmt.Sprintf("child-%d", mode), Mode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -102,7 +101,7 @@ func TestToolControlForksAndCompaction(t *testing.T) {
 		if err := manager.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
-		reopened, err := newAgent(t, c).OpenSession(ctx, parent.ID())
+		reopened, err := newSessions(t, c).OpenSession(ctx, parent.ID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +114,7 @@ func TestToolControlForksAndCompaction(t *testing.T) {
 }
 
 func TestExclusiveOrdinaryToolAllowsAssistantText(t *testing.T) {
-	eachControlEngine(t, func(t *testing.T, st sessions.Store) {
+	eachControlEngine(t, func(t *testing.T, st astral.Store) {
 		var effects atomic.Int32
 		work := astral.ToolFunc{
 			Spec: astral.ToolDefinition{Name: "exclusive", Version: "1", Exclusive: true, Parameters: json.RawMessage(`{"type":"object"}`)},
@@ -133,7 +132,7 @@ func TestExclusiveOrdinaryToolAllowsAssistantText(t *testing.T) {
 			return answer("done"), nil
 		})
 		e, _ := controlEndpoint(t, st, astral.Config{Model: m, Tools: []astral.Tool{work}})
-		run, err := e.Start(context.Background(), astral.User("go"))
+		run, err := prompt(e, context.Background(), astral.User("go"))
 		if err != nil {
 			t.Fatal(err)
 		}

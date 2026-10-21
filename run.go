@@ -38,139 +38,255 @@ func (r *Run) Wait(ctx context.Context) (RunResult, error) {
 	}
 }
 
-func (a *Agent) drive(ctx context.Context, r *Run) {
+type PromptResult struct {
+	Receipt InputReceipt
+	Run     *Run
+}
+
+func (s *Session) Prompt(ctx context.Context, input Input) (PromptResult, error) {
+	q, err := inputRecord(InputSteer, input)
+	if err != nil {
+		return PromptResult{}, err
+	}
+	run, receipt, err := s.begin(ctx, &q)
+	return PromptResult{Receipt: receipt, Run: run}, err
+}
+func (s *Session) Continue(ctx context.Context) (*Run, error) {
+	run, _, err := s.begin(ctx, nil)
+	return run, err
+}
+func (s *Session) begin(ctx context.Context, input *InputRecord) (*Run, InputReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, InputReceipt{}, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, InputReceipt{}, ErrClosed
+	}
+	if input != nil {
+		if receipt, exists, err := s.existingInputLocked(ctx, *input); err != nil || exists {
+			s.mu.Unlock()
+			return nil, receipt, err
+		}
+	}
+	if s.busyLocked() {
+		s.mu.Unlock()
+		return nil, InputReceipt{}, ErrBusy
+	}
+	state := s.executionStateLocked()
+	if input == nil && !state.Continuable(state.HasQueuedInputs) {
+		s.mu.Unlock()
+		return nil, InputReceipt{}, ErrNotContinuable
+	}
+	if input != nil {
+		if !s.state.Branch.Complete() {
+			s.mu.Unlock()
+			return nil, InputReceipt{}, ErrIncompleteBatch
+		}
+		if err := s.admitInput(*input); err != nil {
+			s.mu.Unlock()
+			return nil, InputReceipt{}, err
+		}
+	}
+	runCtx, cancel := context.WithCancel(s.lifetime)
+	run := &Run{id: newID(), ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+	s.active = run
+	s.operationError = ""
+	s.attempt = nil
+	s.mu.Unlock()
+	abandon := func(err error) (*Run, InputReceipt, error) {
+		cancel()
+		s.mu.Lock()
+		s.active = nil
+		s.mu.Unlock()
+		close(run.done)
+		return nil, InputReceipt{}, err
+	}
+	if input == nil {
+		if err := s.recoverInterrupted(ctx); err != nil {
+			return abandon(err)
+		}
+	}
+	s.mu.Lock()
+	var drafts []Entry
+	if input != nil {
+		drafts = append(drafts, Entry{Kind: EntryInputQueued, Input: input})
+	}
+	drafts = append(drafts, Entry{Kind: EntryRun, RunID: run.id, Run: &RunRecord{ID: run.id, Status: "started", QueueOnly: input == nil && state.LastRunStatus == "cancelled" && state.HasQueuedInputs}})
+	entries, err := s.appendLocked(ctx, drafts...)
+	s.mu.Unlock()
+	if err != nil {
+		return abandon(err)
+	}
+	s.publish(Event{Type: EventRunStart, RunID: run.id})
+	go s.drive(runCtx, run)
+	receipt := InputReceipt{}
+	if input != nil {
+		receipt = InputReceipt{InputRecord: *entries[0].Input, State: InputPending, AcceptedAt: entries[0].Time}
+	}
+	return run, receipt, nil
+}
+func (s *Session) drive(ctx context.Context, run *Run) {
 	var runErr error
-	var result RunResult
-	finished := false
+	endReason := ""
+	endLocked := false
 	defer func() {
 		if p := recover(); p != nil {
 			runErr = fmt.Errorf("astral: execution panicked: %v", p)
 		}
-		if !finished {
-			status := "failed"
-			if ctx.Err() != nil || errors.Is(runErr, context.Canceled) {
-				status = "cancelled"
-			}
-			cleanup, cancel := persistContext(ctx)
-			var err error
-			result, err = a.driver.Finish(cleanup, r.id, status, runErr)
-			cancel()
-			runErr = errors.Join(runErr, err)
-		}
-		r.mu.Lock()
-		r.result = clone(result)
-		r.err = runErr
-		r.mu.Unlock()
-		a.mu.Lock()
-		e := Event{Type: EventRunEnd, RunID: r.id}
+		status := "completed"
 		if runErr != nil {
-			e.Error = runErr.Error()
+			status = "failed"
 		}
-		e.Status = result.Status
-		e.EndReason = result.EndReason
-		a.Publish(e)
-		a.active = nil
-		a.mu.Unlock()
-		r.cancel()
-		close(r.done)
+		if endReason == "" && (ctx.Err() != nil || errors.Is(runErr, context.Canceled)) {
+			status = "cancelled"
+		}
+		cleanup, cancel := persistContext(ctx)
+		if !endLocked {
+			s.mu.Lock()
+		}
+		record := RunRecord{ID: run.id, Status: status, EndReason: endReason}
+		if runErr != nil {
+			record.Error = runErr.Error()
+		}
+		var err error
+		if last := s.state.LastRun; last == nil || last.ID != run.id || last.Status != status || last.EndReason != endReason {
+			_, err = s.appendLocked(cleanup, Entry{Kind: EntryRun, RunID: run.id, Run: &record})
+		}
+		runErr = errors.Join(runErr, err)
+		if err != nil {
+			status = "failed"
+		}
+		result := s.runResultLocked(run.id, status)
+		result.EndReason = endReason
+		var next *Run
+		if status == "completed" && endReason != "" && !s.closed && s.lifetime.Err() == nil && (s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0) {
+			nextCtx, nextCancel := context.WithCancel(s.lifetime)
+			next = &Run{id: newID(), ctx: nextCtx, cancel: nextCancel, done: make(chan struct{})}
+			_, err = s.appendLocked(cleanup, Entry{Kind: EntryRun, RunID: next.id, Run: &RunRecord{ID: next.id, Status: "started"}})
+			if err != nil {
+				nextCancel()
+				next = nil
+				runErr = errors.Join(runErr, err)
+				s.operationError = err.Error()
+			}
+		}
+		cancel()
+		s.active = next
+		s.attempt = nil
+		s.publishLocked(Event{Type: EventRunEnd, RunID: run.id, Status: status, EndReason: endReason, Error: errorText(runErr)})
+		if next != nil {
+			s.publishLocked(Event{Type: EventRunStart, RunID: next.id})
+		}
+		s.mu.Unlock()
+		if next != nil {
+			go s.drive(next.ctx, next)
+		}
+		run.mu.Lock()
+		run.result, run.err = result, runErr
+		run.mu.Unlock()
+		run.cancel()
+		close(run.done)
 	}()
-	state := a.driver.Snapshot()
-	natural := state.Last == nil || state.QueueOnly
-	if state.Last != nil && state.Last.Message.Role == RoleAssistant {
-		natural = true
-		if !state.Last.Message.Failed() && state.controlEnd() == nil && (len(state.Last.Message.ToolCalls()) > 0 || state.Turn != nil && !state.Turn.Decided) {
-			// Recover a committed assistant/tool boundary without regenerating it.
-			recoverTurn := state.Turn == nil || !state.Turn.Decided
-			if recoverTurn {
-				a.Publish(Event{Type: EventTurnStart, RunID: r.id, TurnID: state.Last.TurnID})
-			}
-			if len(state.Last.Message.ToolCalls()) > 0 {
-				var batch batchOutcome
-				batch, runErr = a.executeBatch(ctx, r, *state.Last)
-				natural = batch.Natural
-				if runErr == nil && batch.EndRun != nil {
-					result = controlRunResult(r.id, *state.Last, *batch.EndRun)
-					finished = true
+	state := s.executionSnapshot()
+	natural := state.QueueOnly || state.Last == nil || state.Last.Message.Role == RoleAssistant
+	if state.Last != nil && state.Last.Message.Role == RoleAssistant && state.controlEnd() == nil && len(state.Last.Message.ToolCalls()) > 0 {
+		var batch batchOutcome
+		batch, runErr = s.executeBatch(ctx, run, *state.Last)
+		if runErr != nil {
+			return
+		}
+		natural = batch.Natural
+		if batch.EndRun != nil {
+			natural = true
+			endReason = batch.EndRun.Reason
+		}
+	}
+	for turns := 0; ; turns++ {
+		if endReason == "" {
+			runErr = ctx.Err()
+		}
+		if runErr != nil {
+			return
+		}
+		s.mu.Lock()
+		queued := s.state.PendingInputs[InputSteer] > 0 || natural && s.state.PendingInputs[InputFollowUp] > 0
+		// Natural completion and queue inspection are serialized with admission.
+		// If a new input arrives after this boundary, Host's explicit Continue sees
+		// the completed lifecycle and can start it without a waiting goroutine.
+		if natural && (!queued || endReason != "") {
+			passive := endReason == "" && s.state.PendingInputs[InputContext] > 0
+			if passive {
+				s.mu.Unlock()
+				_, _, flushErr := s.prepareStep(ctx, prepareOptions{runID: run.id, passiveOnly: true, reason: "idle", skipCollect: true})
+				if flushErr != nil && !errors.Is(flushErr, ErrBudget) {
+					runErr = flushErr
+					return
 				}
+				s.mu.Lock()
+				queued = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
 			}
-			if runErr == nil && recoverTurn && !finished {
-				_, runErr = a.finishTurn(ctx, r, *state.Last)
-			}
-			if recoverTurn {
-				event := Event{Type: EventTurnEnd, RunID: r.id, TurnID: state.Last.TurnID}
-				if runErr != nil {
-					event.Error = runErr.Error()
-				}
-				a.Publish(event)
-			}
-			if runErr != nil || finished {
+			if !queued || endReason != "" {
+				endLocked = true
 				return
 			}
 		}
-	}
-	turns := 0
-	for {
-		if runErr = ctx.Err(); runErr != nil {
-			return
-		}
-		var done bool
-		done, result, runErr = a.driver.Boundary(ctx, r.id, natural)
-		if runErr != nil {
-			return
-		}
-		if done {
-			finished = true
-			return
-		}
-		if a.config.MaxTurns > 0 && turns >= a.config.MaxTurns {
+		s.mu.Unlock()
+		if s.config.MaxTurns > 0 && turns >= s.config.MaxTurns {
 			runErr = ErrTurnLimit
 			return
 		}
-		turns++
 		turnID := newID()
-		a.Publish(Event{Type: EventTurnStart, RunID: r.id, TurnID: turnID})
-		runErr = func() (err error) {
-			defer func() {
-				event := Event{Type: EventTurnEnd, RunID: r.id, TurnID: turnID}
-				if err != nil {
-					event.Error = err.Error()
-				}
-				a.Publish(event)
-			}()
-			assistant, err := a.generate(ctx, r, turnID)
-			if err != nil {
-				return err
-			}
-			natural = true
-			if len(assistant.Message.ToolCalls()) > 0 {
-				var batch batchOutcome
-				batch, err = a.executeBatch(ctx, r, assistant)
-				natural = batch.Natural
-				if err != nil {
-					return err
-				}
-				if batch.EndRun != nil {
-					result = controlRunResult(r.id, assistant, *batch.EndRun)
-					finished = true
-					return nil
+		s.publish(Event{Type: EventTurnStart, RunID: run.id, TurnID: turnID})
+		var step preparedStep
+		step, _, runErr = s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, natural: natural, reason: "boundary"})
+		if runErr == nil {
+			var assistant Frame
+			assistant, runErr = s.generate(ctx, run, turnID, step)
+			if runErr == nil {
+				natural = true
+				endReason = ""
+				if len(assistant.Message.ToolCalls()) > 0 {
+					var batch batchOutcome
+					batch, runErr = s.executeBatch(ctx, run, assistant)
+					natural = batch.Natural
+					if batch.EndRun != nil {
+						natural = true
+						endReason = batch.EndRun.Reason
+					}
 				}
 			}
-			if err = ctx.Err(); err != nil {
-				return err
-			}
-			_, err = a.finishTurn(ctx, r, assistant)
-			return err
-		}()
-		if runErr != nil || finished {
+		}
+		s.publish(Event{Type: EventTurnEnd, RunID: run.id, TurnID: turnID, Error: errorText(runErr)})
+		if runErr != nil {
 			return
 		}
 	}
 }
-
-func controlRunResult(id string, assistant Frame, end RunEnd) RunResult {
-	return RunResult{RunID: id, Status: "completed", EndReason: end.Reason, LastMessageID: assistant.ID, LastMessage: &assistant.Message}
+func (s *Session) lastMessageLocked() *Entry {
+	if i, ok := s.windowIndex[s.state.Branch.LastMessageID]; ok {
+		e := s.window[i]
+		return &e
+	}
+	return nil
 }
-
+func (s *Session) runResultLocked(id, status string) RunResult {
+	r := RunResult{RunID: id, Status: status}
+	if s.state.LastRun != nil {
+		r.EndReason = s.state.LastRun.EndReason
+	}
+	if last := s.lastMessageLocked(); last != nil && last.Message.Role == RoleAssistant {
+		r.LastMessageID, r.LastMessage = last.ID, last.Message
+	}
+	return clone(r)
+}
+func errorText(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
 func persistContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }

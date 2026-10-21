@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -40,7 +40,7 @@ func TestModelSelectionFreezesNextRequestOptionsDuringRun(t *testing.T) {
 	})
 	config := testConfig(m, memory.New())
 	config.Options.Reasoning.Effort = "initial"
-	s := newSession(t, newAgent(t, config), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, config), astral.SessionOptions{})
 	run := start(t, s, "first")
 	<-entered
 	options := astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "selected"}}
@@ -70,9 +70,9 @@ func TestCompactionUsesIndependentFrozenOptionsAndReasoningReply(t *testing.T) {
 	config := testConfig(normal, memory.New())
 	config.Options.Reasoning.Effort = "normal-effort"
 	config.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-	config.Compaction = sessions.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1,
+	config.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1,
 		Options: astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "high"}}}
-	s := newSession(t, newAgent(t, config), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, config), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	waitOK(t, start(t, s, "second"))
 	record, err := s.Compact(context.Background(), "")
@@ -106,14 +106,14 @@ func TestStandaloneFreezesGenerationOptions(t *testing.T) {
 		return answer("done"), nil
 	})
 	m.spec.Revision = "revision-1"
-	a, err := astral.New(astral.Config{Model: m, Options: options})
+	a, err := newMemorySession(astral.Config{Model: m, Options: options})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Close(context.Background()) })
 	mutateOptions(options)
 	for range 2 {
-		run, err := a.Start(context.Background(), astral.User("go"))
+		run, err := prompt(a, context.Background(), astral.User("go"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -122,7 +122,7 @@ func TestStandaloneFreezesGenerationOptions(t *testing.T) {
 }
 
 func TestPersistentGenerationOptionsSurviveConfigurationAndReopen(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		options := frozenOptions()
 		m := model(func(_ context.Context, _ int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 			return answer("done"), nil
@@ -130,8 +130,8 @@ func TestPersistentGenerationOptionsSurviveConfigurationAndReopen(t *testing.T) 
 		m.spec.Revision = "revision-1"
 		config := testConfig(m, store)
 		config.Options = options
-		manager := newAgent(t, config)
-		s := newSession(t, manager, sessions.SessionOptions{})
+		manager := newSessions(t, config)
+		s := newSession(t, manager, astral.SessionOptions{})
 		mutateOptions(options)
 		waitOK(t, start(t, s, "first"))
 		if got := m.observed()[0]; !reflect.DeepEqual(got.Options, frozenOptions()) || got.ModelRevision != "revision-1" {
@@ -149,7 +149,7 @@ func TestPersistentGenerationOptionsSurviveConfigurationAndReopen(t *testing.T) 
 		}
 		// Different manager defaults must not overwrite the committed selection.
 		config.Options = astral.GenerationOptions{}
-		reopenedManager := newAgent(t, config)
+		reopenedManager := newSessions(t, config)
 		reopened, err := reopenedManager.OpenSession(context.Background(), id)
 		if err != nil {
 			t.Fatal(err)
@@ -168,7 +168,7 @@ func TestPersistentGenerationOptionsSurviveConfigurationAndReopen(t *testing.T) 
 }
 
 func TestModelInputLimitIsCheckedIndependentlyOfContextWindow(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		m := model(func(_ context.Context, _ int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 			t.Fatal("provider called after input limit was exceeded")
 			return astral.Reply{}, nil
@@ -178,12 +178,12 @@ func TestModelInputLimitIsCheckedIndependentlyOfContextWindow(t *testing.T) {
 		m.estimator = func(astral.Request) (int, error) { return 900, nil }
 		config := testConfig(m, store)
 		config.Budget.SafetyMargin = 200
-		s := newSession(t, newAgent(t, config), sessions.SessionOptions{})
-		run, err := s.Start(context.Background(), astral.User("go"))
+		s := newSession(t, newSessions(t, config), astral.SessionOptions{})
+		run, err := prompt(s, context.Background(), astral.User("go"))
 		if err == nil {
 			_, err = run.Wait(context.Background())
 		}
-		if !errors.Is(err, sessions.ErrBudget) || len(m.observed()) != 0 {
+		if !errors.Is(err, astral.ErrBudget) || len(m.observed()) != 0 {
 			t.Fatalf("input budget was not enforced: %v", err)
 		}
 	})

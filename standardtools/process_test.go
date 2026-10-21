@@ -220,6 +220,6 @@ func TestRunningCommandUsesFrozenEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := command(t, *result.Result); got.ExitCode == nil || !strings.Contains(got.Output, h.dir) {
-		t.Fatal(fmt.Sprintf("wrong target: %+v", got))
+		t.Fatalf("wrong target: %+v", got)
 	}
 }

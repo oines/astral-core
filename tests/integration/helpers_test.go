@@ -11,7 +11,8 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
+	"github.com/oines/astral-core/store/memory"
 )
 
 type testModel struct {
@@ -87,31 +88,122 @@ func echoTool(counter *atomic.Int32) astral.Tool {
 	})
 }
 
-func testConfig(m astral.Model, store sessions.Store) sessions.Config {
-	return sessions.Config{EstimateTokens: func(ctx context.Context, m astral.Model, r astral.Request) (int, error) {
+func testConfig(m astral.Model, store astral.Store) astral.Config {
+	return astral.Config{EstimateTokens: func(ctx context.Context, m astral.Model, r astral.Request) (int, error) {
 		return m.(interface {
 			EstimateTokens(context.Context, astral.Request) (int, error)
 		}).EstimateTokens(ctx, r)
-	}, Model: m, Store: store, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: sessions.CompactionPolicy{Disabled: true}}
+	}, Model: m, Store: store, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: astral.CompactionPolicy{Disabled: true}}
 }
 
-func newAgent(t *testing.T, c sessions.Config) *sessions.Manager {
-	t.Helper()
-	a, err := sessions.New(c)
-	if err != nil {
-		t.Fatal(err)
+// sessionFactory is test-host ownership, not an SDK execution layer.
+type sessionFactory struct {
+	config   astral.Config
+	mu       sync.Mutex
+	sessions []*astral.Session
+}
+
+func newFactory(config astral.Config) (*sessionFactory, error) {
+	return &sessionFactory{config: config}, nil
+}
+func (f *sessionFactory) NewSession(ctx context.Context, options astral.SessionOptions) (*astral.Session, error) {
+	s, err := astral.NewSession(ctx, f.config, options)
+	if err == nil {
+		f.mu.Lock()
+		f.sessions = append(f.sessions, s)
+		f.mu.Unlock()
 	}
+	return s, err
+}
+func (f *sessionFactory) OpenSession(ctx context.Context, id string) (*astral.Session, error) {
+	s, err := astral.OpenSession(ctx, f.config, id)
+	if err == nil {
+		f.mu.Lock()
+		f.sessions = append(f.sessions, s)
+		f.mu.Unlock()
+	}
+	return s, err
+}
+func (f *sessionFactory) Close(ctx context.Context) error {
+	f.mu.Lock()
+	all := append([]*astral.Session(nil), f.sessions...)
+	f.mu.Unlock()
+	var errs []error
+	for _, s := range all {
+		errs = append(errs, s.Close(ctx))
+	}
+	return errors.Join(errs...)
+}
+func newSessions(t *testing.T, c astral.Config) *sessionFactory {
+	t.Helper()
+	f, _ := newFactory(c)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		if err := a.Close(ctx); err != nil {
+		if err := f.Close(ctx); err != nil {
 			t.Errorf("close: %v", err)
 		}
 	})
-	return a
+	return f
 }
 
-func newSession(t *testing.T, a *sessions.Manager, options sessions.SessionOptions) *sessions.Session {
+// Input helpers give each independent test submission a stable identity while
+// assertions can still focus on protocol payloads and tool effects.
+type inputOptions struct{ Contexts []astral.Message }
+type injectOptions struct{}
+
+func nextInput(message astral.Message, options []inputOptions) astral.Input {
+	input := astral.Input{ID: fmt.Sprintf("input-%d", fixtureCommitID.Add(1)), Message: message}
+	if len(options) > 0 {
+		input.Contexts = options[0].Contexts
+	}
+	return input
+}
+func prompt(s interface {
+	Prompt(context.Context, astral.Input) (astral.PromptResult, error)
+}, ctx context.Context, message astral.Message, options ...inputOptions) (*astral.Run, error) {
+	result, err := s.Prompt(ctx, nextInput(message, options))
+	return result.Run, err
+}
+func steer(s interface {
+	Steer(context.Context, astral.Input) (astral.InputReceipt, error)
+}, ctx context.Context, message astral.Message, options ...inputOptions) (string, error) {
+	r, err := s.Steer(ctx, nextInput(message, options))
+	return r.ID, err
+}
+func followUp(s interface {
+	FollowUp(context.Context, astral.Input) (astral.InputReceipt, error)
+}, ctx context.Context, message astral.Message, options ...inputOptions) (string, error) {
+	r, err := s.FollowUp(ctx, nextInput(message, options))
+	return r.ID, err
+}
+func inject(s interface {
+	InjectContext(context.Context, astral.Input) (astral.InputReceipt, error)
+}, ctx context.Context, messages []astral.Message, _ ...injectOptions) (string, error) {
+	r, err := s.InjectContext(ctx, astral.Input{ID: fmt.Sprintf("context-%d", fixtureCommitID.Add(1)), Contexts: messages})
+	return r.ID, err
+}
+func steerFor(s *astral.Session) func(context.Context, astral.Message, ...inputOptions) (string, error) {
+	return func(ctx context.Context, m astral.Message, o ...inputOptions) (string, error) {
+		return steer(s, ctx, m, o...)
+	}
+}
+func followUpFor(s *astral.Session) func(context.Context, astral.Message, ...inputOptions) (string, error) {
+	return func(ctx context.Context, m astral.Message, o ...inputOptions) (string, error) {
+		return followUp(s, ctx, m, o...)
+	}
+}
+func newMemorySession(config astral.Config) (*astral.Session, error) {
+	if config.Store == nil {
+		config.Store = memory.New()
+	}
+	if config.EstimateTokens == nil {
+		config.EstimateTokens = testConfig(config.Model, config.Store).EstimateTokens
+	}
+	return astral.NewSession(context.Background(), config, astral.SessionOptions{})
+}
+
+func newSession(t *testing.T, a *sessionFactory, options astral.SessionOptions) *astral.Session {
 	t.Helper()
 	s, err := a.NewSession(context.Background(), options)
 	if err != nil {
@@ -120,11 +212,11 @@ func newSession(t *testing.T, a *sessions.Manager, options sessions.SessionOptio
 	return s
 }
 
-func start(t *testing.T, s *sessions.Session, text string) *astral.Run {
+func start(t *testing.T, s *astral.Session, text string) *astral.Run {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
-	r, err := s.Start(ctx, astral.User(text))
+	r, err := prompt(s, ctx, astral.User(text))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +248,10 @@ func signal(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-func toolResults(s *sessions.Session) []astral.ToolResult {
+func toolResults(s *astral.Session) []astral.ToolResult {
 	var results []astral.ToolResult
 	for _, e := range entries(s) {
-		if e.Kind == sessions.EntryToolResult {
+		if e.Kind == astral.EntryToolResult {
 			results = append(results, *e.Tool.Result)
 		}
 	}
@@ -194,16 +286,16 @@ func bindingOf(raw json.RawMessage) hostBinding {
 
 type historySnapshot struct {
 	Version uint64
-	Entries []sessions.Entry
+	Entries []astral.Entry
 }
 
-func entries(s *sessions.Session) []sessions.Entry {
+func entries(s *astral.Session) []astral.Entry {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var out []sessions.Entry
+	var out []astral.Entry
 	cursor := ""
 	for {
-		page, err := s.History().Scan(ctx, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
+		page, err := s.History().Scan(ctx, astral.Query{Cursor: cursor, MaxBytes: astral.DefaultContextBytes})
 		if err != nil {
 			panic(err)
 		}
@@ -214,21 +306,21 @@ func entries(s *sessions.Session) []sessions.Entry {
 		cursor = page.NextCursor
 	}
 }
-func historyOf(s *sessions.Session) historySnapshot {
+func historyOf(s *astral.Session) historySnapshot {
 	return historySnapshot{Version: s.State().Version, Entries: entries(s)}
 }
-func entry(s *sessions.Session, id string) (sessions.Entry, bool) {
+func entry(s *astral.Session, id string) (astral.Entry, bool) {
 	e, err := s.History().Get(context.Background(), id)
 	return e, err == nil
 }
-func children(s *sessions.Session, id string) []sessions.Entry {
-	p, err := s.History().Children(context.Background(), id, sessions.Query{})
+func children(s *astral.Session, id string) []astral.Entry {
+	p, err := s.History().Children(context.Background(), id, astral.Query{})
 	if err != nil {
 		panic(err)
 	}
 	return p.Entries
 }
-func readStore(ctx context.Context, store sessions.Store, id string) (historySnapshot, error) {
+func readStore(ctx context.Context, store astral.Store, id string) (historySnapshot, error) {
 	state, err := store.LoadState(ctx, id)
 	if err != nil {
 		return historySnapshot{}, err
@@ -236,7 +328,7 @@ func readStore(ctx context.Context, store sessions.Store, id string) (historySna
 	out := historySnapshot{Version: state.Version}
 	cursor := ""
 	for {
-		page, err := store.Scan(ctx, state.RolloutID, sessions.Query{Cursor: cursor, MaxBytes: sessions.DefaultContextBytes})
+		page, err := store.Scan(ctx, state.RolloutID, astral.Query{Cursor: cursor, MaxBytes: astral.DefaultContextBytes})
 		if err != nil {
 			return out, err
 		}
@@ -252,8 +344,8 @@ func readStore(ctx context.Context, store sessions.Store, id string) (historySna
 
 var fixtureCommitID atomic.Uint64
 
-func makeCommit(state sessions.RuntimeState, version uint64, entries []sessions.Entry) sessions.Commit {
-	batch := append([]sessions.Entry(nil), entries...)
+func makeCommit(state astral.RuntimeState, version uint64, entries []astral.Entry) astral.Commit {
+	batch := append([]astral.Entry(nil), entries...)
 	for i := range batch {
 		batch[i].Sequence = 0
 		batch[i].SessionID = state.SessionID
@@ -265,11 +357,11 @@ func makeCommit(state sessions.RuntimeState, version uint64, entries []sessions.
 			batch[i].Time = time.Now().UTC()
 		}
 	}
-	return sessions.Commit{ID: fmt.Sprintf("fixture-%d", fixtureCommitID.Add(1)), ExpectedVersion: version, Entries: batch}
+	return astral.Commit{ID: fmt.Sprintf("fixture-%d", fixtureCommitID.Add(1)), ExpectedVersion: version, Entries: batch}
 }
-func appendStore(ctx context.Context, store sessions.Store, id string, version uint64, entries []sessions.Entry) error {
+func appendStore(ctx context.Context, store astral.Store, id string, version uint64, entries []astral.Entry) error {
 	state, err := store.LoadState(ctx, id)
-	if err != nil && !errors.Is(err, sessions.ErrNotFound) {
+	if err != nil && !errors.Is(err, astral.ErrNotFound) {
 		return err
 	}
 	commit := makeCommit(state, version, entries)
@@ -291,14 +383,32 @@ func (t hostTargetTool) Bind(ctx context.Context, inv astral.Invocation) (json.R
 	return append(json.RawMessage(nil), t.target()...), nil
 }
 
-func seedCompletedBoundary(t *testing.T, s *sessions.Session, store sessions.Store) {
+func seedCompletedBoundary(t *testing.T, s *astral.Session, store astral.Store) {
 	t.Helper()
 	m := answer("prior").Message
-	drafts := []sessions.Entry{{ID: "seed-assistant", ParentID: s.Head(), Kind: sessions.EntryMessage, TurnID: "seed-turn", Message: &m}, {ID: "seed-decision", Kind: sessions.EntryTurn, Turn: &astral.TurnState{ID: "seed-turn", AssistantID: "seed-assistant", Decided: true, Advanced: true}}}
+	drafts := []astral.Entry{{ID: "seed-assistant", ParentID: s.Head(), Kind: astral.EntryMessage, TurnID: "seed-turn", Message: &m}, {ID: "seed-run", Kind: astral.EntryRun, Run: &astral.RunRecord{ID: "seed-run", Status: "completed"}}}
 	if err := appendStore(context.Background(), store, s.ID(), s.State().Version, drafts); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func snapshotMessage(text string) astral.Message {
+	return astral.Message{Role: astral.RoleUser, ContextKind: "host.environment", Content: astral.Text(text)}
+}
+func waitSessionIdle(t *testing.T, s *astral.Session) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for s.Snapshot().Running {
+		select {
+		case <-deadline.C:
+			t.Fatal("session did not become idle")
+		case <-tick.C:
+		}
 	}
 }

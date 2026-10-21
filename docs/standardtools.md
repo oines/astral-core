@@ -97,13 +97,13 @@ config.Tools = set.Tools()
 
 ## 生命周期与环境绑定
 
-一个 `Set` 可以跨多个 Run、独立 Agent 和持久 Session 复用，每个终端会话有自己的执行所有者。Invocation.Binding 是宿主定义的 opaque JSON；标准工具只检查 JSON 有效性，将解析和授权交给 Backend。`write_stdin` 在审批之前找到原始绑定，执行之前再次验证。切换当前环境不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
+一个 `Set` 可以跨多个 Run 和 Session 复用，每个终端会话有自己的执行所有者。Invocation.Binding 是宿主定义的 opaque JSON；标准工具只检查 JSON 有效性，将解析和授权交给 Backend。`write_stdin` 在审批之前找到原始绑定，执行之前再次验证。切换当前环境不会把输入发到另一台机器；Fork 不获得源会话的终端使用权。
 
 命令不会随着一次工具调用的 Context 结束而被自动杀死。取消等待会返回已经收集的输出和已知的活跃 ID；后续可继续读取。取消一个正在阻塞的 PTY 写入可能已提交部分输入，本地后端会终止该进程并报告未知效果，避免返回后继续暗中写入。
 
 进程会话保存在 Set 内存中。它们不会通过持久历史在进程重启后自动重新建立，也不会重跑旧命令。重启后的旧 ID 返回不可用；持久 Session 按 started / completed 事实处理恢复，不自动重跑未知效果的工具。Standalone Core 只保留进程内状态。
 
-宿主停止 Agent 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Agent.Close` 不替宿主关闭 Set 或 Backend。本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。
+宿主关闭使用该工具集的 Session 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Session.Close` 不替宿主关闭 Set 或 Backend。本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。
 
 [environments 示例](../examples/environments/main.go) 使用宿主自定义 Binding 和同机上的两个目录模拟两个目标，演示切换后新命令使用新目标，真实 PTY 仍归属原始目标。环境切换是示例中普通的宿主 Sequential Tool，选择 Schema、发现及授权均由示例宿主实现；SDK 不提供 SwitchEnvironment 或设备选择接口。
 
