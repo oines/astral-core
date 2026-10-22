@@ -142,6 +142,7 @@ type SessionSnapshot struct {
 	Error         string            `json:"error,omitempty"`
 	Running       bool              `json:"running"`
 	Maintenance   bool              `json:"maintenance"`
+	CanContinue   bool              `json:"can_continue"`
 	RunID         string            `json:"run_id,omitempty"`
 	Attempt       *AttemptStatus    `json:"attempt,omitempty"`
 }
@@ -150,6 +151,10 @@ func (s *Session) Snapshot() SessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snapshot := SessionSnapshot{State: clone(s.state), Approvals: clone(s.pendingApprovalsLocked()), Unresolved: clone(s.unresolvedLocked()), Running: s.active != nil, Maintenance: s.maintenance, Attempt: clone(s.attempt), Error: s.operationError}
+	if !s.busyLocked() {
+		execution := s.executionStateLocked()
+		snapshot.CanContinue = execution.Continuable(execution.HasQueuedInputs)
+	}
 	s.events.mu.Lock()
 	snapshot.EventSequence = s.events.sequence
 	s.events.mu.Unlock()

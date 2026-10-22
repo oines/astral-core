@@ -50,6 +50,7 @@ const (
 	EntryApprovalRequested EntryKind = "approval_requested"
 	EntryApprovalDecided   EntryKind = "approval_decided"
 	EntryInputQueued       EntryKind = "input_queued"
+	EntryInputRequeued     EntryKind = "input_requeued"
 	EntryInputConsumed     EntryKind = "input_consumed"
 	EntryInputCleared      EntryKind = "input_cleared"
 	EntryCompaction        EntryKind = "compaction"

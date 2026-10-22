@@ -106,7 +106,7 @@ func (s *Session) LookupInput(ctx context.Context, id string) (InputReceipt, err
 func (s *Session) existingInputLocked(ctx context.Context, q InputRecord) (InputReceipt, bool, error) {
 	old, err := s.config.Store.LookupInput(ctx, s.id, q.ID)
 	if err == nil {
-		if old.Kind != q.Kind || old.Digest != q.Digest {
+		if old.Digest != q.Digest {
 			return InputReceipt{}, false, ErrConflict
 		}
 		return old, true, nil
@@ -160,18 +160,30 @@ func (s *Session) FollowUp(ctx context.Context, input Input) (InputReceipt, erro
 	return receipt, err
 }
 func (s *Session) InjectContext(ctx context.Context, input Input) (InputReceipt, error) {
-	receipt, admitted, err := s.enqueue(ctx, InputContext, input)
-	if err != nil || !admitted {
+	receipt, _, err := s.enqueue(ctx, InputContext, input)
+	if err != nil {
 		return receipt, err
 	}
-	// Passive flush never compacts or generates. It is optional: accepted input
-	// stays pending if an operation races this reservation or the request is full.
-	operation, finish, reserveErr := s.beginMaintenance(ctx)
-	if reserveErr == nil {
+	// Re-admission also resumes accepted passive input after recovery. Maintenance
+	// may summarize history, but never starts a driving model turn.
+	for {
+		s.mu.Lock()
+		pending := s.state.PendingInputs[InputContext] > 0
+		s.mu.Unlock()
+		if !pending {
+			break
+		}
+		operation, finish, reserveErr := s.beginMaintenance(ctx)
+		if reserveErr != nil {
+			break
+		}
 		_, _, flushErr := s.prepareStep(operation, prepareOptions{passiveOnly: true, reason: "passive", skipCollect: true})
 		finish()
-		if flushErr != nil && !errors.Is(flushErr, ErrBudget) && !errors.Is(flushErr, ErrIncompleteBatch) {
-			return receipt, flushErr
+		if flushErr != nil {
+			if !errors.Is(flushErr, ErrBudget) && !errors.Is(flushErr, ErrIncompleteBatch) {
+				return receipt, flushErr
+			}
+			break
 		}
 	}
 	return s.LookupInput(ctx, input.ID)
@@ -222,6 +234,9 @@ func (s *Session) HasQueuedInputs(ctx context.Context) (bool, error) {
 func (s *Session) PeekQueuedInputs(ctx context.Context) ([]InputRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.queuedInputsLocked(ctx)
+}
+func (s *Session) queuedInputsLocked(ctx context.Context) ([]InputRecord, error) {
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -247,6 +262,117 @@ func (s *Session) PeekQueuedInputs(ctx context.Context) ([]InputRecord, error) {
 	}
 	return out, nil
 }
+
+// pendingInputLocked selects the current queue item while holding the same lock
+// used by consumption. A UI action cannot revive an already consumed input.
+func (s *Session) pendingInputLocked(ctx context.Context, id string) (InputRecord, error) {
+	if s.closed {
+		return InputRecord{}, ErrClosed
+	}
+	receipt, err := s.config.Store.LookupInput(ctx, s.id, id)
+	if err != nil {
+		return InputRecord{}, err
+	}
+	if receipt.State != InputPending || receipt.Kind == InputContext {
+		return InputRecord{}, ErrNotFound
+	}
+	return receipt.InputRecord, nil
+}
+
+// ClearQueuedInput removes one driving input without affecting the other items.
+func (s *Session) ClearQueuedInput(ctx context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	input, err := s.pendingInputLocked(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = s.appendLocked(ctx, Entry{Kind: EntryInputCleared, Input: &input})
+	return err
+}
+
+// UpdateQueuedInput edits the existing input and/or changes when it is applied.
+// Its ID, acceptance digest, attached context and frozen attachments survive.
+// Clearing and requeuing share a commit; no intermediate queue is observable.
+func (s *Session) UpdateQueuedInput(ctx context.Context, id string, kind InputKind, message *Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queued, err := s.queuedInputsLocked(ctx)
+	if err != nil {
+		return err
+	}
+	next := append([]InputRecord(nil), queued...)
+	for i, input := range queued {
+		if input.ID != id {
+			continue
+		}
+		if kind != "" {
+			next[i].Kind = kind
+		}
+		if message != nil {
+			next[i].Message = message
+		}
+		if err = s.admitInput(next[i]); err != nil {
+			return err
+		}
+		if sameJSON(input, next[i]) {
+			return nil
+		}
+		return s.requeueLocked(ctx, queued, next)
+	}
+	return ErrNotFound
+}
+
+// MoveQueuedInput moves one item before another (empty beforeID means the end).
+// The order is resolved from the current queue, so later arrivals are retained.
+func (s *Session) MoveQueuedInput(ctx context.Context, id, beforeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queued, err := s.queuedInputsLocked(ctx)
+	if err != nil {
+		return err
+	}
+	index, target := -1, len(queued)
+	for i, input := range queued {
+		if input.ID == id {
+			index = i
+		}
+		if input.ID == beforeID {
+			target = i
+		}
+	}
+	if index < 0 || beforeID != "" && target == len(queued) {
+		return ErrNotFound
+	}
+	if index == target || index+1 == target {
+		return nil
+	}
+	previous := append([]InputRecord(nil), queued...)
+	item := queued[index]
+	queued = append(queued[:index], queued[index+1:]...)
+	if index < target {
+		target--
+	}
+	queued = append(queued, InputRecord{})
+	copy(queued[target+1:], queued[target:])
+	queued[target] = item
+	return s.requeueLocked(ctx, previous, queued)
+}
+
+// Replacement uses existing input identities, not a parallel queue or new
+// submissions. Every removal and reinsertion is in one durable commit.
+func (s *Session) requeueLocked(ctx context.Context, previous, next []InputRecord) error {
+	drafts := make([]Entry, 0, len(previous)+len(next))
+	for _, input := range previous {
+		drafts = append(drafts, Entry{Kind: EntryInputCleared, Input: &input})
+	}
+	for _, input := range next {
+		drafts = append(drafts, Entry{Kind: EntryInputRequeued, Input: &input})
+	}
+	_, err := s.appendLocked(ctx, drafts...)
+	return err
+}
+
 func (s *Session) ClearSteering(ctx context.Context) error  { return s.clearInputs(ctx, InputSteer) }
 func (s *Session) ClearFollowUps(ctx context.Context) error { return s.clearInputs(ctx, InputFollowUp) }
 func (s *Session) ClearQueuedInputs(ctx context.Context) error {

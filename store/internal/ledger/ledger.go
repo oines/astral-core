@@ -103,12 +103,24 @@ func (d *Data) AddPending(r core.Record) {
 		d.Inputs[e.InputID] = receipt
 	}
 	switch e.Kind {
+	case core.EntryInputRequeued:
+		receipt := d.Inputs[e.Input.ID]
+		receipt.InputRecord, receipt.State = *e.Input, core.InputPending
+		d.Inputs[e.Input.ID] = receipt
+		d.Pending["input:"+e.Input.ID] = r
 	case core.EntryInputQueued:
 		d.Pending["input:"+e.Input.ID] = r
 		d.Inputs[e.Input.ID] = core.InputReceipt{InputRecord: *e.Input, AcceptedAt: e.Time, State: core.InputPending}
 	case core.EntryInputCleared:
+		if e.Input != nil {
+			receipt := d.Inputs[e.Input.ID]
+			receipt.State = core.InputCleared
+			d.Inputs[e.Input.ID] = receipt
+			delete(d.Pending, "input:"+e.Input.ID)
+			break
+		}
 		for key, p := range d.Pending {
-			if p.Entry.Kind == core.EntryInputQueued {
+			if p.Entry.Kind == core.EntryInputQueued || p.Entry.Kind == core.EntryInputRequeued {
 				for _, kind := range e.Clear.Kinds {
 					if p.Entry.Input.Kind == kind {
 						receipt := d.Inputs[p.Entry.Input.ID]
@@ -473,7 +485,10 @@ func (st *Store) Pending(ctx context.Context, id string, q core.PendingQuery) (c
 	}
 	var rows []core.Record
 	for _, r := range d.Pending {
-		if q.Kind != "" && r.Entry.Kind != q.Kind {
+		if q.InputID != "" && (r.Entry.Input == nil || r.Entry.Input.ID != q.InputID) {
+			continue
+		}
+		if q.Kind != "" && r.Entry.Kind != q.Kind && (q.Kind != core.EntryInputQueued || r.Entry.Kind != core.EntryInputRequeued) {
 			continue
 		}
 		if q.InputKind != "" && (r.Entry.Input == nil || r.Entry.Input.Kind != q.InputKind) {

@@ -216,8 +216,7 @@ func (s *Session) drive(ctx context.Context, run *Run) {
 		// If a new input arrives after this boundary, Host's explicit Continue sees
 		// the completed lifecycle and can start it without a waiting goroutine.
 		if natural && (!queued || endReason != "") {
-			passive := endReason == "" && s.state.PendingInputs[InputContext] > 0
-			if passive {
+			for endReason == "" && s.state.PendingInputs[InputContext] > 0 {
 				s.mu.Unlock()
 				_, _, flushErr := s.prepareStep(ctx, prepareOptions{runID: run.id, passiveOnly: true, reason: "idle", skipCollect: true})
 				if flushErr != nil && !errors.Is(flushErr, ErrBudget) {
@@ -226,6 +225,9 @@ func (s *Session) drive(ctx context.Context, run *Run) {
 				}
 				s.mu.Lock()
 				queued = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
+				if flushErr != nil || queued {
+					break
+				}
 			}
 			if !queued || endReason != "" {
 				endLocked = true

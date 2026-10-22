@@ -15,7 +15,7 @@ Run 接受成功后使用 Session 自己的生命周期。提交请求的取消�
 - Prompt 要求空闲且协议完整，接收与 Run 开始记录一起提交。Busy 不接收新 ID。
 - Steer 和 FollowUp 只入队。活跃 Run 自然读取队列；空闲时需要显式 Continue。
 - Continue 不制造消息；可处理首条排队输入、继续未完成模型工作或恢复工具批次，无工作返回 ErrNotContinuable。
-- InjectContext 只接收被动 Context；空闲时可直接应用，但不会启动模型或自动压缩。放不下时保持 pending。
+- InjectContext 接收被动 Context；空闲维护及 Run 结束时分批应用积压，并可触发现有自动压缩，不启动主模型循环。预算、取消或摘要失败时保留尚未提交的 pending 输入，重试复用同一输入 ID。
 - Cancel 和失败保留未消费队列，不自行继续。一次 EndRun 控制完成后，Core 为已排队的独立输入开始新 Run。
 
 Input 要求调用方提供稳定 ID。未提供 Digest 时 Core 对消息与附带 Context 的规范化 JSON 计算摘要；提供 Digest 时它代表冻结前的原始业务提交。Host 必须诚实计算摘要，并在重读附件、生成时间戳之前调用 LookupInput。相同 ID、Kind、Digest 返回既有回执，重复 Prompt 的 Run 为 nil。不同内容或 Kind 返回 ErrConflict，即使会话正在运行也先进行此查询。

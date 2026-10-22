@@ -337,6 +337,10 @@ func (st *Store) Pending(ctx context.Context, id string, q core.PendingQuery) (c
 		query += " AND p.input_kind=?"
 		args = append(args, string(q.InputKind))
 	}
+	if q.InputID != "" {
+		query += " AND p.kind=? AND p.key=?"
+		args = append(args, string(core.EntryInputQueued), q.InputID)
+	}
 	if q.Cursor != "" {
 		cursor, err := strconv.ParseUint(q.Cursor, 10, 63)
 		if err != nil {
@@ -572,12 +576,17 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []core.Record, p
 			}
 		}
 		switch e.Kind {
-		case core.EntryInputQueued:
+		case core.EntryInputQueued, core.EntryInputRequeued:
 			frozen, encodeErr := json.Marshal(e.Input)
 			if encodeErr != nil {
 				return encodeErr
 			}
-			if _, err = tx.ExecContext(ctx, "INSERT INTO inputs(session_id,id,kind,digest,accepted_at,payload,state) VALUES(?,?,?,?,?,?,?)", e.SessionID, e.Input.ID, string(e.Input.Kind), e.Input.Digest, e.Time.Format(time.RFC3339Nano), frozen, string(core.InputPending)); err != nil {
+			if e.Kind == core.EntryInputRequeued {
+				_, err = tx.ExecContext(ctx, "UPDATE inputs SET kind=?,payload=?,state=? WHERE session_id=? AND id=?", string(e.Input.Kind), frozen, string(core.InputPending), e.SessionID, e.Input.ID)
+			} else {
+				_, err = tx.ExecContext(ctx, "INSERT INTO inputs(session_id,id,kind,digest,accepted_at,payload,state) VALUES(?,?,?,?,?,?,?)", e.SessionID, e.Input.ID, string(e.Input.Kind), e.Input.Digest, e.Time.Format(time.RFC3339Nano), frozen, string(core.InputPending))
+			}
+			if err != nil {
 				return err
 			}
 			fallthrough
@@ -589,8 +598,19 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []core.Record, p
 			if e.Approval != nil {
 				owner = e.Approval.ExecutionID
 			}
-			_, err = tx.ExecContext(ctx, "INSERT INTO pending(rollout_id,session_id,kind,input_kind,key,owner,seq,payload) VALUES(?,?,?,?,?,?,?,?)", id, e.SessionID, string(e.Kind), kind, key, owner, e.Sequence, payload)
+			pendingKind := e.Kind
+			if pendingKind == core.EntryInputRequeued {
+				pendingKind = core.EntryInputQueued
+			}
+			_, err = tx.ExecContext(ctx, "INSERT INTO pending(rollout_id,session_id,kind,input_kind,key,owner,seq,payload) VALUES(?,?,?,?,?,?,?,?)", id, e.SessionID, string(pendingKind), kind, key, owner, e.Sequence, payload)
 		case core.EntryInputCleared:
+			if e.Input != nil {
+				if _, err = tx.ExecContext(ctx, "UPDATE inputs SET state=? WHERE session_id=? AND id=?", string(core.InputCleared), e.SessionID, e.Input.ID); err != nil {
+					return err
+				}
+				_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(core.EntryInputQueued), e.Input.ID)
+				break
+			}
 			for _, kind := range e.Clear.Kinds {
 				if _, err = tx.ExecContext(ctx, "UPDATE inputs SET state=? WHERE session_id=? AND kind=? AND state=?", string(core.InputCleared), e.SessionID, string(kind), string(core.InputPending)); err != nil {
 					return err

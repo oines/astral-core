@@ -65,15 +65,22 @@ if submission.Run != nil {
 | `Steer(ctx, Input)` | 只入队，在下一完整工具批次后的安全边界优先应用 |
 | `FollowUp(ctx, Input)` | 只入队，在当前任务自然结束时应用 |
 | `Continue(ctx)` | 显式处理队列或恢复未完成执行；无工作返回 `ErrNotContinuable` |
-| `InjectContext(ctx, Input)` | 接收被动上下文，不启动模型或自动摘要 |
+| `InjectContext(ctx, Input)` | 接收被动上下文；空闲时应用并按预算自动摘要，不启动主模型循环 |
 | `LookupInput(ctx, id)` | 按索引读取冻结载荷、首次接收时间与 `pending/applied/cleared` 状态 |
+| `UpdateQueuedInput(ctx, id, kind, message)` | 修改尚未消费的驱动输入；空 kind 或 nil message 保留该部分 |
+| `MoveQueuedInput(ctx, id, beforeID)` | 将驱动输入移到另一条之前；空 beforeID 表示队尾 |
+| `ClearQueuedInput(ctx, id)` | 删除一条尚未消费的驱动输入 |
 | `Cancel()` / `Run.Cancel()` | 取消执行并保留未消费输入 |
 | `Compact(ctx, instructions)` | 空闲时显式压缩，不消费驱动输入、不生成普通回答 |
 | `Snapshot()` / `Subscribe()` | 读取执行状态、尝试进度并订阅事件 |
 | `History()` / `InspectContext()` | 读取历史与有效上下文，不启动执行或收集环境 |
 | `Fork(ctx, entryID, options)` | 在完整历史边界创建共享或独立 Rollout 的 Session |
 
-所有输入都要求稳定 ID，包括第一条 Prompt。相同 ID、相同 Digest 返回既有回执；内容或投递类别不同返回冲突。Host 可提供原始业务提交的 Digest，并在重新生成时间戳或读取附件前先查询回执。Core 保存第一次接收的完整载荷，不再用重试时构造的内容替换它。
+所有输入都要求稳定 ID，包括第一条 Prompt。相同 ID、相同 Digest 返回既有回执；不同 Digest 返回冲突。Host 可提供原始业务提交的 Digest，并在重新生成时间戳或读取附件前先查询回执。重试不替换已保存载荷。
+
+队列编辑和重排复用输入 ID、首次接收时间和接收 Digest；Contexts 保持冻结。重排与载荷更新在同一提交中完成，以新队列记录的顺序为准。如果上下文准备期间选中的队列记录被更新，准备过程会根据新记录重新开始，不提交旧内容或旧顺序。已消费输入不能通过迟到的 UI 操作重新入队。Host 编辑文字时保留原消息中的附件块，无需重新读取附件来源。
+
+`Snapshot().CanContinue` 使用与 `Continue` 相同的执行判断，覆盖队列和已开始但未完成的工作；Host 可以直接据此展示恢复操作。
 
 输入的 `Contexts` 与 `Message` 是不可拆分的投递组。Steer 默认每次一组，`MaxSteeringPerTurn` 可设为 1–16；FollowUp 每次一组。准备开始时冻结有限选择范围；预算不够时整批不消费。取消和失败不自动重启，Host 可以显式 Continue。已接受的 Run 使用 Session 生命周期，不因提交请求的 Context 或浏览器断开而取消；`Run.Wait` 的 Context 只控制等待。
 

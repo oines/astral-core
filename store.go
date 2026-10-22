@@ -58,6 +58,7 @@ type Query struct {
 type PendingQuery struct {
 	Kind      EntryKind
 	InputKind InputKind
+	InputID   string
 	Cursor    string
 	Limit     int
 	MaxBytes  int

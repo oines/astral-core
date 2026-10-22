@@ -59,12 +59,16 @@ func validateEnvelope(e Entry) error {
 		if valid && e.Kind == EntryApprovalDecided {
 			valid = e.Approval.Decision != nil
 		}
-	case EntryInputQueued, EntryInputConsumed:
+	case EntryInputQueued, EntryInputRequeued, EntryInputConsumed:
 		valid = e.Input != nil && e.Input.ID != "" && (e.Input.Kind == InputSteer || e.Input.Kind == InputFollowUp || e.Input.Kind == InputContext)
-		if valid && e.Kind == EntryInputQueued {
+		if valid && e.Kind != EntryInputConsumed {
 			valid = e.Input.Validate() == nil
 		}
 	case EntryInputCleared:
+		if e.Input != nil {
+			valid = e.Input.ID != "" && (e.Input.Kind == InputSteer || e.Input.Kind == InputFollowUp)
+			break
+		}
 		valid = e.Clear != nil && len(e.Clear.Kinds) > 0
 		if valid {
 			for _, k := range e.Clear.Kinds {

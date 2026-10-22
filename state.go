@@ -235,7 +235,7 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				state.Branch.ToolEntries[inv.Call.ID] = e.ID
 			}
 			state.Tools[inv.Call.ID] = work
-		case EntryInputQueued:
+		case EntryInputQueued, EntryInputRequeued:
 			if state.PendingInputs == nil {
 				state.PendingInputs = map[InputKind]uint64{}
 			}
@@ -252,8 +252,18 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				}
 			}
 		case EntryInputCleared:
-			for _, kind := range e.Clear.Kinds {
-				delete(state.PendingInputs, kind)
+			if e.Input != nil {
+				if state.PendingInputs[e.Input.Kind] == 0 {
+					return RuntimeState{}, nil, ErrCorrupt
+				}
+				state.PendingInputs[e.Input.Kind]--
+				if state.PendingInputs[e.Input.Kind] == 0 {
+					delete(state.PendingInputs, e.Input.Kind)
+				}
+			} else {
+				for _, kind := range e.Clear.Kinds {
+					delete(state.PendingInputs, kind)
+				}
 			}
 			if len(state.PendingInputs) == 0 {
 				state.PendingInputs = nil

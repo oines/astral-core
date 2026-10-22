@@ -17,10 +17,21 @@ type preparedStep struct {
 	driven bool
 }
 
-// prepareStep does all external work on immutable snapshots. Only the final
+var errQueueRevised = errors.New("selected queue input was revised")
+
+func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (preparedStep, CompactionRecord, error) {
+	for {
+		step, summary, err := s.prepareCandidate(ctx, options)
+		if !errors.Is(err, errQueueRevised) {
+			return step, summary, err
+		}
+	}
+}
+
+// prepareCandidate does all external work on immutable snapshots. Only the final
 // commit is locked; audit records and newly accepted queue entries can advance
 // the store version without changing this finite boundary's selected inputs.
-func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (preparedStep, CompactionRecord, error) {
+func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) (preparedStep, CompactionRecord, error) {
 	var summary CompactionRecord
 	s.mu.Lock()
 	if !s.state.Branch.Complete() {
@@ -55,7 +66,7 @@ func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (prep
 	}
 	candidate, budgetErr := s.fitContext(ctx, model, candidate)
 	near := budgetErr == nil && s.config.Budget.AutoCompactAt > 0 && candidate.EstimatedInput > model.Spec().ContextWindow-candidate.Request.MaxOutputTokens-s.config.Budget.SafetyMargin-s.config.Budget.AutoCompactAt
-	needsCompact := options.compact || !options.passiveOnly && !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
+	needsCompact := options.compact || !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
 	compactionID := ""
 	var drafts []Entry
 	if needsCompact {
@@ -145,12 +156,18 @@ func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (prep
 		return preparedStep{}, summary, ErrConflict
 	}
 	for _, record := range selected {
-		receipt, err := s.config.Store.LookupInput(ctx, s.id, record.Entry.Input.ID)
+		current, err := s.config.Store.Pending(ctx, s.id, PendingQuery{Kind: EntryInputQueued, InputID: record.Entry.Input.ID, Limit: 1, MaxBytes: 2 * s.config.MaxContextBytes})
 		if err != nil {
 			return preparedStep{}, summary, err
 		}
-		if receipt.State != InputPending || receipt.Digest != record.Entry.Input.Digest {
+		if len(current.Records) == 0 {
 			return preparedStep{}, summary, ErrConflict
+		}
+		// Editing/reordering keeps the input identity and acceptance digest, but
+		// replaces its immutable queue record. Rebuild against that new selection
+		// rather than consuming a draft prepared before the owner's change.
+		if current.Records[0].Entry.ID != record.Entry.ID {
+			return preparedStep{}, summary, errQueueRevised
 		}
 	}
 	if len(drafts) > 0 {
