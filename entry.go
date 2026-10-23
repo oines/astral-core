@@ -110,7 +110,6 @@ type CompactionRecord struct {
 	ModelRevision string            `json:"model_revision,omitempty"`
 	Options       GenerationOptions `json:"options,omitempty"`
 	InputTokens   int               `json:"input_tokens"`
-	Generation    *GenerationRecord `json:"generation,omitempty"`
 	Usage         Usage             `json:"usage,omitempty"`
 	Instructions  string            `json:"instructions,omitempty"`
 }
