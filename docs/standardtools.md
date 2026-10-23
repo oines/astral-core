@@ -5,7 +5,7 @@
 ```go
 backend, err := local.New(local.Options{
     CWD: preparedWorkspace,
-    Shell: "/bin/sh",
+    Shell: local.DefaultShell(),
 })
 if err != nil { return err }
 set, err := standardtools.New(backend)
@@ -40,7 +40,7 @@ config.Tools = set.Tools()
 - 不提供 Pi 的 `bash`；该位置由命令会话工具替代。没有在模型 schema 中加入 Codex 特定的 `sandbox_permissions` 等宿主策略字段。
 - `edit` 发布当前数组 schema，不接受 Pi 为旧客户端提供的单组 `oldText/newText` 兼容输入。工具定义版本为 `2`；持久 Session 使用的声明必须与宿主实现匹配。当前存储格式不支持旧日志自动迁移。
 - 匹配与修改行为有参考样例验证；Go diff 库可能为重复行选择不同但等价的 diff。Go 图片编码器的字节和压缩质量也不会与 Pi 完全相同。
-- 本地 Shell / PTY 后端目前支持 Unix。非 Unix 调用明确报错；可接入原生或远程 Backend。标准工具不读取环境中的平台字段，平台要求由宿主 Backend 处理。
+- 本地 Shell / PTY 后端支持 Unix 和带 ConPTY 的 Windows。Windows 默认使用已安装的 `$SHELL`，否则优先 PowerShell 7，再使用系统 Windows PowerShell；可通过 `local.DefaultShell()` 取得实际选择的可执行文件。其他平台仍需提供原生或远程 Backend。标准工具不读取环境中的平台字段，平台要求由宿主 Backend 处理。
 
 ### 输入声明与普通调用结果
 
@@ -91,6 +91,8 @@ config.Tools = set.Tools()
 
 本地路径支持相对 / 绝对路径、`~`、`@file`、`file://`、粘贴的特殊空格，以及截图文件名的 AM/PM、NFD 和弯引号变体。符号链接别名共享队列。写入遵循 Pi 的原地覆盖，跟随符号链接并保留已有权限；不是文件系统事务。所有匹配成功才开始写入，实际 IO 失败仍可能产生部分变更，此时返回未知效果。
 
+Windows 同时支持盘符、UNC、`~\`、`file:///C:/...` 与 `file://server/share/...` 路径。路径由执行所在机器解析；远程 Backend 必须返回目标系统的 `Parent` 和 `Key`，宿主不能用自己的路径规则重算。Windows 环境变量覆盖忽略键名大小写，保留驱动器当前目录变量。
+
 ## 命令工具
 
 ```json
@@ -116,7 +118,7 @@ config.Tools = set.Tools()
 
 等待窗口结束会返回数字 `session_id`，不会终止命令。`write_stdin` 只交付上次取走之后的新输出；各进程可以并行，同一进程的读写串行。完成结果包含 `exit_code`，该 ID 随后不可再次使用。输出正文采用 Codex 的约 4 字节 / Token 估算，按 UTF-8 边界保留头尾，插入 `…N tokens truncated…`。普通返回按 Set 的 Token 上限增加 20% 序列化余量，并为状态头和截断提示预留空间；较小的调用级预算仍限制正文。缓冲区省略字节数独立保留，后续截断不会抹掉该提示。精确 Provider 预算由 Session 的独立 TokenEstimator 检查。
 
-非 PTY 会话拒绝普通输入，但单独的 Ctrl-C 可向进程组发送中断。PTY 接收输入字节，可用于交互式程序。默认本地 PTY 为 80×24；没有终端 UI 或窗口尺寸同步服务。
+非 PTY 会话拒绝普通输入，但单独的 Ctrl-C 可发送中断。Unix 使用进程组信号；Windows 使用每个命令的私有 ConPTY 控制通道，不修改宿主进程的控制台。Windows 管道模式仍向子进程提供真实的 stdout/stderr 管道和 stdin EOF。PTY 可用于交互式程序；Windows 会将输入 LF/CRLF 转成控制台 Enter 的 CR。默认本地 PTY 为 80×24；没有终端 UI 或窗口尺寸同步服务。
 
 模型 Content 使用 `Chunk ID`、`Wall time`、退出码或 `Process running with session ID`、原始 Token 数及 `Output` 文本。结构化副本保存在 `ToolResult.Details`：
 
@@ -134,7 +136,7 @@ config.Tools = set.Tools()
 
 进程会话保存在 Set 内存中。它们不会通过持久历史在进程重启后自动重新建立，也不会重跑旧命令。重启后的旧 ID 返回不可用；持久 Session 按 started / completed 事实处理恢复，不自动重跑未知效果的工具。Standalone Core 只保留进程内状态。
 
-宿主关闭使用该工具集的 Session 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Session.Close` 不替宿主关闭 Set 或 Backend。本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。
+宿主关闭使用该工具集的 Session 后，应在自己的清理 Context 中调用 `Set.Close`。它取消待处理调用、终止所有拥有的进程并等待 IO 工作者退出，可以再次调用。`Session.Close` 不替宿主关闭 Set 或 Backend。Unix 本地后端清理 Shell 的进程组；主动创建新会话逃离进程组的程序，需要宿主 Runtime 的容器 / 作业管理机制约束。Windows 在 Shell 恢复执行前将其放入 Job Object，终止时清理整个 Job；Shell 正常退出也清理后台子进程，宿主崩溃后由关闭 Job 句柄触发收尾。
 
 [environments 示例](../examples/environments/main.go) 使用宿主自定义 Binding 和同机上的两个目录模拟两个目标，演示切换后新命令使用新目标，真实 PTY 仍归属原始目标。环境切换是示例中普通的宿主 Sequential Tool，选择 Schema、发现及授权均由示例宿主实现；SDK 不提供 SwitchEnvironment 或设备选择接口。
 
