@@ -39,7 +39,9 @@ Input.Contexts 与 Message 整体接收、整体应用。Steer 优先，默认�
 
 CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返回独立消息。Host 负责发现、权限、指纹及相对当前分支的去重。新 CompactionID 要重新收集完整快照；Core 不把它当作持久待完成任务。动态环境应使用 RoleUser 普通 Context，SystemPrompt 仅放稳定规则。回调不能修改 Core 或执行业务副作用。
 
-手动 Compact 复用准备流程，可应用选中的被动 Context，但不消费驱动输入、不生成普通回答。摘要请求独立校验预算，按完整消息/工具批次选择旧历史，保留原生多模态与来源信息。仅摘要请求超预算时可缩短工具文本的副本；原始历史不变。只有有效非空文本摘要可提交。
+手动 Compact 复用准备流程，可应用选中的被动 Context，但不消费驱动输入、不生成普通回答。摘要请求独立校验预算，按完整消息/工具批次选择旧历史，沿用普通请求的对话顺序，保留原生消息、多模态内容和工具调用关系；同批工具结果按调用声明顺序紧随 assistant 调用，不额外附加内部历史 ID 或执行记录清单。仅摘要请求超预算时可缩短工具文本的副本；原始历史不变。只有有效非空文本摘要可提交。
+
+默认摘要使用 Goal、Constraints & Preferences、Progress（Done / In Progress / Blocked）、Key Decisions、Next Steps、Critical Context 结构。已有摘要作为首条源消息参与下一次压缩；更新指令要求保留仍有效的目标与约束，合并新进展和决策，更新完成状态、阻塞与下一步，并保留准确路径、标识符和错误信息。模型只生成交接摘要，不继续执行源对话中的任务，也不能把未经确认的操作写成已完成。自定义 Compaction.SystemPrompt 可覆盖默认格式。
 
 MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。缺失、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
 

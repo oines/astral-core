@@ -80,12 +80,10 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	}
 	// Select every message covered by the complete history boundary.
 	var selected []Message
-	var sourceIDs []string
 	for i, message := range view.Request.Messages {
 		source := view.Sources[i]
 		if source == summaryID || indices[source] <= through {
 			selected = append(selected, message)
-			sourceIDs = append(sourceIDs, source)
 		}
 	}
 	if len(selected) == 0 {
@@ -111,12 +109,8 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	output = outputReservation(output, summaryModel.Spec())
 	baseRequest := Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.config.Compaction.Options}
 	build := func(messages []Message) (Request, error) {
-		messages, err := summaryMessages(messages, sourceIDs, path, instructions)
-		if err != nil {
-			return Request{}, err
-		}
 		candidate := baseRequest
-		candidate.Messages = messages
+		candidate.Messages = summaryMessages(messages, instructions)
 		return PrepareRequest(ctx, summaryModel, candidate)
 	}
 	request, err := build(selected)

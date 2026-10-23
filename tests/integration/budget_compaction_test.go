@@ -184,6 +184,9 @@ func TestCompactionKeepsNativeInputAndSummarizesContextNormally(t *testing.T) {
 		if n == 1 {
 			return calls(call("c", "large", `{"value":"x"}`)), nil
 		}
+		if n == 3 {
+			return calls(call("new-a", "large", `{"value":"a"}`), call("new-b", "large", `{"value":"b"}`)), nil
+		}
 		return answer("recent answer"), nil
 	})
 	summary := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
@@ -195,9 +198,28 @@ func TestCompactionKeepsNativeInputAndSummarizesContextNormally(t *testing.T) {
 	summary.spec.ID = "summary"
 	s, userID := largeHistory(t, normal, summary, large, true)
 	before := historyOf(s)
+	beforeContext, err := s.InspectContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	record, err := s.Compact(context.Background(), "preserve exact identifiers")
 	if err != nil {
 		t.Fatal(err)
+	}
+	request := summary.observed()[0]
+	// The last ordinary answer is retained; the selected native messages are
+	// followed only by the summarization instruction, without a history ledger.
+	if !reflect.DeepEqual(request.Messages[:len(request.Messages)-1], beforeContext.Request.Messages[:len(beforeContext.Request.Messages)-1]) {
+		t.Fatal("summary request changed the selected native conversation")
+	}
+	instruction := request.Messages[len(request.Messages)-1].Content[0].Text
+	if strings.Contains(instruction, "Source manifest") || !strings.Contains(instruction, "preserve exact identifiers") {
+		t.Fatal("summary instruction contains a ledger or lost the requested focus")
+	}
+	for _, entry := range before.Entries {
+		if strings.Contains(instruction, entry.ID) {
+			t.Fatal("internal history ID leaked into summary instruction")
+		}
 	}
 	after := historyOf(s)
 	if !reflect.DeepEqual(before.Entries, after.Entries[:len(before.Entries)]) {
@@ -237,6 +259,46 @@ func TestCompactionKeepsNativeInputAndSummarizesContextNormally(t *testing.T) {
 			t.Fatal("future summary leaked into fork")
 		}
 	}
+
+	waitOK(t, start(t, s, "continue work after the first compaction"))
+	if _, err := s.Compact(context.Background(), "keep unresolved work"); err != nil {
+		t.Fatal(err)
+	}
+	requests := summary.observed()
+	if len(requests) != 2 {
+		t.Fatalf("expected one summary request per compaction, got %d", len(requests))
+	}
+	updated := requests[1]
+	wantRoles := []astral.Role{astral.RoleUser, astral.RoleAssistant, astral.RoleUser, astral.RoleAssistant, astral.RoleTool, astral.RoleTool, astral.RoleUser}
+	if len(updated.Messages) != len(wantRoles) {
+		t.Fatalf("unexpected updated summary sequence: %d messages", len(updated.Messages))
+	}
+	for i, role := range wantRoles {
+		if updated.Messages[i].Role != role {
+			t.Fatalf("summary message %d has role %s, want %s", i, updated.Messages[i].Role, role)
+		}
+	}
+	previous := updated.Messages[0]
+	if previous.ContextKind != "summary" || !reflect.DeepEqual(previous.Content, astral.Text(record.Summary)) {
+		t.Fatal("subsequent compaction lost the previous summary")
+	}
+	if !reflect.DeepEqual(updated.Messages[1].Content, astral.Text("recent answer")) || !reflect.DeepEqual(updated.Messages[2].Content, astral.Text("continue work after the first compaction")) {
+		t.Fatal("subsequent compaction reordered retained and new conversation")
+	}
+	wantCalls := []astral.ToolCall{call("new-a", "large", `{"value":"a"}`), call("new-b", "large", `{"value":"b"}`)}
+	if !reflect.DeepEqual(updated.Messages[3].ToolCalls(), wantCalls) {
+		t.Fatal("subsequent compaction changed tool calls, arguments or order")
+	}
+	for i, call := range wantCalls {
+		result := updated.Messages[4+i]
+		if result.ToolCallID != call.ID || result.Name != call.Name || !reflect.DeepEqual(result.Content, astral.Text(large)) {
+			t.Fatal("subsequent compaction lost a full tool result or its position after the corresponding calls")
+		}
+	}
+	updateInstruction := updated.Messages[len(updated.Messages)-1].Content[0].Text
+	if !strings.Contains(updateInstruction, "previous summary") || !strings.Contains(updateInstruction, "keep unresolved work") {
+		t.Fatal("subsequent compaction lost the update instruction or requested focus")
+	}
 }
 
 func TestCompactionTrimsOnlyToolCopiesForSmallerSummarizer(t *testing.T) {
@@ -248,11 +310,12 @@ func TestCompactionTrimsOnlyToolCopiesForSmallerSummarizer(t *testing.T) {
 		return answer("recent"), nil
 	})
 	summary := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-		text := requestText(r)
-		if !strings.Contains(text, "shortened for summary") || !strings.Contains(text, `"execution_outcome":"succeeded"`) || !strings.Contains(text, `"tool_call_id":"c"`) {
-			return astral.Reply{}, errors.New("summary input lost status, identity or trim marker")
+		for _, message := range r.Messages {
+			if message.Role == astral.RoleTool && message.ToolCallID == "c" && message.Name == "large" && !message.IsError && strings.Contains(message.Content[0].Text, "shortened for summary") {
+				return answer("small summary"), nil
+			}
 		}
-		return answer("small summary"), nil
+		return astral.Reply{}, errors.New("summary input lost native tool identity, status or trim marker")
 	})
 	summary.spec = astral.ModelSpec{ID: "small-summary", ContextWindow: 2000, MaxOutputTokens: 200}
 	s, _ := largeHistory(t, normal, summary, large, false)
