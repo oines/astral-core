@@ -55,6 +55,14 @@ func init() {
 		fmt.Printf("INPUT:%s", line)
 		os.Exit(0)
 	case "interrupt":
+		// CI's parent shell can mark its descendants as ignoring Ctrl-C. Unlike
+		// real shells, this Go fixture does not initialize console input itself.
+		// Installing a signal handler alone does not clear that inherited flag.
+		setHandler := windows.NewLazySystemDLL("kernel32.dll").NewProc("SetConsoleCtrlHandler")
+		if ok, _, err := setHandler.Call(0, 0); ok == 0 {
+			fmt.Printf("reset Ctrl-C ignore state: %v\n", err)
+			os.Exit(80)
+		}
 		interrupt := make(chan os.Signal, 1)
 		signal.Notify(interrupt, os.Interrupt)
 		fmt.Println("READY")
@@ -301,7 +309,20 @@ func TestWindowsPowerShellCommandQuotingEncodingAndExit(t *testing.T) {
 			code := waitWindowsProcess(t, p)
 			select {
 			case raw := <-output:
-				if code != 17 || !strings.Contains(raw, "中文 and \"quoted\"") || !strings.Contains(raw, dir) {
+				// PowerShell expands an inherited 8.3 short temp directory to its
+				// long spelling. Compare filesystem identities instead of strings.
+				cwdMatches := false
+				wantInfo, statErr := os.Stat(dir)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				for _, line := range strings.Split(raw, "\n") {
+					info, err := os.Stat(strings.TrimSpace(line))
+					if err == nil && os.SameFile(wantInfo, info) {
+						cwdMatches = true
+					}
+				}
+				if code != 17 || !strings.Contains(raw, "中文 and \"quoted\"") || !cwdMatches || strings.Contains(raw, "#< CLIXML") {
 					t.Fatalf("PowerShell exit=%d output=%q; expected cwd=%q", code, raw, dir)
 				}
 			case <-time.After(5 * time.Second):

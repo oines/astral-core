@@ -261,7 +261,7 @@ func windowsCommand(shell string, request standardtools.ProcessRequest) (string,
 	case "pwsh", "powershell":
 		// EncodedCommand preserves quotes, multiline commands and Unicode across
 		// Windows argv parsing. Set the pipe encoding explicitly for PS 5.1 too.
-		script := "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; " + request.Command
+		script := "$ProgressPreference = 'SilentlyContinue'; [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; " + request.Command
 		units := utf16.Encode([]rune(script))
 		raw := make([]byte, len(units)*2)
 		for i, u := range units {

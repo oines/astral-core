@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -94,7 +95,7 @@ func Open(path string) (*Store, error) {
 	} else if !errors.Is(openErr, os.ErrNotExist) {
 		return nil, openErr
 	}
-	uri := url.URL{Scheme: "file", Path: abs}
+	uri := databaseURI(abs, runtime.GOOS)
 	// Inspect an existing database before any schema or journal mutation.
 	if existing {
 		check, err := sql.Open("sqlite", uri.String()+"?mode=ro")
