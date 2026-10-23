@@ -27,7 +27,7 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	s.mu.Unlock()
 	return record, err
 }
-func (s *Session) draftCompaction(ctx context.Context, instructions string, normalModel Model, path []Entry, keepTokens int, runID, turnID string) (CompactionRecord, error) {
+func (s *Session) draftCompaction(ctx context.Context, instructions string, normalModel Model, path []Entry, keepTokens int, force bool, runID, turnID string) (CompactionRecord, error) {
 	view, err := project(path)
 	if err != nil {
 		return CompactionRecord{}, err
@@ -47,6 +47,9 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		if count >= keepTokens {
 			break
 		}
+	}
+	if keepStart == 0 && force {
+		keepStart = groups[len(groups)/2].start
 	}
 	if keepStart == 0 {
 		return CompactionRecord{}, ErrCompactionNoProgress
@@ -101,7 +104,9 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	}
 	output := s.config.Compaction.OutputTokens
 	if output == 0 {
-		output = 4096
+		reserve := s.compactionBudget(normalModel).ReserveTokens
+		// floor(0.8 * reserve), without overflowing a host-supplied integer.
+		output = max(1, reserve/5*4+reserve%5*4/5)
 	}
 	output = outputReservation(output, summaryModel.Spec())
 	baseRequest := Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.config.Compaction.Options}

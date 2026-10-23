@@ -86,7 +86,7 @@ if submission.Run != nil {
 
 ## 原子上下文准备
 
-普通模型轮次先预览队列与旧上下文，必要时仅对已提交历史生成摘要草稿，再同步调用 `Config.CollectContext` 采集环境。最终顺序为：摘要与保留历史、选中的被动上下文、最新环境、驱动输入组。
+普通模型轮次先预览队列，并同步调用 `Config.CollectContext` 把最新环境加入完整候选，再决定是否压缩。必要时仅对已提交历史生成摘要草稿，摘要完成后重新采集环境。最终顺序为：摘要与保留历史、选中的被动上下文、最新环境、驱动输入组。
 
 完整候选请求必须同时满足 Token 与字节预算。摘要、环境、输入和消费记录通过一次 Store Commit 确认，然后发送冻结请求。采集失败、预算失败或提交前冲突不会改变有效上下文；摘要草稿可以在下一次激活重新计算。每次准备最多自动压缩一次，摘要请求也独立检查预算。自动压缩的近期保留目标会为新输入预留空间。
 
@@ -106,9 +106,19 @@ config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary)
 
 ## 重试与模型记录
 
+预算默认采用 Pi 的数值：`Compaction.ReserveTokens = 16384`，输入超过 `ContextWindow - ReserveTokens` 才触发提前压缩；`KeepRecentTokens = 20000`，按完整消息/工具批次保留；摘要输出上限为预留量的 80%（默认 13107），并受摘要模型最大输出限制。`Compaction.ModelBudgets` 可按普通模型 ID 覆盖预留量和保留量。
+
+普通输出按 `min(期望输出或模型最大输出, ContextWindow - 输入 - SafetyMargin)` 计算，`SafetyMargin` 默认 4096，不叠加到提前压缩阈值或 `MaxInputTokens` 上。没有至少一个 token 的可用输出空间时拒绝发送。`MaxInputTokens` 和字节上限仍独立检查。
+
+输入优先使用当前投影中最近有效普通生成的实报 `InputTokens + OutputTokens`，再加后续新增消息的估算；`InputTokens` 已包含缓存输入，缓存分项不重复相加。成功 assistant 的 `Generation` 记录明确关联 Attempt、冻结请求和上下文指纹，重开/Fork 可恢复，无需扫描归档尝试。压缩、配置/模型变化或回放修复改变前缀时，回退到整份内容估算。摘要用量、失败回复、未报告或全零用量不能作为基线；旧记录缺少关联信息时也回退，直到下一次成功普通生成。
+
+`TokenEstimator` 必须接受完整请求、空请求和不带 System/Tools/Options 的消息尾段；后两者只用于估算，不发送给模型。可选的 `RequestValidator` 在最终输出长度确定后校验完整协议与参数，在输入和摘要提交之前失败。完整请求与尾段使用同一套内容估算，尾段减去空请求的固定开销。
+
 普通生成和摘要共用一套尝试策略：默认总共 3 次，包含首次；从 1 秒指数退避到 5 秒，较长的有效 Retry-After 优先；每次请求超时 4 分钟。明确永久错误和用户取消直接停止。网络重试复用冻结请求，不重新消费输入、扫描环境、摘要或执行工具。
 
 `ModelRequestRecoverer` 可以对明确拒绝的 Provider 回放状态修复一次请求副本，占用同一个总尝试预算，并重新检查协议及 Token/字节预算。没有自动模型 fallback。
+
+提供商明确报告 `ModelError.ContextOverflow` 时，Core 在完整边界上最多再压缩并生成一次；不走原样 HTTP 重试。此次恢复不接收新队列输入，不重跑已完成的工具；第二次溢出直接停止。关闭自动压缩时也关闭该恢复。
 
 每次调用在 Provider 前保存 `model_request`，在采用结果或重试前保存 `model_response`。失败片段、网络错误和重试信息只属于执行记录；只有完整且校验通过的 Stop / ToolCalls 回复进入对话。失败、取消和 Length 回复不会触发工具，也不会进入后续普通请求或摘要。
 

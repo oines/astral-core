@@ -27,6 +27,26 @@ type RequestPreparer interface {
 	PrepareRequest(context.Context, Request) (Request, error)
 }
 
+// RequestValidator checks a complete frozen request against the provider's
+// wire contract. It is separate from content estimation, which also measures
+// partial tails. Validation runs after the dynamic output limit is chosen and
+// before any selected inputs or compaction are committed.
+type RequestValidator interface {
+	ValidateRequest(context.Context, Request) error
+}
+
+func ValidateRequest(ctx context.Context, model Model, request Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("model request validation panicked: %v", p)
+		}
+	}()
+	if validator, ok := model.(RequestValidator); ok {
+		return validator.ValidateRequest(ctx, clone(request))
+	}
+	return nil
+}
+
 // PrepareRequest owns both sides of the optional preparation boundary.
 func PrepareRequest(ctx context.Context, model Model, request Request) (out Request, err error) {
 	defer func() {
@@ -105,6 +125,8 @@ type Reply struct {
 }
 
 type Usage struct {
+	// InputTokens includes cached reads and cache writes. Cache fields are
+	// breakdowns, never additional input to be summed into context usage.
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
 	// Available distinguishes a provider's reported zero usage from no report.

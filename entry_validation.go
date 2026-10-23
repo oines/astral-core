@@ -14,6 +14,11 @@ func validateEnvelope(e Entry) error {
 	if n != 1 {
 		return fmt.Errorf("%w: %s needs exactly one payload", ErrCorrupt, e.ID)
 	}
+	if g := e.Generation; g != nil {
+		if e.Kind != EntryMessage || e.Message == nil || e.Message.Role != RoleAssistant || e.Message.Failed() || g.AttemptID == "" || g.RequestID == "" || g.ConfigurationID == "" || len(g.ContextDigest) != 64 {
+			return fmt.Errorf("%w: invalid generation provenance in %s", ErrCorrupt, e.ID)
+		}
+	}
 	valid := false
 	switch e.Kind {
 	case EntryCreated:

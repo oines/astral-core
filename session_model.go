@@ -39,6 +39,10 @@ func (m estimatedModel) PrepareRequest(ctx context.Context, request Request) (Re
 	return PrepareRequest(ctx, m.Model, request)
 }
 
+func (m estimatedModel) ValidateRequest(ctx context.Context, request Request) error {
+	return ValidateRequest(ctx, m.Model, request)
+}
+
 func (m estimatedModel) RecoverRequest(ctx context.Context, request Request, cause error) (Request, bool, error) {
 	return RecoverModelRequest(ctx, m.Model, request, cause)
 }

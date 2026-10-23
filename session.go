@@ -128,15 +128,27 @@ func configureSession(config Config, id string) (*Session, error) {
 	if config.MaxSteeringPerTurn == 0 {
 		config.MaxSteeringPerTurn = 1
 	}
+	if config.Budget.SafetyMargin == 0 {
+		config.Budget.SafetyMargin = 4096
+	}
+	if config.Compaction.ReserveTokens == 0 {
+		config.Compaction.ReserveTokens = 16384
+	}
 	if config.Compaction.KeepRecentTokens == 0 {
 		config.Compaction.KeepRecentTokens = 20000
 	}
 	if config.Compaction.SystemPrompt == "" {
 		config.Compaction.SystemPrompt = defaultSummaryPrompt
 	}
-	if config.MaxContextBytes < 4096 || config.Retry.MaxAttempts < 1 || config.Retry.InitialBackoff < 0 || config.Retry.MaxBackoff < config.Retry.InitialBackoff || config.Retry.RequestTimeout < 0 || config.MaxParallelTools < 1 || config.MaxSteeringPerTurn < 1 || config.MaxSteeringPerTurn > 16 || config.MaxTurns < 0 || config.Budget.OutputTokens < 0 || config.Budget.SafetyMargin < 0 || config.Budget.AutoCompactAt < 0 || config.Compaction.OutputTokens < 0 || config.Compaction.KeepRecentTokens < 0 {
+	if config.MaxContextBytes < 4096 || config.Retry.MaxAttempts < 1 || config.Retry.InitialBackoff < 0 || config.Retry.MaxBackoff < config.Retry.InitialBackoff || config.Retry.RequestTimeout < 0 || config.MaxParallelTools < 1 || config.MaxSteeringPerTurn < 1 || config.MaxSteeringPerTurn > 16 || config.MaxTurns < 0 || config.Budget.OutputTokens < 0 || config.Budget.SafetyMargin < 0 || config.Compaction.ReserveTokens < 0 || config.Compaction.OutputTokens < 0 || config.Compaction.KeepRecentTokens < 0 {
 		return nil, fmtInvalid("invalid execution policy")
 	}
+	for _, budget := range config.Compaction.ModelBudgets {
+		if budget.ReserveTokens < 0 || budget.KeepRecentTokens < 0 {
+			return nil, fmtInvalid("invalid model compaction budget")
+		}
+	}
+	config.Compaction.ModelBudgets = clone(config.Compaction.ModelBudgets)
 	var err error
 	config.Options, err = copyJSON(config.Options)
 	if err != nil {

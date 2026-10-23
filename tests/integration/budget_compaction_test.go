@@ -29,7 +29,7 @@ func TestHugeSingleResultReportsDeliveryFailureWithoutCompacting(t *testing.T) {
 	m.spec.ContextWindow = 2500
 	m.spec.MaxOutputTokens = 100
 	c := testConfig(m, memory.New())
-	c.Compaction = astral.CompactionPolicy{SystemPrompt: "summarize", KeepRecentTokens: 1}
+	c.Compaction = astral.CompactionPolicy{SystemPrompt: "summarize", KeepRecentTokens: 1, ReserveTokens: 100}
 	c.Tools = []astral.Tool{tool("large", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 		effects.Add(1)
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(large), Artifact: "artifact://output"}}, nil
@@ -115,7 +115,7 @@ func TestAutomaticCompactionUsesCompleteBatchAndRechecksBudget(t *testing.T) {
 			summary.spec.ID = "summary"
 			c := testConfig(m, memory.New())
 			c.Tools = []astral.Tool{echoTool(nil)}
-			c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100}
+			c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100, ReserveTokens: 100}
 			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
 			s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 			waitOK(t, start(t, s, strings.Repeat("a", 400)))

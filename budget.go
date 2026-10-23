@@ -7,7 +7,7 @@ import (
 
 func outputReservation(requested int, spec ModelSpec) int {
 	if requested == 0 {
-		requested = 16384
+		requested = spec.MaxOutputTokens
 	}
 	if requested > spec.MaxOutputTokens {
 		requested = spec.MaxOutputTokens
@@ -37,13 +37,16 @@ func checkBudget(ctx context.Context, model Model, request Request, margin int) 
 	if err != nil {
 		return 0, err
 	}
-	spec := model.Spec()
-	if spec.MaxInputTokens > 0 && (margin > spec.MaxInputTokens || tokens > spec.MaxInputTokens-margin) {
-		return tokens, &BudgetError{Input: tokens, Margin: margin, Window: spec.MaxInputTokens}
+	return tokens, checkTokenBudget(tokens, model.Spec(), request.MaxOutputTokens, margin)
+}
+
+func checkTokenBudget(tokens int, spec ModelSpec, output, margin int) error {
+	if spec.MaxInputTokens > 0 && tokens > spec.MaxInputTokens {
+		return &BudgetError{Input: tokens, Window: spec.MaxInputTokens}
 	}
 	// Subtraction avoids integer overflow for hostile or broken estimators.
-	if request.MaxOutputTokens > spec.ContextWindow || margin > spec.ContextWindow-request.MaxOutputTokens || tokens > spec.ContextWindow-request.MaxOutputTokens-margin {
-		return tokens, &BudgetError{Input: tokens, Output: request.MaxOutputTokens, Margin: margin, Window: spec.ContextWindow}
+	if output > spec.ContextWindow || margin > spec.ContextWindow-output || tokens > spec.ContextWindow-output-margin {
+		return &BudgetError{Input: tokens, Output: output, Margin: margin, Window: spec.ContextWindow}
 	}
-	return tokens, nil
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 // Context is the effective request plus provenance in the active branch. Its
 // messages contain only the active window and its provenance.
 type Context struct {
+	anchor          *contextUsageAnchor
 	HeadID          string   `json:"head_id"`
 	ConfigurationID string   `json:"configuration_id"`
 	Request         Request  `json:"request"`
@@ -31,13 +32,7 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	view.Request.MaxOutputTokens = outputReservation(s.config.Budget.OutputTokens, model.Spec())
-	view.Request.ModelRevision = model.Spec().Revision
-	view.Request, err = PrepareRequest(ctx, model, view.Request)
-	if err != nil {
-		return Context{}, err
-	}
-	view.EstimatedInput, err = estimate(ctx, model, view.Request)
+	view, err = s.measureContext(ctx, model, view)
 	return view, err
 }
 
@@ -161,7 +156,31 @@ func project(path []Entry) (Context, error) {
 	if err = validateProtocol(view.Request.Messages); err != nil {
 		return Context{}, err
 	}
-	return clone(view), nil
+	view = clone(view)
+	// Only a successful assistant created after the current compaction/config
+	// may anchor this projection. Summarizer usage never appears here.
+	entries := make(map[string]Entry, len(visible))
+	afterCompaction := checkpoint == nil
+	for _, entry := range visible {
+		if entry.Kind == EntryCompaction {
+			if checkpoint != nil && entry.ID == checkpoint.ID {
+				afterCompaction = true
+			}
+			continue
+		}
+		if afterCompaction {
+			entries[entry.ID] = entry
+		}
+	}
+	for i := len(view.Sources) - 1; i >= 0; i-- {
+		entry := entries[view.Sources[i]]
+		if entry.Generation != nil && entry.Message != nil && entry.Message.Role == RoleAssistant && !entry.Message.Failed() &&
+			entry.Usage.Available && entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
+			view.anchor = &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
+			break
+		}
+	}
+	return view, nil
 }
 
 // Results may commit out of order within a batch, but a later message must

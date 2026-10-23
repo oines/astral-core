@@ -175,7 +175,7 @@ func TestModelInputLimitIsCheckedIndependentlyOfContextWindow(t *testing.T) {
 		})
 		m.spec.ContextWindow = 10000
 		m.spec.MaxInputTokens = 1000
-		m.estimator = func(astral.Request) (int, error) { return 900, nil }
+		m.estimator = func(astral.Request) (int, error) { return 1001, nil }
 		config := testConfig(m, store)
 		config.Budget.SafetyMargin = 200
 		s := newSession(t, newSessions(t, config), astral.SessionOptions{})

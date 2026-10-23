@@ -7,6 +7,7 @@ astral-core/
 ├── session.go, session_config.go      # 直接创建/打开 Session 与生命周期
 ├── run.go, execution_state.go         # 唯一执行循环和当前工具批次
 ├── input.go                          # 稳定输入 ID、索引回执与持久队列
+├── budget.go, context_estimate.go     # Pi 预算策略、实报基线与增量估算
 ├── prepare.go                        # 预览、准备、预算与原子边界提交
 ├── compaction.go, summary.go          # 已提交历史摘要草稿
 ├── generation.go, model_recovery.go   # 生成/摘要共用尝试、超时、退避与修复
@@ -53,6 +54,7 @@ CGO_ENABLED=0 go test ./store/sqlite ./tests/integration
 | `state_store_test.go` / `store_test.go` | Memory/SQLite 回执、分页、CAS、非法批次、格式标记与 checkpoint 一致性 |
 | `rollout*_test.go` / `fork_concurrent_test.go` | 共享顺序、包含式边界、Fork 幂等、独立生命周期、Detached 无源恢复 |
 | `store/sqlite/*_test.go` | 分页复制竞争、真实进程崩溃、发布与清理、查询计划 |
+| `context_estimate_test.go` / `context_overflow_test.go` | 实报与增量、缓存不重计、重开/Fork、基线失效、Pi 默认值、环境增长、溢出一次恢复与工具不重跑 |
 | `budget_compaction_test.go` | 完整批次、多模态摘要、独立摘要预算、裁剪副本与有界自动压缩 |
 | `scale_test.go` / `cold_start_test.go` | 固定有效窗口、百万级历史夹具、新进程打开、索引读取上限 |
 | 标准工具包 | Pi 参考样例、真实文件/图片、命令、PTY、原目标绑定和清理 |

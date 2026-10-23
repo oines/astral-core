@@ -11,6 +11,7 @@ type Entry struct {
 	SessionID     string               `json:"session_id"`
 	Sequence      uint64               `json:"sequence"`
 	Version       uint64               `json:"version"`
+	Generation    *GenerationRecord    `json:"generation,omitempty"`
 	Usage         Usage                `json:"usage,omitempty"`
 	ID            string               `json:"id"`
 	ParentID      string               `json:"parent_id,omitempty"`
@@ -109,6 +110,7 @@ type CompactionRecord struct {
 	ModelRevision string            `json:"model_revision,omitempty"`
 	Options       GenerationOptions `json:"options,omitempty"`
 	InputTokens   int               `json:"input_tokens"`
+	Generation    *GenerationRecord `json:"generation,omitempty"`
 	Usage         Usage             `json:"usage,omitempty"`
 	Instructions  string            `json:"instructions,omitempty"`
 }
@@ -119,4 +121,14 @@ type RunRecord struct {
 	Error     string `json:"error,omitempty"`
 	EndReason string `json:"end_reason,omitempty"`
 	QueueOnly bool   `json:"queue_only,omitempty"`
+}
+
+// GenerationRecord links a committed assistant to the exact successful attempt.
+// ContextDigest fingerprints its frozen request plus reply, excluding only the
+// output limit. It is a validity check, not a second usage ledger.
+type GenerationRecord struct {
+	AttemptID       string `json:"attempt_id"`
+	RequestID       string `json:"request_id"`
+	ConfigurationID string `json:"configuration_id"`
+	ContextDigest   string `json:"context_digest"`
 }

@@ -60,8 +60,11 @@ func TestEncryptedReplayRecoveryRecordedOnceWithoutReexecutingTools(t *testing.T
 				if !strings.Contains(string(raw), "saved") || len(req.Messages[len(req.Messages)-2].ToolCalls()) != 1 {
 					t.Error("tool history was not retained")
 				}
-				return answer("recovered"), nil
+				reply := answer("recovered")
+				reply.Usage = astral.Usage{Available: true, InputTokens: 1000, OutputTokens: 100}
+				return reply, nil
 			})}
+			m.estimator = contentEstimate
 			c := testConfig(m, memory.New())
 			c.Tools = []astral.Tool{echoTool(&effects)}
 			c.Retry.MaxAttempts = 2
@@ -97,6 +100,13 @@ func TestEncryptedReplayRecoveryRecordedOnceWithoutReexecutingTools(t *testing.T
 			third, _ := json.Marshal(requests[2])
 			if !strings.Contains(string(second), "opaque") || strings.Contains(string(third), "opaque") {
 				t.Fatal("request records do not describe actual attempts")
+			}
+			if !repeatFailure {
+				view, err := s.InspectContext(context.Background())
+				want, _ := contentEstimate(view.Request)
+				if err != nil || view.EstimatedInput != want || view.EstimatedInput == 1100 {
+					t.Fatalf("repaired request usage incorrectly covered unrepaired history: %d want=%d err=%v", view.EstimatedInput, want, err)
+				}
 			}
 		})
 	}

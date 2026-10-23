@@ -244,8 +244,8 @@ func TestModelSelectionDuringCompactionAppliesToNextGeneration(t *testing.T) {
 	})
 	next.spec.ID = "next"
 	c := testConfig(normal, memory.New())
-	c.Budget = astral.BudgetPolicy{AutoCompactAt: 650}
-	c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
+	c.Budget = astral.BudgetPolicy{SafetyMargin: 1}
+	c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, ReserveTokens: 750}
 	c.ResolveModel = func(_ context.Context, id string) (astral.Model, error) {
 		if id == "summary" {
 			return summary, nil

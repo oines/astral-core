@@ -49,13 +49,19 @@ type Configuration struct {
 }
 
 type BudgetPolicy struct {
+	// OutputTokens caps desired output; zero uses the model maximum.
 	OutputTokens int
+	// SafetyMargin defaults to 4096 and leaves room when computing output.
+	// It is not added to the compaction threshold or the input-only limit.
 	SafetyMargin int
-	// AutoCompactAt reserves this many tokens beyond output and safety margin.
-	AutoCompactAt int
 }
 
 type CompactionPolicy struct {
+	// ReserveTokens triggers compaction when input exceeds window minus reserve.
+	// Defaults follow Pi: 16384 reserved, 20000 recent, 80% reserve for summary.
+	ReserveTokens int
+	// ModelBudgets optionally override reserve/retention by normal model ID.
+	ModelBudgets     map[string]CompactionBudget
 	Disabled         bool
 	ModelID          string
 	SystemPrompt     string
@@ -64,6 +70,24 @@ type CompactionPolicy struct {
 	// Options is independent of normal generation (for example, a required
 	// tool choice or structured reply format must not constrain the summary).
 	Options GenerationOptions
+}
+
+type CompactionBudget struct {
+	ReserveTokens    int
+	KeepRecentTokens int
+}
+
+func (s *Session) compactionBudget(model Model) CompactionBudget {
+	b := CompactionBudget{s.config.Compaction.ReserveTokens, s.config.Compaction.KeepRecentTokens}
+	if override, ok := s.config.Compaction.ModelBudgets[model.Spec().ID]; ok {
+		if override.ReserveTokens > 0 {
+			b.ReserveTokens = override.ReserveTokens
+		}
+		if override.KeepRecentTokens > 0 {
+			b.KeepRecentTokens = override.KeepRecentTokens
+		}
+	}
+	return b
 }
 
 func (a *Session) validateConfiguration(ctx context.Context, c Configuration) error {
@@ -170,5 +194,7 @@ func effectiveConfiguration(path []Entry) (Configuration, string, error) {
 	return Configuration{}, "", fmt.Errorf("%w: no effective configuration", ErrCorrupt)
 }
 
-// TokenEstimator counts the exact target model request, including wire overhead.
+// TokenEstimator estimates model-visible request content. It must also accept
+// an empty request or a partial message tail, with no system prompt or tools.
+// Those requests are for measurement only and are never sent to a provider.
 type TokenEstimator func(context.Context, Model, Request) (int, error)

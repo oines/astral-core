@@ -245,7 +245,7 @@ func (s *Session) drive(ctx context.Context, run *Run) {
 		step, _, runErr = s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, natural: natural, reason: "boundary"})
 		if runErr == nil {
 			var assistant Frame
-			assistant, runErr = s.generate(ctx, run, turnID, step)
+			assistant, runErr = s.generateWithRecovery(ctx, run, turnID, step)
 			if runErr == nil {
 				natural = true
 				endReason = ""

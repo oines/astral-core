@@ -10,6 +10,7 @@ import (
 type prepareOptions struct {
 	runID, turnID, reason, instructions        string
 	passiveOnly, natural, compact, skipCollect bool
+	noInputs, overflow                         bool
 }
 type preparedStep struct {
 	model  Model
@@ -40,7 +41,11 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	path := clone(s.pathLocked())
 	head := s.state.Branch.HeadID
-	selected, err := s.selectedInputsLocked(ctx, options.passiveOnly, options.natural)
+	var selected []Record
+	var err error
+	if !options.noInputs {
+		selected, err = s.selectedInputsLocked(ctx, options.passiveOnly, options.natural)
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return preparedStep{}, summary, err
@@ -60,92 +65,115 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	for _, record := range selected {
 		driving = driving || record.Entry.Input.Kind != InputContext
 	}
-	candidate := clone(old)
-	for _, record := range selected {
-		candidate.Request.Messages = append(candidate.Request.Messages, record.Entry.Input.Messages()...)
-	}
-	candidate, budgetErr := s.fitContext(ctx, model, candidate)
-	near := budgetErr == nil && s.config.Budget.AutoCompactAt > 0 && candidate.EstimatedInput > model.Spec().ContextWindow-candidate.Request.MaxOutputTokens-s.config.Budget.SafetyMargin-s.config.Budget.AutoCompactAt
-	needsCompact := options.compact || !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
-	compactionID := ""
-	var drafts []Entry
-	if needsCompact {
-		keepTokens := s.config.Compaction.KeepRecentTokens
-		if !options.compact {
-			// A large incoming group must reduce the retention target before the
-			// one allowed summary call. Leave half the remaining space for the
-			// summary and fresh environment; the final exact check remains decisive.
-			incoming := clone(old)
-			incoming.Request.Messages = nil
-			for _, record := range selected {
-				incoming.Request.Messages = append(incoming.Request.Messages, record.Entry.Input.Messages()...)
+	// Collect fresh environment before the first decision, then rebuild it
+	// after a summary. No draft becomes history until the final check passes.
+	build := func(base Context, compactionID string) (Context, []Entry, error) {
+		view := cloneContext(base)
+		var entries []Entry
+		add := func(entry Entry) {
+			if entry.ID == "" {
+				entry.ID = newID()
 			}
+			entries = append(entries, entry)
+			if entry.Message != nil {
+				view.Request.Messages = append(view.Request.Messages, *entry.Message)
+				view.Sources = append(view.Sources, entry.ID)
+			}
+		}
+		for _, record := range selected {
+			item := record.Entry.Input
+			if item.Kind == InputContext {
+				for _, entry := range contextEntries(item.Contexts, options.runID, item.ID) {
+					add(entry)
+				}
+				add(Entry{Kind: EntryInputConsumed, RunID: options.runID, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
+			}
+		}
+		// Idle passive injection avoids an ordinary scan, but a compaction
+		// always needs a fresh snapshot for its newly constructed context.
+		if (!options.skipCollect || compactionID != "") && s.config.CollectContext != nil {
+			reason := options.reason
+			if compactionID != "" {
+				reason = "after_compact"
+			}
+			batch, err := collectContext(ctx, s.config.CollectContext, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: cloneContext(view)})
+			if err != nil {
+				return Context{}, nil, err
+			}
+			for _, message := range batch {
+				if err := message.ValidateContext(); err != nil {
+					return Context{}, nil, err
+				}
+			}
+			for _, entry := range contextEntries(batch, options.runID, "") {
+				add(entry)
+			}
+		}
+		for _, record := range selected {
+			item := record.Entry.Input
+			if item.Kind == InputContext {
+				continue
+			}
+			for _, entry := range contextEntries(item.Contexts, options.runID, item.ID) {
+				add(entry)
+			}
+			add(Entry{Kind: EntryMessage, RunID: options.runID, InputID: item.ID, Message: item.Message})
+			add(Entry{Kind: EntryInputConsumed, RunID: options.runID, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
+		}
+		return view, entries, nil
+	}
+	candidate, drafts, err := build(old, "")
+	if err != nil {
+		return preparedStep{}, summary, err
+	}
+	incomingMessages := clone(candidate.Request.Messages[len(old.Request.Messages):])
+	candidate, budgetErr := s.fitContext(ctx, model, candidate)
+	if budgetErr != nil && !errors.Is(budgetErr, ErrBudget) && !options.compact {
+		return preparedStep{}, summary, budgetErr
+	}
+	budget := s.compactionBudget(model)
+	near := candidate.EstimatedInput > model.Spec().ContextWindow-budget.ReserveTokens
+	needsCompact := options.compact || !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
+	if needsCompact {
+		keepTokens := budget.KeepRecentTokens
+		if !options.compact {
+			incoming := cloneContext(old)
+			incoming.anchor = nil
+			incoming.Request.Messages = incomingMessages
 			incoming, incomingErr := s.fitContext(ctx, model, incoming)
 			if incomingErr != nil {
 				return preparedStep{}, summary, incomingErr
 			}
-			limit := model.Spec().ContextWindow - incoming.Request.MaxOutputTokens - s.config.Budget.SafetyMargin
+			limit := model.Spec().ContextWindow - s.config.Budget.SafetyMargin - 1
 			if maxInput := model.Spec().MaxInputTokens; maxInput > 0 {
-				limit = min(limit, maxInput-s.config.Budget.SafetyMargin)
+				limit = min(limit, maxInput)
 			}
 			keepTokens = min(keepTokens, max(1, (limit-incoming.EstimatedInput)/2))
 		}
-		summary, err = s.draftCompaction(ctx, options.instructions, model, path, keepTokens, options.runID, options.turnID)
+		summary, err = s.draftCompaction(ctx, options.instructions, model, path, keepTokens, options.overflow, options.runID, options.turnID)
 		if err != nil {
-			if !near || options.compact || !errors.Is(err, ErrCompactionNoProgress) {
+			if options.compact || budgetErr != nil || !errors.Is(err, ErrCompactionNoProgress) {
 				return preparedStep{}, summary, err
 			}
 		} else {
-			compactionID = newID()
-			drafts = append(drafts, Entry{ID: compactionID, Kind: EntryCompaction, RunID: options.runID, TurnID: options.turnID, Compaction: &summary})
-			// A draft is projected on a copy; the effective history is unchanged until
-			// the final request, environment and selected queue groups all fit.
-			old, err = project(append(append([]Entry(nil), path...), drafts...))
+			compactionID := newID()
+			compaction := Entry{ID: compactionID, Kind: EntryCompaction, RunID: options.runID, TurnID: options.turnID, Compaction: &summary}
+			base, projectErr := project(append(append([]Entry(nil), path...), compaction))
+			if projectErr != nil {
+				return preparedStep{}, summary, projectErr
+			}
+			candidate, drafts, err = build(base, compactionID)
+			if err != nil {
+				return preparedStep{}, summary, err
+			}
+			drafts = append([]Entry{compaction}, drafts...)
+			candidate, err = s.fitContext(ctx, model, candidate)
 			if err != nil {
 				return preparedStep{}, summary, err
 			}
 		}
 	} else if budgetErr != nil {
 		return preparedStep{}, summary, budgetErr
-	}
-	// Passive input always precedes the latest collected environment.
-	for _, record := range selected {
-		item := record.Entry.Input
-		if item.Kind == InputContext {
-			drafts = append(drafts, contextEntries(item.Contexts, options.runID, item.ID)...)
-			drafts = append(drafts, Entry{Kind: EntryInputConsumed, RunID: options.runID, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
-			old.Request.Messages = append(old.Request.Messages, item.Contexts...)
-		}
-	}
-	if !options.skipCollect && s.config.CollectContext != nil {
-		reason := options.reason
-		if compactionID != "" {
-			reason = "after_compact"
-		}
-		batch, err := collectContext(ctx, s.config.CollectContext, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: clone(old)})
-		if err != nil {
-			return preparedStep{}, summary, err
-		}
-		for _, message := range batch {
-			if err = message.ValidateContext(); err != nil {
-				return preparedStep{}, summary, err
-			}
-		}
-		drafts = append(drafts, contextEntries(batch, options.runID, "")...)
-		old.Request.Messages = append(old.Request.Messages, batch...)
-	}
-	for _, record := range selected {
-		item := record.Entry.Input
-		if item.Kind == InputContext {
-			continue
-		}
-		drafts = append(drafts, contextEntries(item.Contexts, options.runID, item.ID)...)
-		drafts = append(drafts, Entry{Kind: EntryMessage, RunID: options.runID, InputID: item.ID, Message: item.Message}, Entry{Kind: EntryInputConsumed, RunID: options.runID, Input: &InputRecord{ID: item.ID, Kind: item.Kind}})
-		old.Request.Messages = append(old.Request.Messages, item.Messages()...)
-	}
-	candidate, err = s.fitContext(ctx, model, old)
-	if err != nil {
-		return preparedStep{}, summary, err
 	}
 	if err = ctx.Err(); err != nil {
 		return preparedStep{}, summary, err
@@ -180,7 +208,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	return preparedStep{model: model, view: candidate, driven: driving}, summary, nil
 }
-func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Context, error) {
+func (s *Session) measureContext(ctx context.Context, model Model, view Context) (Context, error) {
 	view.Request.ModelID, view.Request.ModelRevision = model.Spec().ID, model.Spec().Revision
 	view.Request.MaxOutputTokens = outputReservation(s.config.Budget.OutputTokens, model.Spec())
 	request, err := PrepareRequest(ctx, model, view.Request)
@@ -191,8 +219,35 @@ func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Co
 	if err = validateProtocol(request.Messages); err != nil {
 		return view, err
 	}
-	view.EstimatedInput, err = s.checkRequestBudget(ctx, model, request)
-	return view, err
+	view.EstimatedInput, err = s.estimateContext(ctx, model, view)
+	if err != nil {
+		return view, err
+	}
+	available := 0
+	room := model.Spec().ContextWindow - s.config.Budget.SafetyMargin
+	if view.EstimatedInput < room {
+		available = room - view.EstimatedInput
+	}
+	view.Request.MaxOutputTokens = min(view.Request.MaxOutputTokens, available)
+	return view, nil
+}
+
+func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Context, error) {
+	view, err := s.measureContext(ctx, model, view)
+	if err != nil {
+		return view, err
+	}
+	spec, margin := model.Spec(), s.config.Budget.SafetyMargin
+	if view.Request.MaxOutputTokens < 1 {
+		return view, &BudgetError{Input: view.EstimatedInput, Output: 1, Margin: margin, Window: spec.ContextWindow}
+	}
+	if err := checkTokenBudget(view.EstimatedInput, spec, view.Request.MaxOutputTokens, margin); err != nil {
+		return view, err
+	}
+	if err := ValidateRequest(ctx, model, view.Request); err != nil {
+		return view, err
+	}
+	return view, s.checkRequestBytes(view.Request)
 }
 
 func (s *Session) checkRequestBudget(ctx context.Context, model Model, request Request) (int, error) {
@@ -200,11 +255,18 @@ func (s *Session) checkRequestBudget(ctx context.Context, model Model, request R
 	if err != nil {
 		return tokens, err
 	}
+	if err := ValidateRequest(ctx, model, request); err != nil {
+		return tokens, err
+	}
+	return tokens, s.checkRequestBytes(request)
+}
+
+func (s *Session) checkRequestBytes(request Request) error {
 	raw, err := json.Marshal(request)
 	if err == nil && len(raw) > s.config.MaxContextBytes {
 		err = &BudgetError{Input: len(raw), Window: s.config.MaxContextBytes}
 	}
-	return tokens, err
+	return err
 }
 
 func collectContext(ctx context.Context, collect CollectContext, boundary ContextBoundary) (messages []Message, err error) {

@@ -49,7 +49,7 @@ func TestPreparedBoundaryCommitsSummaryEnvironmentAndInputTogether(t *testing.T)
 					})
 					summary.spec.ID = "summary"
 					c := testConfig(normal, captured)
-					c.Compaction = core.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100}
+					c.Compaction = core.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100, ReserveTokens: 100}
 					if outcome == "default_retention" {
 						c.Compaction.KeepRecentTokens = 0
 					}

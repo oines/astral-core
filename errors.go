@@ -21,11 +21,13 @@ var (
 // ModelError lets adapters classify failures without parsing provider messages.
 // Authentication, invalid requests and cancellation should not be transient.
 type ModelError struct {
-	Code       string
-	Message    string
-	Transient  bool
-	RetryAfter time.Duration
-	Cause      error
+	Code    string
+	Message string
+	// ContextOverflow permits one compaction recovery at a complete boundary.
+	ContextOverflow bool
+	Transient       bool
+	RetryAfter      time.Duration
+	Cause           error
 }
 
 func (e *ModelError) Error() string {

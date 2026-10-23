@@ -29,9 +29,9 @@ Input.Contexts 与 Message 整体接收、整体应用。Steer 优先，默认�
 每个普通轮次使用 prepareStep：
 
 1. 在短锁内复制分支与配置、读取选中输入，不消费。
-2. 在锁外解析模型、适配请求并检查旧上下文与新输入的空间。
+2. 在锁外解析模型并调用 CollectContext，把最新环境、旧上下文和选中输入组成完整候选，再估算输入和判断压缩。
 3. 必要时只对已提交旧历史生成摘要草稿，每次准备最多一次。待投递输入不进入该摘要。自动压缩根据剩余空间收缩近期保留目标。
-4. 摘要完成后调用只读 CollectContext，取得最新环境。
+4. 摘要完成后再次调用只读 CollectContext，取得压缩后的完整最新环境。被动维护可以跳过普通扫描，但发生压缩后必须重新采集。
 5. 按“摘要与保留历史 → 被动 Context → 最新环境 → 驱动组”形成候选，检查完整协议、Token 和字节预算。
 6. 重新加锁验证分支 Head 和输入仍处于 pending，原子提交摘要、Context、输入与消费事实，随后调用模型。
 
@@ -41,11 +41,13 @@ CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返�
 
 手动 Compact 复用准备流程，可应用选中的被动 Context，但不消费驱动输入、不生成普通回答。摘要请求独立校验预算，按完整消息/工具批次选择旧历史，保留原生多模态与来源信息。仅摘要请求超预算时可缩短工具文本的副本；原始历史不变。只有有效非空文本摘要可提交。
 
-MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。Token 估算包含 System、Tools、Images、Messages，另加输出预留与 SafetyMargin，并同时遵守 ModelSpec 的 ContextWindow / MaxInputTokens。估算器必须非负。单个工具结果不可交付时保存有界的交付失败结果与真实 Outcome；聚合压力在准备阶段处理，不改写成功工具的执行事实。
+MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。缺失、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
+
+默认压缩条件为 Input > ContextWindow - 16384，近期保留目标 20000，摘要输出 min(floor(0.8 × ReserveTokens), 摘要模型最大输出)。按 ModelBudgets 可覆盖普通模型的 ReserveTokens / KeepRecentTokens。普通输出 min(期望输出或模型最大输出, ContextWindow - Input - 4096)，可用输出不足 1 时拒绝发送。SafetyMargin 只预留输出空间，不叠加到压缩阈值或独立的 MaxInputTokens 上；摘要仍独立检查完整请求与输出预算。单个工具结果不可交付时保存有界的交付失败结果与真实 Outcome；聚合压力在准备阶段处理，不改写成功工具的执行事实。
 
 ## 模型协议、重试与审计
 
-Model 提供 Spec / Stream；ResolveModel 必须返回匹配 ID。RequestPreparer 在预算检查前完成无副作用的请求适配，可能被多次调用；不得在 Stream 内追加实时环境或重新读取可变附件。冻结图片与稳定引用由 Host 负责。
+Model 提供 Spec / Stream；ResolveModel 必须返回匹配 ID。RequestPreparer 在预算检查前完成无副作用的请求适配，可能被多次调用；不得在 Stream 内追加实时环境或重新读取可变附件。冻结图片与稳定引用由 Host 负责。RequestValidator 单独校验完整请求，在动态输出长度确定后、候选提交前运行；部分尾段的估算不要求完整工具协议。
 
 普通生成与摘要调用同一个模型入口，默认参数如下：
 
@@ -60,7 +62,9 @@ Model 提供 Spec / Stream；ResolveModel 必须返回匹配 ID。RequestPrepare
 
 ModelRequestRecoverer 仅处理 Provider 明确拒绝的回放数据。最多一次有效修复，占用剩余尝试预算，只改请求副本；模型身份、Options、SystemPrompt、Tools、输出预留不能改变，协议和 Token/字节预算重新校验。Models 自身只做单次请求与错误分类。Host 和 UI 不叠加模型重试。
 
-每次外部调用前确认 model_request；采用结果、执行工具或重试前确认 model_response。失败记录也保存完整 Reply 和错误。审计保存失败阻止依赖动作，不把 Store 错误当作模型暂时错误。审计条目不改变对话 Head，也不投影进普通请求或摘要。仅完整、校验通过的 Stop / ToolCalls 回复进入 EntryMessage。失败、取消、Length 片段既不合并到成功回复，也不触发工具。
+提供商明确标记 ModelError.ContextOverflow 时，跳出原样网络重试，在完整边界最多压缩并重新生成一次。恢复期间不消费新队列输入，不重跑工具；保留完整工具批次，即使估算器低估也必须切出可压缩的旧组。再次溢出或压缩失败停止；Disabled 禁止自动溢出恢复。
+
+每次外部调用前确认 model_request；采用结果、执行工具或重试前确认 model_response。失败记录也保存完整 Reply 和错误。审计保存失败阻止依赖动作，不把 Store 错误当作模型暂时错误。审计条目不改变对话 Head，也不投影进普通请求或摘要。仅完整、校验通过的 Stop / ToolCalls 回复进入 EntryMessage；Generation 关联成功 AttemptID、RequestID、ConfigurationID 和覆盖上下文指纹。指纹不含动态输出上限，不复制另一份用量。失败、取消、Length 片段既不合并到成功回复，也不触发工具。
 
 Message.Content 是唯一有序内容来源，按原始顺序包含 Reasoning、Text、ToolCall、多模态及扩展块。message.ToolCalls() 仅派生调用列表。工具 ID 在同一消息内唯一，参数是完整 JSON。未知 Content 类型保留，由适配器明确支持或拒绝；签名、加密数据、Metadata 和大整数保持原样。
 

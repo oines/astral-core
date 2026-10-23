@@ -88,12 +88,14 @@ func echoTool(counter *atomic.Int32) astral.Tool {
 	})
 }
 
+// Test models use deliberately tiny token windows; production defaults are
+// exercised separately by the context policy tests.
 func testConfig(m astral.Model, store astral.Store) astral.Config {
 	return astral.Config{EstimateTokens: func(ctx context.Context, m astral.Model, r astral.Request) (int, error) {
 		return m.(interface {
 			EstimateTokens(context.Context, astral.Request) (int, error)
 		}).EstimateTokens(ctx, r)
-	}, Model: m, Store: store, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: astral.CompactionPolicy{Disabled: true}}
+	}, Model: m, Store: store, Budget: astral.BudgetPolicy{SafetyMargin: 1}, Retry: astral.RetryPolicy{MaxAttempts: 1}, Compaction: astral.CompactionPolicy{Disabled: true}}
 }
 
 // sessionFactory is test-host ownership, not an SDK execution layer.
