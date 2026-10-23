@@ -23,11 +23,13 @@ const windowsHelperEnv = "ASTRAL_LOCAL_PROCESS_TEST_HELPER"
 
 // A copied test executable acts as the shell so tests exercise console signals
 // and Job ownership without a PowerShell parent intercepting the same Ctrl-C.
-// This init exists only in test binaries and runs before testing parses argv.
-func init() {
+// TestMain runs after Go runtime initialization, before M.Run parses argv. An
+// init function must not wait for a Windows control handler: callbacks into Go
+// from the console thread wait for main_init_done and would deadlock there.
+func TestMain(m *testing.M) {
 	mode := os.Getenv(windowsHelperEnv)
 	if mode == "" {
-		return
+		os.Exit(m.Run())
 	}
 	switch mode {
 	case "pipes":
