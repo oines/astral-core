@@ -6,7 +6,7 @@ An embeddable Go SDK for durable agent sessions.
 
 ## 快速开始
 
-需要 Go 1.23+。以下示例使用离线模型，运行时不需要模型账号：
+需要 Go 1.24+。以下示例使用离线模型，运行时不需要模型账号：
 
 ```sh
 go run ./examples/basic
