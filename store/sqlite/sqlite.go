@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -78,7 +77,7 @@ func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, core.ErrInvalid
 	}
-	abs, err := filepath.Abs(path)
+	abs, err := databasePath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -109,9 +108,6 @@ func Open(path string) (*Store, error) {
 			return nil, core.ErrUnsupportedFormat
 		}
 	}
-	if err = os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
-		return nil, err
-	}
 	values := url.Values{}
 	values.Set("_txlock", "immediate")
 	for _, p := range []string{"journal_mode(WAL)", "synchronous(FULL)", "busy_timeout(5000)", "temp_store(FILE)", "cache_size(-2048)"} {
@@ -123,9 +119,6 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	if resolved, e := filepath.EvalSymlinks(abs); e == nil {
-		abs = resolved
-	}
 	st := &Store{db: db, path: abs}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -147,9 +140,6 @@ func Open(path string) (*Store, error) {
 	if err = db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, err
-	}
-	if resolved, e := filepath.EvalSymlinks(abs); e == nil {
-		st.path = resolved
 	}
 	return st, nil
 }
