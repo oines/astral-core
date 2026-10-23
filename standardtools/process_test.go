@@ -37,12 +37,12 @@ func TestCommandDefaultsWorkdirAndExitCode(t *testing.T) {
 		t.Fatalf("execution: %+v", r)
 	}
 	failed, err := h.invoke(context.Background(), "exec_command", map[string]any{"cmd": "printf failed; exit 7", "login": false})
-	if err != nil || !failed.IsError || failed.Outcome != astral.OutcomeSucceeded || *command(t, failed).ExitCode != 7 {
+	if err != nil || failed.IsError || failed.Outcome != astral.OutcomeSucceeded || *command(t, failed).ExitCode != 7 {
 		t.Fatalf("known nonzero exit: %v %+v", err, failed)
 	}
 	z := command(t, h.run(t, "exec_command", map[string]any{"cmd": "printf hidden", "max_output_tokens": 0, "login": false}))
-	if z.Output != "" || z.OriginalTokenCount == 0 {
-		t.Fatal("zero output budget or original count lost")
+	if z.Output != "Warning: truncated output (original token count: 2)\nTotal output lines: 1\n\n…2 tokens truncated…" || z.OriginalTokenCount != 2 {
+		t.Fatalf("zero output budget lost its truncation notice: %+v", z)
 	}
 }
 
