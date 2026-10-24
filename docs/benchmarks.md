@@ -1,6 +1,22 @@
 # Rollout / Session Fork：版本 3 验收与性能
 
-本文保留 2026-10-14 的 V3 历史测量，数值与原始输出未改写。当前持久化格式为 9，执行入口已合并为 Session，Manager 和 JSONL 运行存储已删除；以下接口描述及结果仅作为历史记录，不代表当前版本的重新测量。
+本文主体保留 2026-10-14 的 V3 历史测量，数值与原始输出未改写。当前持久化格式为 10，执行入口已合并为 Session，Manager 和 JSONL 运行存储已删除。以下补充区为当前格式测量，其后的 V3 接口描述与结果仍仅作为历史记录。
+
+## 2026-10-24：格式 10 有界读取验证
+
+Apple M2、darwin/arm64。沿用公开 Commit 构造历史、固定保留 16 条近期消息与摘要的夹具，各操作测量 3 次；这是读取规模的回归验证，不是完整吞吐或尾延迟基准。重开与 RequestInput 重建均只返回 **20 行**，与归档历史规模无关。
+
+| 归档消息数 | OpenSession 毫秒/次 | RebuildRequest 毫秒/次 | 重建累计分配 B/次 | 重建采样堆峰值 MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 0.364 | 0.422 | 190,685 | 3.104 |
+| 100,000 | 0.395 | 0.426 | 190,640 | 3.112 |
+| 1,000,000 | 0.340 | 0.406 | 189,392 | 3.188 |
+
+新 Store 句柄的 OpenSession 为 0.838 / 0.873 / 0.842 毫秒，也各读取 20 行；未清空系统文件缓存。重建按固定 Head 沿祖先链读取有效窗口，不回放全部 Rollout 或扫描历史 Attempt。B/次是累计分配，堆峰值按 1 ms 采样，不能解释为大型实际上下文的内存上限。
+
+复现：`go test ./tests/integration -run '^$' -bench 'BenchmarkSQLiteLongHistory/(10000|100000|1000000)/(OpenSession|RebuildRequest)$' -benchtime=3x -count=1 -timeout=15m`。
+
+## V3 历史验收
 
 日期：2026-10-14。契约见 [contracts.md](contracts.md)，离线用法见 [Fork 示例](../examples/fork/main.go)。本轮变更限于 Session、Store、测试、示例和文档；Core 源码没有修改。
 

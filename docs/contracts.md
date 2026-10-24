@@ -66,7 +66,11 @@ ModelRequestRecoverer 仅处理 Provider 明确拒绝的回放数据。最多一
 
 提供商明确标记 ModelError.ContextOverflow 时，跳出原样网络重试，在完整边界最多压缩并重新生成一次。恢复期间不消费新队列输入，不重跑工具；保留完整工具批次，即使估算器低估也必须切出可压缩的旧组。再次溢出或压缩失败停止；Disabled 禁止自动溢出恢复。
 
-每次外部调用前确认 model_request；采用结果、执行工具或重试前确认 model_response。失败记录也保存完整 Reply 和错误。审计保存失败阻止依赖动作，不把 Store 错误当作模型暂时错误。审计条目不改变对话 Head，也不投影进普通请求或摘要。仅完整、校验通过的 Stop / ToolCalls 回复进入 EntryMessage；Generation 关联成功 AttemptID、RequestID、ConfigurationID 和覆盖上下文指纹。指纹不含动态输出上限，不复制另一份用量。失败、取消、Length 片段既不合并到成功回复，也不触发工具。
+ModelAttempt 独立于历史树，归属于 Session。RequestInput 固定 RolloutID、HeadID、ConfigurationID、ModelSpec、消息下标选择和 JSON 结构差异，并保存重建结果的语义摘要。它引用历史正文，不保存每轮完整 Request。ReadContext/RebuildRequest 只加载所选祖先链上的有效窗口，不执行准备回调、环境采集、估算或模型 I/O；重建必须验证配置引用和内容摘要。
+
+首个普通 Attempt 与选中的输入、环境、摘要采用、消费队列记录原子提交。成功回复与 Attempt 完成原子提交：正文仅保存于 EntryMessage，Outcome.EntryID 指向该节点，Outcome.Reply 为空。失败或尚未采用的摘要输出保留在 Outcome.Reply；摘要采用与 Compaction 节点原子提交并清除临时正文。审计保存失败阻止依赖动作，不把 Store 错误当作模型暂时错误。仅完整、校验通过的 Stop / ToolCalls 回复进入对话；Generation 自带 AttemptID、ConfigurationID、冻结 ModelSpec 和覆盖上下文指纹，不依赖父 Session 的审计记录。指纹不含动态输出上限。失败、取消、Length 片段既不合并到成功回复，也不触发工具。
+
+RuntimeState.CurrentAttemptID 固定尚未确认回复的普通生成。进程崩溃后显式 Continue 将无终态的旧尝试标为 interrupted，创建 RetryOf 关联的新 Attempt，并重建同一冻结输入；期间到达的输入仍留在队列。远端执行结果可能未知，不承诺外部请求恰好一次。明确取消或正常失败的 Run 会清除此指针，后续激活重新准备。已确认的助手/工具结果不重复执行。
 
 Message.Content 是唯一有序内容来源，按原始顺序包含 Reasoning、Text、ToolCall、多模态及扩展块。message.ToolCalls() 仅派生调用列表。工具 ID 在同一消息内唯一，参数是完整 JSON。未知 Content 类型保留，由适配器明确支持或拒绝；签名、加密数据、Metadata 和大整数保持原样。
 
@@ -91,17 +95,19 @@ MayEndRun 要求唯一 ToolCall，允许 Reasoning、不允许普通正文。返
 
 ## Store、历史与 Fork
 
-根包 Store 提供 LoadState、Get、Scan、Pending、Commit、LookupCommit、LookupInput 和 Fork。Get / Scan 按 RolloutID 读取；状态、队列、提交与输入回执按 SessionID 读取。所有返回值是隔离副本。
+根包 Store 提供 LoadState、Get、Scan、GetAttempt、ScanAttempts、Pending、Commit、LookupCommit、LookupInput 和 Fork。Get / Scan 按 RolloutID 读取；Attempt、状态、队列、提交与输入回执按 SessionID 读取。所有返回值是隔离副本。Attempt 分页游标按创建时的 Session Version 前进，不随结果完成改变；支持用途过滤和正反向扫描。
 
-格式 **9** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
+格式 **10** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
 
-Commit 包含稳定 ID、ExpectedVersion 与 Entry。Store 在一次原子操作中检查 CAS、分配 Rollout 连续 Sequence、执行同一个 Reduce、保存记录、Projection、RuntimeState、Pending、Input 索引及回执。Entry.Version 是写入 Session 的本地版本；Entry.Sequence 是 Rollout 顺序，两者独立。
+可选维护接口 SessionDeleter.DeleteSession 由 Memory 和 SQLite 实现。Host 必须先停止并关闭目标 Session、阻止新的执行，再调用原子、幂等的永久删除；它清除私有 Rollout 的历史、Attempt、输入、队列与提交回执。多个 Session 共享同一 Rollout 时返回 ErrConflict，保留全部数据。Detached Fork 拥有独立副本，不受来源删除影响。删除业务元数据、索引和恢复未完成维护由 Host 负责，不调用模型或工具。
+
+Commit 包含稳定 ID、ExpectedVersion、Entries 和 Attempts 变更。Store 在一次原子操作中检查 CAS、分配 Rollout Sequence、执行同一个 Reduce 与 ApplyAttemptMutation、保存记录、Projection、RuntimeState、Attempt、Pending、Input 索引及回执。只有 Attempt 变更的提交仍推进 Session Version，Receipt 的 FirstSequence/LastSequence 均为零，不占用 Rollout Sequence。Entry.Version 是写入 Session 的本地版本；Entry.Sequence 是 Rollout 顺序，两者独立。创建 Attempt 时必须验证固定 Head 的协议完整性、Configuration 引用与归属；成功结果只能关联同一提交中新写入的合法节点。
 
 确认前 Session 不推进缓存。错误后最多用独立 5 秒 Context 查询 LookupCommit，验证 ID、Digest、Version 和 CurrentVersion；其他所有者已推进版本时仍停止。相同 Commit ID 相同内容幂等，不同内容冲突。Reload 只供 Host 重新建立独占所有权后的空闲句柄使用。
 
 SQLite 使用纯 Go 驱动、WAL、synchronous=FULL、busy_timeout=5000 和 BEGIN IMMEDIATE。输入正文按索引读取，RuntimeState 只保留当前批次、审批、待办数量、分支引用和最近 Run。普通提交不扫描历史。Session 缓存有效窗口与必要引用，不持有完整历史树。Stats.RowsRead 是返回到适配器的行数，不等于数据库内部扫描量。
 
-Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可变祖先，Detached 分页复制所选路径并在完成后发布。稳定子 Session ID 与 ForkRequest 摘要用于重试确认；重试返回新句柄，Host 负责唯一活动实例。子会话继承历史配置与完整结果，不继承 Parent 队列、运行中授权或审批。关闭 Parent 不关闭 Child，Fork 不回滚文件或复制活动进程。清理规则见 Store 的引用与 Rollout 状态 API。
+Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可变祖先，Detached 分页复制所选路径并在完成后发布。稳定子 Session ID 与 ForkRequest 摘要用于重试确认；重试返回新句柄，Host 负责唯一活动实例。子会话继承历史配置与完整结果，不继承 Parent 的 Attempt、队列、运行中授权或审批。复制的 Generation 仅为来源与用量元数据，不要求父 Attempt 存在。关闭 Parent 不关闭 Child，Fork 不回滚文件或复制活动进程。清理规则见 Store 的引用与 Rollout 状态 API。
 
 ## 事件与断线恢复
 

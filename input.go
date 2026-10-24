@@ -168,7 +168,9 @@ func (s *Session) InjectContext(ctx context.Context, input Input) (InputReceipt,
 	// may summarize history, but never starts a driving model turn.
 	for {
 		s.mu.Lock()
-		pending := s.state.PendingInputs[InputContext] > 0
+		// A crashed generation already owns its input boundary. Keep newly
+		// received observations queued until that generation has a durable result.
+		pending := s.state.PendingInputs[InputContext] > 0 && s.state.CurrentAttemptID == ""
 		s.mu.Unlock()
 		if !pending {
 			break

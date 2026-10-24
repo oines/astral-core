@@ -9,7 +9,7 @@ import (
 	"math"
 )
 
-const FormatVersion = 9
+const FormatVersion = 10
 
 func SupportsFormat(version int) bool { return version == FormatVersion }
 
@@ -26,12 +26,23 @@ const DefaultContextBytes = 32 << 20
 type Store interface {
 	LoadState(context.Context, string) (RuntimeState, error)
 	LookupInput(context.Context, string, string) (InputReceipt, error)
+	GetAttempt(context.Context, string, string) (ModelAttempt, error)
+	ScanAttempts(context.Context, string, AttemptQuery) (AttemptPage, error)
 	Get(context.Context, string, string) (Record, error)
 	Scan(context.Context, string, Query) (Page, error)
 	Pending(context.Context, string, PendingQuery) (Page, error)
 	Commit(context.Context, string, Commit) (Receipt, error)
 	LookupCommit(context.Context, string, string) (Receipt, error)
 	Fork(context.Context, ForkRequest) (RuntimeState, error)
+}
+
+// SessionDeleter is an optional host maintenance capability. The host must
+// close the Session and prevent new execution before calling it. Deletion is
+// atomic and idempotent, and removes history, attempts, inputs and receipts.
+// A Rollout shared by multiple Sessions returns ErrConflict without changes;
+// detached Forks own their copies and are not affected.
+type SessionDeleter interface {
+	DeleteSession(context.Context, string) error
 }
 
 // Record pairs immutable history with the branch projection at that node.
@@ -72,9 +83,10 @@ type Page struct {
 // entry identities and contents, excluding Store-assigned Sequence. Duplicate IDs with changed
 // contents are conflicts, never another write.
 type Commit struct {
-	ID              string  `json:"id"`
-	ExpectedVersion uint64  `json:"expected_version"`
-	Entries         []Entry `json:"entries"`
+	ID              string            `json:"id"`
+	ExpectedVersion uint64            `json:"expected_version"`
+	Entries         []Entry           `json:"entries,omitempty"`
+	Attempts        []AttemptMutation `json:"attempts,omitempty"`
 }
 type Receipt struct {
 	FirstSequence  uint64 `json:"first_sequence"`
@@ -105,7 +117,8 @@ func (c Commit) Confirmed(r Receipt) (Commit, error) {
 	if err != nil {
 		return Commit{}, err
 	}
-	if r.CommitID != c.ID || r.Digest != digest || r.Version != c.ExpectedVersion+1 || len(c.Entries) == 0 || r.FirstSequence == 0 || r.LastSequence < r.FirstSequence || r.LastSequence-r.FirstSequence != uint64(len(c.Entries)-1) {
+	validRange := len(c.Entries) == 0 && r.FirstSequence == 0 && r.LastSequence == 0 || len(c.Entries) > 0 && r.FirstSequence > 0 && r.LastSequence >= r.FirstSequence && r.LastSequence-r.FirstSequence == uint64(len(c.Entries)-1)
+	if r.CommitID != c.ID || r.Digest != digest || r.Version != c.ExpectedVersion+1 || !validRange || len(c.Entries)+len(c.Attempts) == 0 {
 		return Commit{}, fmt.Errorf("%w: commit receipt mismatch", ErrCorrupt)
 	}
 	out, err := copyJSON(c)
@@ -120,7 +133,7 @@ func (c Commit) Confirmed(r Receipt) (Commit, error) {
 
 // AssignCommit is called by a Store under its rollout write transaction.
 func AssignCommit(c Commit, first uint64) (Commit, Receipt, error) {
-	if len(c.Entries) == 0 || first == 0 || first > math.MaxInt64 || uint64(len(c.Entries)-1) > math.MaxInt64-first {
+	if len(c.Entries)+len(c.Attempts) == 0 || first == 0 || first > math.MaxInt64 || len(c.Entries) > 0 && uint64(len(c.Entries)-1) > math.MaxInt64-first {
 		return Commit{}, Receipt{}, ErrCorrupt
 	}
 	for _, e := range c.Entries {
@@ -132,7 +145,10 @@ func AssignCommit(c Commit, first uint64) (Commit, Receipt, error) {
 	if err != nil {
 		return Commit{}, Receipt{}, err
 	}
-	r := Receipt{CommitID: c.ID, Digest: digest, Version: c.ExpectedVersion + 1, CurrentVersion: c.ExpectedVersion + 1, FirstSequence: first, LastSequence: first + uint64(len(c.Entries)) - 1}
+	r := Receipt{CommitID: c.ID, Digest: digest, Version: c.ExpectedVersion + 1, CurrentVersion: c.ExpectedVersion + 1}
+	if len(c.Entries) > 0 {
+		r.FirstSequence, r.LastSequence = first, first+uint64(len(c.Entries))-1
+	}
 	confirmed, err := c.Confirmed(r)
 	return confirmed, r, err
 }

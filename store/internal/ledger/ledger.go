@@ -16,10 +16,12 @@ import (
 )
 
 type Data struct {
-	State    core.RuntimeState
-	Pending  map[string]core.Record
-	Receipts map[string]core.Receipt
-	Inputs   map[string]core.InputReceipt
+	State        core.RuntimeState
+	Pending      map[string]core.Record
+	Receipts     map[string]core.Receipt
+	Inputs       map[string]core.InputReceipt
+	Attempts     map[string]core.ModelAttempt
+	AttemptOrder []string
 }
 type Rollout struct {
 	ID                   string
@@ -36,15 +38,16 @@ type Store struct {
 	forks    targetlock.Map
 }
 type Change struct {
-	Commit  core.Commit
-	State   core.RuntimeState
-	Records []core.Record
-	Receipt core.Receipt
+	Commit   core.Commit
+	State    core.RuntimeState
+	Records  []core.Record
+	Receipt  core.Receipt
+	Attempts []core.ModelAttempt
 }
 
 func New() *Store { return &Store{Sessions: map[string]*Data{}, Rollouts: map[string]*Rollout{}} }
 func NewData() *Data {
-	return &Data{Pending: map[string]core.Record{}, Receipts: map[string]core.Receipt{}, Inputs: map[string]core.InputReceipt{}}
+	return &Data{Pending: map[string]core.Record{}, Receipts: map[string]core.Receipt{}, Inputs: map[string]core.InputReceipt{}, Attempts: map[string]core.ModelAttempt{}}
 }
 func NewRollout(id string) *Rollout {
 	return &Rollout{ID: id, Status: "active", Records: map[string]core.Record{}, Children: map[string][]string{}, References: map[string][]string{}}
@@ -197,14 +200,14 @@ func (st *Store) LookupCommit(ctx context.Context, id, key string) (core.Receipt
 
 // Prepare is non-mutating and requires Mu. Durable adapters sync before Apply.
 func (st *Store) Prepare(id string, c core.Commit) (Change, error) {
-	if id == "" || len(c.Entries) == 0 || c.ID == core.ForkCommitID {
+	if id == "" || len(c.Entries)+len(c.Attempts) == 0 || c.ID == core.ForkCommitID {
 		return Change{}, core.ErrInvalid
 	}
 	var rolloutID string
 	d := st.Sessions[id]
 	if d != nil {
 		rolloutID = d.State.RolloutID
-	} else if c.Entries[0].Created != nil && c.Entries[0].Created.Projection == nil {
+	} else if len(c.Entries) > 0 && c.Entries[0].Created != nil && c.Entries[0].Created.Projection == nil {
 		rolloutID = c.Entries[0].Created.RolloutID
 	} else {
 		return Change{}, core.ErrCorrupt
@@ -249,7 +252,8 @@ func (st *Store) PrepareConfirmed(id string, c core.Commit, receipt core.Receipt
 	if c.ExpectedVersion != d.State.Version {
 		return Change{}, core.ErrConflict
 	}
-	if len(c.Entries) == 0 || receipt.FirstSequence == 0 || receipt.LastSequence-receipt.FirstSequence != uint64(len(c.Entries)-1) || receipt.Version != c.ExpectedVersion+1 || receipt.CommitID != c.ID {
+	validRange := len(c.Entries) == 0 && receipt.FirstSequence == 0 && receipt.LastSequence == 0 || len(c.Entries) > 0 && receipt.FirstSequence > 0 && receipt.LastSequence >= receipt.FirstSequence && receipt.LastSequence-receipt.FirstSequence == uint64(len(c.Entries)-1)
+	if !validRange || len(c.Entries)+len(c.Attempts) == 0 || receipt.Version != c.ExpectedVersion+1 || receipt.CommitID != c.ID {
 		return Change{}, core.ErrCorrupt
 	}
 	for i, e := range c.Entries {
@@ -287,10 +291,10 @@ func (st *Store) PrepareConfirmed(id string, c core.Commit, receipt core.Receipt
 		r = NewRollout(state.RolloutID)
 	}
 	validRollout := r.Status == "active" || r.Status == "building" && c.ID == core.ForkCommitID && d.State.Version == 0
-	if !validRollout || receipt.FirstSequence != r.Sequence+1 {
+	if !validRollout || len(c.Entries) > 0 && receipt.FirstSequence != r.Sequence+1 {
 		return Change{}, core.ErrCorrupt
 	}
-	if c.Entries[0].Created != nil && c.Entries[0].Created.Projection != nil {
+	if len(c.Entries) > 0 && c.Entries[0].Created != nil && c.Entries[0].Created.Projection != nil {
 		head, ok := r.Records[c.Entries[0].Created.ForkEntryID]
 		if !ok || !Equal(head.Projection, c.Entries[0].Created.Projection) {
 			return Change{}, core.ErrCorrupt
@@ -317,7 +321,38 @@ func (st *Store) PrepareConfirmed(id string, c core.Commit, receipt core.Receipt
 		return Change{}, err
 	}
 
-	return Change{Commit: c, State: state, Records: records, Receipt: receipt}, nil
+	var attempts []core.ModelAttempt
+	seenAttempts := map[string]bool{}
+	for _, mutation := range c.Attempts {
+		if seenAttempts[mutation.ID] {
+			return Change{}, core.ErrCorrupt
+		}
+		seenAttempts[mutation.ID] = true
+		var old *core.ModelAttempt
+		if value, exists := d.Attempts[mutation.ID]; exists {
+			old = &value
+		}
+		attempt, err := core.ApplyAttemptMutation(old, mutation, c.Entries)
+		if err != nil || attempt.SessionID != id {
+			if err == nil {
+				err = core.ErrCorrupt
+			}
+			return Change{}, err
+		}
+		if mutation.Create != nil {
+			head, exists := r.Records[attempt.Input.HeadID]
+			for _, record := range records {
+				if record.Entry.ID == attempt.Input.HeadID {
+					head, exists = record, true
+				}
+			}
+			if !exists || head.Projection == nil || !head.Projection.Complete() || head.Projection.ConfigurationID != attempt.Input.ConfigurationID {
+				return Change{}, core.ErrCorrupt
+			}
+		}
+		attempts = append(attempts, attempt)
+	}
+	return Change{Commit: c, State: state, Records: records, Receipt: receipt, Attempts: attempts}, nil
 }
 func (st *Store) Apply(change Change) {
 	id := change.State.SessionID
@@ -336,6 +371,12 @@ func (st *Store) Apply(change Change) {
 		r.Add(record)
 		d.AddPending(record)
 	}
+	for _, attempt := range change.Attempts {
+		if _, exists := d.Attempts[attempt.ID]; !exists {
+			d.AttemptOrder = append(d.AttemptOrder, attempt.ID)
+		}
+		d.Attempts[attempt.ID] = attempt
+	}
 	d.State = change.State
 	d.Receipts[change.Receipt.CommitID] = change.Receipt
 }
@@ -352,10 +393,83 @@ func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (core.Rec
 	if err = ctx.Err(); err != nil {
 		return core.Receipt{}, err
 	}
-	if len(change.Records) > 0 {
+	if len(change.Records)+len(change.Attempts) > 0 {
 		st.Apply(change)
 	}
 	return change.Receipt, nil
+}
+
+func (st *Store) GetAttempt(ctx context.Context, id, key string) (core.ModelAttempt, error) {
+	if err := ctx.Err(); err != nil {
+		return core.ModelAttempt{}, err
+	}
+	st.Mu.RLock()
+	defer st.Mu.RUnlock()
+	d := st.Sessions[id]
+	if d == nil {
+		return core.ModelAttempt{}, core.ErrNotFound
+	}
+	a, exists := d.Attempts[key]
+	if !exists {
+		return core.ModelAttempt{}, core.ErrNotFound
+	}
+	return Clone(a)
+}
+
+func (st *Store) ScanAttempts(ctx context.Context, id string, q core.AttemptQuery) (core.AttemptPage, error) {
+	if err := ctx.Err(); err != nil {
+		return core.AttemptPage{}, err
+	}
+	st.Mu.RLock()
+	defer st.Mu.RUnlock()
+	d := st.Sessions[id]
+	if d == nil {
+		return core.AttemptPage{}, core.ErrNotFound
+	}
+	var cursor uint64
+	var err error
+	if q.Cursor != "" {
+		cursor, err = strconv.ParseUint(q.Cursor, 10, 63)
+		if err != nil {
+			return core.AttemptPage{}, core.ErrInvalid
+		}
+	}
+	start, step := 0, 1
+	if q.Reverse {
+		start, step = len(d.AttemptOrder)-1, -1
+	}
+	if q.Cursor != "" {
+		if q.Reverse {
+			start = sort.Search(len(d.AttemptOrder), func(i int) bool { return d.Attempts[d.AttemptOrder[i]].Version >= cursor }) - 1
+		} else {
+			start = sort.Search(len(d.AttemptOrder), func(i int) bool { return d.Attempts[d.AttemptOrder[i]].Version > cursor })
+		}
+	}
+	limit, maxBytes := core.PageLimits(q.Limit, q.MaxBytes)
+	page, size := core.AttemptPage{}, 0
+	for i := start; i >= 0 && i < len(d.AttemptOrder); i += step {
+		if err := ctx.Err(); err != nil {
+			return core.AttemptPage{}, err
+		}
+		a := d.Attempts[d.AttemptOrder[i]]
+		if q.Purpose != "" && a.Purpose != q.Purpose {
+			continue
+		}
+		raw, err := json.Marshal(a)
+		if err != nil {
+			return core.AttemptPage{}, err
+		}
+		if len(page.Attempts) == limit || size+len(raw) > maxBytes {
+			if len(page.Attempts) == 0 {
+				return core.AttemptPage{}, core.ErrBudget
+			}
+			page.Next = strconv.FormatUint(page.Attempts[len(page.Attempts)-1].Version, 10)
+			break
+		}
+		page.Attempts = append(page.Attempts, a)
+		size += len(raw)
+	}
+	return Clone(page)
 }
 func (st *Store) Scan(ctx context.Context, id string, q core.Query) (core.Page, error) {
 	if err := ctx.Err(); err != nil {

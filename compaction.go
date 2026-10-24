@@ -159,7 +159,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		}
 		return CompactionRecord{}, fitErr
 	}
-	reply, err := s.callModel(ctx, summaryModel, request, modelCall{runID: runID, turnID: turnID, purpose: "compaction"})
+	reply, err := s.callModel(ctx, summaryModel, request, modelCall{runID: runID, turnID: turnID, purpose: "compaction", base: view})
 	if err != nil {
 		return CompactionRecord{}, err
 	}
@@ -177,7 +177,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	if summary == "" {
 		return CompactionRecord{}, fmtInvalid("empty summary")
 	}
-	record := CompactionRecord{ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, ModelRevision: request.ModelRevision, Options: request.Options, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
+	record := CompactionRecord{AttemptID: reply.attemptID, ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, ModelRevision: request.ModelRevision, Options: request.Options, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
 	return record, nil
 }
 

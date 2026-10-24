@@ -242,7 +242,7 @@ func (s *Session) drive(ctx context.Context, run *Run) {
 		turnID := newID()
 		s.publish(Event{Type: EventTurnStart, RunID: run.id, TurnID: turnID})
 		var step preparedStep
-		step, _, runErr = s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, natural: natural, reason: "boundary"})
+		step, _, runErr = s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, natural: natural, reason: "boundary", generation: true})
 		if runErr == nil {
 			var assistant Frame
 			assistant, runErr = s.generateWithRecovery(ctx, run, turnID, step)

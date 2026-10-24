@@ -344,6 +344,23 @@ func readStore(ctx context.Context, store astral.Store, id string) (historySnaps
 	}
 }
 
+func allAttempts(t *testing.T, s *astral.Session) []astral.ModelAttempt {
+	t.Helper()
+	var out []astral.ModelAttempt
+	cursor := ""
+	for {
+		page, err := s.Attempts().Scan(context.Background(), astral.AttemptQuery{Cursor: cursor, MaxBytes: astral.DefaultContextBytes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, page.Attempts...)
+		if page.Next == "" {
+			return out
+		}
+		cursor = page.Next
+	}
+}
+
 var fixtureCommitID atomic.Uint64
 
 func makeCommit(state astral.RuntimeState, version uint64, entries []astral.Entry) astral.Commit {

@@ -44,8 +44,8 @@ func TestUsageAnchorSurvivesReopenForkAndPassiveTail(t *testing.T) {
 		if err != nil || entry.Generation == nil {
 			t.Fatalf("missing successful attempt provenance: %+v %v", entry, err)
 		}
-		request, err := s.History().Get(ctx, entry.Generation.RequestID)
-		if err != nil || request.ModelRequest == nil || request.ModelRequest.AttemptID != entry.Generation.AttemptID || request.ModelRequest.Purpose != "generation" {
+		request, err := s.Attempts().Get(ctx, entry.Generation.AttemptID)
+		if err != nil || request.Purpose != "generation" || request.Outcome == nil || request.Outcome.EntryID != entry.ID || request.Outcome.Reply != nil {
 			t.Fatalf("assistant refers to the wrong request: %+v %v", request, err)
 		}
 		for _, mode := range []core.ForkMode{core.ForkShared, core.ForkDetached} {

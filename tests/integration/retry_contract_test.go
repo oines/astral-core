@@ -67,10 +67,12 @@ func TestGenerationAndSummaryRetriesUseFrozenRequestsAndExcludeFailures(t *testi
 		}
 		counts := map[string]int{}
 		failedAudits := 0
-		for _, entry := range entries(s) {
-			if entry.ModelResponse != nil && entry.ModelResponse.Error != "" {
+		for _, attempt := range allAttempts(t, s) {
+			if attempt.Outcome != nil && attempt.Outcome.Error != "" {
 				failedAudits++
 			}
+		}
+		for _, entry := range entries(s) {
 			if entry.Message != nil && strings.Contains(string(mustJSON(t, entry.Message)), "FAILED-") {
 				t.Fatal("failed partial entered conversation")
 			}

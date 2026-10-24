@@ -37,16 +37,22 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 				if !strings.Contains(req.SystemPrompt, "environment-") {
 					t.Fatalf("preparation was not frozen before estimation: %s", req.SystemPrompt)
 				}
-				for _, e := range mustReadHistory(t, store, "snapshot") {
-					if e.ModelRequest != nil && reflect.DeepEqual(e.ModelRequest.Request, req) {
-						if n == 1 {
-							return answer("partial"), &astral.ModelError{Code: "temporary", Transient: true, Cause: errors.New("retry")}
-						}
-						return answer("complete"), nil
-					}
+				state, err := store.LoadState(ctx, "snapshot")
+				if err != nil || state.CurrentAttemptID == "" {
+					t.Fatalf("provider invoked without durable attempt: %v", err)
 				}
-				t.Fatal("provider invoked before exact request was committed")
-				return astral.Reply{}, errors.New("missing request")
+				attempt, err := store.GetAttempt(ctx, "snapshot", state.CurrentAttemptID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				frozen, err := astral.RebuildRequest(ctx, store, attempt.Input, astral.DefaultContextBytes)
+				if err != nil || !reflect.DeepEqual(frozen, req) {
+					t.Fatalf("provider input was not atomically frozen: %v", err)
+				}
+				if n == 1 {
+					return answer("partial"), &astral.ModelError{Code: "temporary", Transient: true, Cause: errors.New("retry")}
+				}
+				return answer("complete"), nil
 			})
 			base.estimator = func(astral.Request) (int, error) {
 				environment.Add(1) // live host changes after preparation
@@ -84,26 +90,25 @@ func TestActualModelAttemptsSurviveReopenWithFrozenMultimodalContext(t *testing.
 				t.Fatal(err)
 			}
 			var requests []astral.Request
-			var responses []astral.ModelResponseRecord
-			ids := map[string]bool{}
-			for _, e := range entries(s) {
-				if e.ModelRequest != nil {
-					requests = append(requests, e.ModelRequest.Request)
-					ids[e.ModelRequest.AttemptID] = true
-					if e.IsHistory() {
-						t.Fatal("attempt snapshot entered conversation tree")
-					}
+			attempts := allAttempts(t, s)
+			for _, attempt := range attempts {
+				request, err := s.Attempts().Request(ctx, attempt.ID)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if e.ModelResponse != nil {
-					responses = append(responses, *e.ModelResponse)
-					if !ids[e.ModelResponse.AttemptID] {
-						t.Fatal("response lacks an earlier request")
-					}
+				requests = append(requests, request)
+				raw, _ := json.Marshal(attempt)
+				if strings.Contains(string(raw), "cGl4ZWxz") {
+					t.Fatal("image body copied into attempt")
 				}
 			}
-			if !reflect.DeepEqual(requests, observed) || len(responses) != 2 || responses[0].Error == "" ||
-				responses[0].Reply.Message.Content[0].Text != "partial" || responses[1].Error != "" {
-				t.Fatalf("attempt snapshots changed on reopen: requests=%d responses=%+v", len(requests), responses)
+			if !reflect.DeepEqual(requests, observed) || len(attempts) != 2 || attempts[0].Outcome == nil || attempts[0].Outcome.Error == "" ||
+				attempts[0].Outcome.Reply.Message.Content[0].Text != "partial" || attempts[1].Outcome == nil || attempts[1].Outcome.Error != "" || attempts[1].Outcome.EntryID == "" || attempts[1].Outcome.Reply != nil {
+				t.Fatalf("attempt inputs/results changed on reopen: requests=%d attempts=%+v", len(requests), attempts)
+			}
+			accepted, err := s.History().Get(ctx, attempts[1].Outcome.EntryID)
+			if err != nil || accepted.Message.Content[0].Text != "complete" || accepted.Generation.AttemptID != attempts[1].ID {
+				t.Fatalf("missing canonical reply: %v", err)
 			}
 			view, err := s.InspectContext(ctx)
 			if err != nil || len(view.Request.Messages) != 2 {
@@ -123,9 +128,9 @@ func mustReadHistory(t *testing.T, store astral.Store, id string) []astral.Entry
 }
 
 func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
-	for _, kind := range []astral.EntryKind{astral.EntryModelRequest, astral.EntryModelResponse} {
-		t.Run(string(kind), func(t *testing.T) {
-			store := &faultStore{Store: memory.New(), kind: kind}
+	for _, phase := range []string{"create", "finish"} {
+		t.Run(phase, func(t *testing.T) {
+			store := &faultStore{Store: memory.New(), attemptPhase: phase}
 			var effects atomic.Int32
 			m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 				return calls(call("effect", "echo", `{"value":"execute"}`)), nil
@@ -138,7 +143,7 @@ func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
 				t.Fatal("storage failure was hidden")
 			}
 			want := 1
-			if kind == astral.EntryModelRequest {
+			if phase == "create" {
 				want = 0
 			}
 			if len(m.observed()) != want || effects.Load() != 0 {
@@ -149,7 +154,7 @@ func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
 }
 
 func TestPreviousHistoryFormatsAreRejected(t *testing.T) {
-	for _, version := range []int{6, 7, 8} {
+	for _, version := range []int{6, 7, 8, 9} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			eachStore(t, func(t *testing.T, store astral.Store) {
 				header := storeHeader()
