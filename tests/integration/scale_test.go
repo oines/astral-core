@@ -182,6 +182,33 @@ func BenchmarkSQLiteLongHistory(b *testing.B) {
 				b.ReportMetric(float64(s.Stats().ContextEntries), "context-records")
 				b.ReportMetric(float64(st.Stats().RowsRead-rows)/float64(b.N), "rows/op")
 			})
+			b.Run("RebuildRequest", func(b *testing.B) {
+				base, err := astral.ReadContext(ctx, st, state.RolloutID, state.Branch.HeadID, astral.DefaultContextBytes)
+				if err != nil {
+					b.Fatal(err)
+				}
+				input, err := astral.FreezeRequest(state.RolloutID, base, base.Request, m.Spec())
+				if err != nil {
+					b.Fatal(err)
+				}
+				stop := sampledPeakHeap(b)
+				defer stop()
+				rows := st.Stats().RowsRead
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					request, err := astral.RebuildRequest(ctx, st, input, astral.DefaultContextBytes)
+					if err != nil || len(request.Messages) != 17 {
+						b.Fatalf("rebuild: %d messages, %v", len(request.Messages), err)
+					}
+				}
+				b.StopTimer()
+				read := float64(st.Stats().RowsRead-rows) / float64(b.N)
+				if read > 24 {
+					b.Fatalf("request reconstruction read archived history: %.0f rows/op", read)
+				}
+				b.ReportMetric(read, "rows/op")
+			})
 			for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
 				name := "Shared"
 				if mode == astral.ForkDetached {

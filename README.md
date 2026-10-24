@@ -74,6 +74,7 @@ if submission.Run != nil {
 | `Compact(ctx, instructions)` | 空闲时显式压缩，不消费驱动输入、不生成普通回答 |
 | `Snapshot()` / `Subscribe()` | 读取执行状态、尝试进度并订阅事件 |
 | `History()` / `InspectContext()` | 读取历史与有效上下文，不启动执行或收集环境 |
+| `Attempts().Get/Scan/Request` | 读取独立的模型尝试记录，或按需重建实际请求 |
 | `Fork(ctx, entryID, options)` | 在完整历史边界创建共享或独立 Rollout 的 Session |
 
 所有输入都要求稳定 ID，包括第一条 Prompt。相同 ID、相同 Digest 返回既有回执；不同 Digest 返回冲突。Host 可提供原始业务提交的 Digest，并在重新生成时间戳或读取附件前先查询回执。重试不替换已保存载荷。
@@ -88,7 +89,7 @@ if submission.Run != nil {
 
 普通模型轮次先预览队列，并同步调用 `Config.CollectContext` 把最新环境加入完整候选，再决定是否压缩。必要时仅对已提交历史生成摘要草稿，摘要完成后重新采集环境。最终顺序为：摘要与保留历史、选中的被动上下文、最新环境、驱动输入组。
 
-完整候选请求必须同时满足 Token 与字节预算。摘要、环境、输入和消费记录通过一次 Store Commit 确认，然后发送冻结请求。采集失败、预算失败或提交前冲突不会改变有效上下文；摘要草稿可以在下一次激活重新计算。每次准备最多自动压缩一次，摘要请求也独立检查预算。自动压缩的近期保留目标会为新输入预留空间。
+完整候选请求必须同时满足 Token 与字节预算。摘要、环境、输入、消费记录和首个 ModelAttempt 的冻结输入引用通过一次 Store Commit 确认，然后调用模型。采集失败、预算失败或提交前冲突不会改变有效上下文；摘要草稿可以在下一次激活重新计算。每次准备最多自动压缩一次，摘要请求也独立检查预算。自动压缩的近期保留目标会为新输入预留空间。
 
 ```go
 config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary) ([]core.Message, error) {
@@ -120,7 +121,11 @@ config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary)
 
 提供商明确报告 `ModelError.ContextOverflow` 时，Core 在完整边界上最多再压缩并生成一次；不走原样 HTTP 重试。此次恢复不接收新队列输入，不重跑已完成的工具；第二次溢出直接停止。关闭自动压缩时也关闭该恢复。
 
-每次调用在 Provider 前保存 `model_request`，在采用结果或重试前保存 `model_response`。失败片段、网络错误和重试信息只属于执行记录；只有完整且校验通过的 Stop / ToolCalls 回复进入对话。失败、取消和 Length 回复不会触发工具，也不会进入后续普通请求或摘要。
+每次外部调用前保存独立的 `ModelAttempt`。`RequestInput` 固定 Rollout、祖先路径 Head、Configuration、模型规格、消息选择和必要的准备/修复差异；完整 Request 只在内存中组装，不按轮次复制图片、历史消息或 opaque reasoning。`Attempts().Request` 只读取固定边界内的有效上下文并核对内容摘要，不重新采集环境或调用模型。
+
+成功回复与 Attempt 完成通过一次提交确认，正文只存在于被采用的消息节点；Attempt 保存结果节点引用和用量。失败片段与未采用的摘要只存在于 Attempt，采用摘要时原子移入 Compaction 节点。失败、取消和 Length 回复不会触发工具，也不会进入后续普通请求或摘要。
+
+进程在输入提交后、回复提交前退出，重开保留未完成 Attempt。显式 Continue 创建关联到原尝试的新 Attempt，复用同一份冻结输入；已经确认的回复不会重新生成。远端请求可能已执行，不能保证网络调用恰好一次。正常失败或明确取消会结束这次生成，之后 Continue 可应用排队输入与新配置。
 
 事件和 Snapshot 提供 Run / Turn / Attempt ID、用途、当前次数、上限、下一次重试时间与安全错误代码。客户端按 Attempt 隔离临时输出；重连只恢复事件流和快照，不重发模型请求。
 
@@ -138,8 +143,10 @@ Assistant 的 `Content` 按原顺序保存 Reasoning、Text、ToolCall、多模�
 
 ## 存储与所有权
 
-当前 Core 格式为 **9**，只支持本格式。没有旧接口、旧格式读取或迁移；已有旧数据库返回 `ErrUnsupportedFormat`，使用全新数据目录初始化。SQLite 是持久运行后端，Memory 用于临时会话；不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
+当前 Core 格式为 **10**，只支持本格式。没有旧接口、旧格式读取或运行时自动升级；已有旧数据库返回 `ErrUnsupportedFormat`。一次性数据维护在运行库之外完成。SQLite 是持久运行后端，Memory 用于临时会话；Host 可实现同一 Store 契约接入其他后端。不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
+
+历史树通过 ParentID 表达分支，Session 持有执行游标、待办和当前未完成 Attempt；三者具有独立身份。普通读取只分页加载所选祖先路径的有效上下文及必要引用，内存不随归档历史总长度增长。Shared Fork 共享祖先节点，Detached Fork 分页复制所选祖先路径后原子发布；两种 Fork 都不继承父 Session 的 Attempt，消息、摘要和用量元数据不依赖父执行记录才能读取。
 
 Host 对每个 Session ID 保留一个活动句柄，并保证进程间执行所有权。Store 的 CAS 不能撤销已发生的外部副作用。Close 取消并等待 Session 的执行、维护与 Fork，释放缓存；Model、Store 和工具环境仍由 Host 关闭。Fork 复制或共享历史，不复制工作文件或活动进程。
 
-更多实现约束见 [宿主契约](docs/contracts.md)，验证入口见 [开发与验证](docs/development.md)。[性能报告](docs/benchmarks.md) 保留早期版本的历史测量，不代表格式 9 的最新性能结果。
+更多实现约束见 [宿主契约](docs/contracts.md)，验证入口见 [开发与验证](docs/development.md)。[性能报告](docs/benchmarks.md) 保留早期版本的历史测量，不代表格式 10 的最新性能结果。

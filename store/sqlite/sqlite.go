@@ -62,6 +62,9 @@ CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
 CREATE TABLE inputs(session_id TEXT NOT NULL,id TEXT NOT NULL,kind TEXT NOT NULL,digest TEXT NOT NULL,accepted_at TEXT NOT NULL,payload BLOB NOT NULL,state TEXT NOT NULL,entry_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(session_id,id));
 CREATE INDEX input_status ON inputs(session_id,kind,state);
+CREATE TABLE attempts(session_id TEXT NOT NULL,id TEXT NOT NULL,rollout_id TEXT NOT NULL,version INTEGER NOT NULL,purpose TEXT NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(session_id,id),UNIQUE(session_id,version));
+CREATE INDEX attempt_purpose ON attempts(session_id,purpose,version);
+CREATE INDEX attempt_rollout ON attempts(rollout_id);
 
 PRAGMA user_version=%d;
 `, core.FormatVersion, core.FormatVersion)
@@ -403,7 +406,7 @@ func (st *Store) activeRollout(ctx context.Context, id string) error {
 	return err
 }
 func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (receipt core.Receipt, err error) {
-	if id == "" || c.ID == core.ForkCommitID || len(c.Entries) == 0 {
+	if id == "" || c.ID == core.ForkCommitID || len(c.Entries)+len(c.Attempts) == 0 {
 		return receipt, core.ErrInvalid
 	}
 	digest, err := c.Digest()
@@ -437,6 +440,9 @@ func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (receipt 
 		}
 		st.rows.Add(1)
 	} else {
+		if len(c.Entries) == 0 {
+			return receipt, core.ErrCorrupt
+		}
 		created := c.Entries[0].Created
 		if created == nil || created.RolloutID == "" || created.Projection != nil {
 			return receipt, core.ErrCorrupt
@@ -528,11 +534,16 @@ func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (receipt 
 	if err = insert(ctx, tx, rolloutID, records, true); err != nil {
 		return receipt, err
 	}
+	if err = saveAttempts(ctx, tx, id, rolloutID, confirmed.Attempts, confirmed.Entries); err != nil {
+		return receipt, err
+	}
 	if err = saveReceipt(ctx, tx, rolloutID, id, receipt); err != nil {
 		return receipt, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE rollouts SET seq=? WHERE id=?", receipt.LastSequence, rolloutID); err != nil {
-		return receipt, err
+	if receipt.LastSequence > 0 {
+		if _, err = tx.ExecContext(ctx, "UPDATE rollouts SET seq=? WHERE id=?", receipt.LastSequence, rolloutID); err != nil {
+			return receipt, err
+		}
 	}
 	err = tx.Commit()
 	if err == nil {
@@ -874,7 +885,7 @@ func (st *Store) discardUnpublished(ctx context.Context, id string) error {
 			n, e = result.RowsAffected()
 		}
 		if e == nil && n == 0 {
-			for _, query := range []string{"DELETE FROM pending WHERE rollout_id=?", "DELETE FROM receipts WHERE rollout_id=?", "DELETE FROM sessions WHERE rollout_id=?", "DELETE FROM rollouts WHERE id=?"} {
+			for _, query := range []string{"DELETE FROM pending WHERE rollout_id=?", "DELETE FROM receipts WHERE rollout_id=?", "DELETE FROM attempts WHERE rollout_id=?", "DELETE FROM sessions WHERE rollout_id=?", "DELETE FROM rollouts WHERE id=?"} {
 				if _, e = tx.ExecContext(ctx, query, rolloutID); e != nil {
 					break
 				}

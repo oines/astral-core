@@ -81,11 +81,15 @@ func TestEncryptedReplayRecoveryRecordedOnceWithoutReexecutingTools(t *testing.T
 				t.Fatalf("requests=%d tools=%d recovery=%d", len(m.observed()), effects.Load(), m.recoveryCalls.Load())
 			}
 			var requests []astral.Request
+			for _, attempt := range allAttempts(t, s) {
+				request, err := s.Attempts().Request(context.Background(), attempt.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				requests = append(requests, request)
+			}
 			originalKept := false
 			for _, entry := range entries(s) {
-				if entry.ModelRequest != nil {
-					requests = append(requests, entry.ModelRequest.Request)
-				}
 				if entry.Message != nil {
 					raw, _ := json.Marshal(entry.Message)
 					if strings.Contains(string(raw), "opaque") {

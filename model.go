@@ -80,21 +80,6 @@ func PrepareRequest(ctx context.Context, model Model, request Request) (out Requ
 	return copyJSON(out)
 }
 
-// ModelRequestRecord and ModelResponseRecord are operational rollout facts.
-// They are never added to the conversation or replayed as additional messages.
-type ModelRequestRecord struct {
-	AttemptID string  `json:"attempt_id"`
-	Purpose   string  `json:"purpose"`
-	Request   Request `json:"request"`
-}
-
-type ModelResponseRecord struct {
-	AttemptID string `json:"attempt_id"`
-	Purpose   string `json:"purpose"`
-	Reply     Reply  `json:"reply"`
-	Error     string `json:"error,omitempty"`
-}
-
 // ModelFunc adapts host functions without a provider-specific SDK dependency.
 type ModelFunc struct {
 	Specification ModelSpec

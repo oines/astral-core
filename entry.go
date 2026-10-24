@@ -8,29 +8,27 @@ import (
 // History entries form the parent tree. Operational facts reference their
 // invocation or queue item instead of changing that tree's parent relation.
 type Entry struct {
-	SessionID     string               `json:"session_id"`
-	Sequence      uint64               `json:"sequence"`
-	Version       uint64               `json:"version"`
-	Generation    *GenerationRecord    `json:"generation,omitempty"`
-	Usage         Usage                `json:"usage,omitempty"`
-	ID            string               `json:"id"`
-	ParentID      string               `json:"parent_id,omitempty"`
-	Kind          EntryKind            `json:"kind"`
-	Time          time.Time            `json:"time"`
-	InputID       string               `json:"input_id,omitempty"`
-	RunID         string               `json:"run_id,omitempty"`
-	TurnID        string               `json:"turn_id,omitempty"`
-	Created       *CreationRecord      `json:"created,omitempty"`
-	Configuration *Configuration       `json:"configuration,omitempty"`
-	Message       *Message             `json:"message,omitempty"`
-	Tool          *ToolRecord          `json:"tool,omitempty"`
-	Approval      *ApprovalRecord      `json:"approval,omitempty"`
-	Input         *InputRecord         `json:"input,omitempty"`
-	Compaction    *CompactionRecord    `json:"compaction,omitempty"`
-	Clear         *InputClear          `json:"clear,omitempty"`
-	Run           *RunRecord           `json:"run,omitempty"`
-	ModelRequest  *ModelRequestRecord  `json:"model_request,omitempty"`
-	ModelResponse *ModelResponseRecord `json:"model_response,omitempty"`
+	SessionID     string            `json:"session_id"`
+	Sequence      uint64            `json:"sequence"`
+	Version       uint64            `json:"version"`
+	Generation    *GenerationRecord `json:"generation,omitempty"`
+	Usage         Usage             `json:"usage,omitempty"`
+	ID            string            `json:"id"`
+	ParentID      string            `json:"parent_id,omitempty"`
+	Kind          EntryKind         `json:"kind"`
+	Time          time.Time         `json:"time"`
+	InputID       string            `json:"input_id,omitempty"`
+	RunID         string            `json:"run_id,omitempty"`
+	TurnID        string            `json:"turn_id,omitempty"`
+	Created       *CreationRecord   `json:"created,omitempty"`
+	Configuration *Configuration    `json:"configuration,omitempty"`
+	Message       *Message          `json:"message,omitempty"`
+	Tool          *ToolRecord       `json:"tool,omitempty"`
+	Approval      *ApprovalRecord   `json:"approval,omitempty"`
+	Input         *InputRecord      `json:"input,omitempty"`
+	Compaction    *CompactionRecord `json:"compaction,omitempty"`
+	Clear         *InputClear       `json:"clear,omitempty"`
+	Run           *RunRecord        `json:"run,omitempty"`
 }
 
 type EntryKind string
@@ -56,8 +54,6 @@ const (
 	EntryInputCleared      EntryKind = "input_cleared"
 	EntryCompaction        EntryKind = "compaction"
 	EntryRun               EntryKind = "run"
-	EntryModelRequest      EntryKind = "model_request"
-	EntryModelResponse     EntryKind = "model_response"
 )
 
 func (e Entry) IsHistory() bool {
@@ -104,6 +100,7 @@ type InputClear struct {
 }
 
 type CompactionRecord struct {
+	AttemptID     string            `json:"attempt_id,omitempty"`
 	ThroughID     string            `json:"through_id"`
 	Summary       string            `json:"summary"`
 	ModelID       string            `json:"model_id"`
@@ -126,8 +123,8 @@ type RunRecord struct {
 // ContextDigest fingerprints its frozen request plus reply, excluding only the
 // output limit. It is a validity check, not a second usage ledger.
 type GenerationRecord struct {
-	AttemptID       string `json:"attempt_id"`
-	RequestID       string `json:"request_id"`
-	ConfigurationID string `json:"configuration_id"`
-	ContextDigest   string `json:"context_digest"`
+	AttemptID       string    `json:"attempt_id"`
+	ConfigurationID string    `json:"configuration_id"`
+	ContextDigest   string    `json:"context_digest"`
+	Model           ModelSpec `json:"model"`
 }

@@ -11,16 +11,28 @@ type prepareOptions struct {
 	runID, turnID, reason, instructions        string
 	passiveOnly, natural, compact, skipCollect bool
 	noInputs, overflow                         bool
+	generation                                 bool
 }
 type preparedStep struct {
-	model  Model
-	view   Context
-	driven bool
+	model   Model
+	view    Context
+	driven  bool
+	base    Context
+	attempt *ModelAttempt
 }
 
 var errQueueRevised = errors.New("selected queue input was revised")
 
 func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (preparedStep, CompactionRecord, error) {
+	if options.generation && !options.compact {
+		s.mu.Lock()
+		pending := s.state.CurrentAttemptID
+		s.mu.Unlock()
+		if pending != "" {
+			step, err := s.resumeGeneration(ctx, pending, options)
+			return step, CompactionRecord{}, err
+		}
+	}
 	for {
 		step, summary, err := s.prepareCandidate(ctx, options)
 		if !errors.Is(err, errQueueRevised) {
@@ -198,15 +210,41 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 			return preparedStep{}, summary, errQueueRevised
 		}
 	}
-	if len(drafts) > 0 {
-		entries, err := s.appendLocked(ctx, drafts...)
+	var mutations []AttemptMutation
+	for _, draft := range drafts {
+		if draft.Compaction != nil && draft.Compaction.AttemptID != "" {
+			mutations = append(mutations, AttemptMutation{ID: draft.Compaction.AttemptID, AdoptEntryID: draft.ID})
+		}
+	}
+	canonicalPath := append([]Entry(nil), path...)
+	for _, draft := range drafts {
+		if draft.IsHistory() {
+			canonicalPath = append(canonicalPath, draft)
+		}
+	}
+	base, err := project(canonicalPath)
+	if err != nil {
+		return preparedStep{}, summary, err
+	}
+	var attempt *ModelAttempt
+	if options.generation {
+		input, err := FreezeRequest(s.rolloutID, base, candidate.Request, model.Spec())
+		if err != nil {
+			return preparedStep{}, summary, err
+		}
+		a := s.newAttempt(input, modelCall{runID: options.runID, turnID: options.turnID, purpose: "generation"}, 1, "")
+		a.Version = s.state.Version + 1
+		attempt = &a
+		mutations = append(mutations, AttemptMutation{ID: a.ID, Create: &a})
+	}
+	if len(drafts)+len(mutations) > 0 {
+		_, err := s.commitLocked(ctx, drafts, mutations)
 		if err != nil {
 			return preparedStep{}, summary, err
 		}
 		candidate.HeadID = s.state.Branch.HeadID
-		_ = entries
 	}
-	return preparedStep{model: model, view: candidate, driven: driving}, summary, nil
+	return preparedStep{model: model, view: candidate, base: base, attempt: attempt, driven: driving}, summary, nil
 }
 func (s *Session) measureContext(ctx context.Context, model Model, view Context) (Context, error) {
 	view.Request.ModelID, view.Request.ModelRevision = model.Spec().ID, model.Spec().Revision

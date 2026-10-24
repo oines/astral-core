@@ -8,11 +8,10 @@ import (
 
 func (s *Session) generate(ctx context.Context, run *Run, turnID string, step preparedStep) (Frame, error) {
 	s.publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID})
-	reply, err := s.callModel(ctx, step.model, step.view.Request, modelCall{runID: run.id, turnID: turnID, purpose: "generation", configurationID: step.view.ConfigurationID})
+	reply, err := s.callModel(ctx, step.model, step.view.Request, modelCall{runID: run.id, turnID: turnID, purpose: "generation", base: step.base, attempt: step.attempt})
 	frame := Frame{}
 	if err == nil {
-		frame = Frame{ID: newID(), TurnID: turnID, Message: reply.Message}
-		_, err = s.append(ctx, Entry{Kind: EntryMessage, ID: frame.ID, RunID: run.id, TurnID: turnID, Message: &frame.Message, Usage: reply.Usage, Generation: reply.generation})
+		frame = Frame{ID: reply.entryID, TurnID: turnID, Message: reply.Message}
 	}
 	event := Event{Type: EventMessageEnd, RunID: run.id, TurnID: turnID, Error: errorText(err)}
 	if err == nil {
@@ -22,11 +21,15 @@ func (s *Session) generate(ctx context.Context, run *Run, turnID string, step pr
 	return frame, err
 }
 
-type modelCall struct{ runID, turnID, purpose, configurationID string }
+type modelCall struct {
+	runID, turnID, purpose string
+	base                   Context
+	attempt                *ModelAttempt
+}
 
 type modelResult struct {
 	Reply
-	generation *GenerationRecord
+	entryID, attemptID string
 }
 
 // callModel owns the complete attempt policy for both generation and summaries.
@@ -36,17 +39,33 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 	policy := s.config.Retry
 	frozen := clone(request)
 	repaired := false
+	var input RequestInput
+	var previous *ModelAttempt
+	if call.attempt != nil {
+		input = call.attempt.Input
+	} else {
+		var err error
+		input, err = FreezeRequest(s.rolloutID, call.base, frozen, model.Spec())
+		if err != nil {
+			return modelResult{}, err
+		}
+	}
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return modelResult{}, err
 		}
-		attemptID := newID()
-		status := AttemptStatus{RunID: call.runID, TurnID: call.turnID, AttemptID: attemptID, Purpose: call.purpose, Attempt: attempt, MaxAttempts: policy.MaxAttempts, State: "running"}
-		record := ModelRequestRecord{AttemptID: attemptID, Purpose: call.purpose, Request: frozen}
-		requestEntries, err := s.append(ctx, Entry{Kind: EntryModelRequest, RunID: call.runID, TurnID: call.turnID, ModelRequest: &record})
-		if err != nil {
-			return modelResult{}, err
+		var current ModelAttempt
+		if attempt == 1 && call.attempt != nil {
+			current = *call.attempt
+		} else {
+			var err error
+			current, err = s.createAttempt(ctx, input, call, attempt, previous)
+			if err != nil {
+				return modelResult{}, err
+			}
 		}
+		attemptID := current.ID
+		status := AttemptStatus{RunID: call.runID, TurnID: call.turnID, AttemptID: attemptID, Purpose: call.purpose, Attempt: attempt, MaxAttempts: policy.MaxAttempts, State: "running"}
 		s.publishAttempt(EventAttemptStart, status)
 		requestCtx, cancel := context.WithTimeout(ctx, policy.RequestTimeout)
 		reply, err := stream(requestCtx, model, frozen, func(event ModelEvent) {
@@ -71,9 +90,26 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 		if err == nil {
 			err = ctx.Err()
 		}
-		response := ModelResponseRecord{AttemptID: attemptID, Purpose: call.purpose, Reply: reply, Error: errorText(err)}
+		outcome := AttemptOutcome{Status: "failed", FinishedAt: time.Now().UTC(), Reply: &reply, Usage: reply.Usage, Error: errorText(err)}
+		var entries []Entry
+		entryID := ""
+		if err == nil {
+			outcome.Status = "completed"
+			if call.purpose == "generation" {
+				entryID = newID()
+				generation := GenerationProvenance(current, frozen, reply.Message)
+				entries = []Entry{{Kind: EntryMessage, ID: entryID, RunID: call.runID, TurnID: call.turnID, Message: &reply.Message, Usage: reply.Usage, Generation: &generation}}
+				outcome.EntryID, outcome.Reply = entryID, nil
+			}
+		}
 		cleanup, finish := persistContext(ctx)
-		_, recordErr := s.append(cleanup, Entry{Kind: EntryModelResponse, RunID: call.runID, TurnID: call.turnID, ModelResponse: &response})
+		commitCtx := cleanup
+		if err == nil {
+			commitCtx = ctx
+		}
+		s.mu.Lock()
+		_, recordErr := s.commitLocked(commitCtx, entries, []AttemptMutation{{ID: attemptID, Finish: &outcome}})
+		s.mu.Unlock()
 		finish()
 		if recordErr != nil {
 			return modelResult{}, errors.Join(err, recordErr)
@@ -81,14 +117,11 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 		if err == nil {
 			status.State = "completed"
 			s.publishAttempt(EventAttemptEnd, status)
-			result := modelResult{Reply: reply}
-			if call.purpose == "generation" {
-				covered := clone(frozen)
-				covered.Messages = append(covered.Messages, reply.Message)
-				result.generation = &GenerationRecord{AttemptID: attemptID, RequestID: requestEntries[0].ID, ConfigurationID: call.configurationID, ContextDigest: contextDigest(covered)}
-			}
+			result := modelResult{Reply: reply, entryID: entryID, attemptID: attemptID}
 			return result, nil
 		}
+		current.Outcome = &outcome
+		previous = &current
 		status.State, status.Error = "failed", safeModelError(err)
 		s.publishAttempt(EventAttemptFailed, status)
 		if ctx.Err() != nil {
@@ -121,6 +154,10 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 					return modelResult{}, protocolErr
 				}
 				frozen, repaired, retryable = candidate, true, true
+				input, repairErr = FreezeRequest(s.rolloutID, call.base, frozen, current.Input.Model)
+				if repairErr != nil {
+					return modelResult{}, repairErr
+				}
 			}
 		}
 		if !retryable {
@@ -199,7 +236,7 @@ func (s *Session) generateWithRecovery(ctx context.Context, run *Run, turnID str
 	if s.config.Compaction.Disabled || !errors.As(err, &failure) || !failure.ContextOverflow || ctx.Err() != nil {
 		return frame, err
 	}
-	recovered, _, compactErr := s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, compact: true, noInputs: true, overflow: true, reason: "context_overflow"})
+	recovered, _, compactErr := s.prepareStep(ctx, prepareOptions{runID: run.id, turnID: turnID, compact: true, noInputs: true, overflow: true, reason: "context_overflow", generation: true})
 	if compactErr != nil {
 		return Frame{}, errors.Join(err, compactErr)
 	}

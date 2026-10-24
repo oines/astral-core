@@ -73,12 +73,14 @@ func TestLengthFinishNeverExecutesEvenValidToolJSON(t *testing.T) {
 		t.Fatalf("truncated output entered execution: %v", err)
 	}
 	audited := false
+	for _, attempt := range allAttempts(t, s) {
+		if attempt.Outcome != nil && attempt.Outcome.Reply != nil && attempt.Outcome.Reply.Message.FinishReason == astral.FinishLength {
+			audited = true
+		}
+	}
 	for _, e := range entries(s) {
 		if e.Message != nil && e.Message.Role == astral.RoleAssistant {
 			t.Fatal("truncated assistant entered conversation")
-		}
-		if e.ModelResponse != nil && e.ModelResponse.Reply.Message.FinishReason == astral.FinishLength {
-			audited = true
 		}
 	}
 	if !audited {

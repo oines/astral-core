@@ -175,13 +175,19 @@ func TestInterruptedToolBecomesUnknownAndIsNeverReplayed(t *testing.T) {
 
 type faultStore struct {
 	astral.Store
-	kind  astral.EntryKind
-	after bool
-	fired atomic.Bool
+	kind         astral.EntryKind
+	attemptPhase string
+	after        bool
+	fired        atomic.Bool
 }
 
 func (s *faultStore) Commit(ctx context.Context, id string, c astral.Commit) (astral.Receipt, error) {
 	fail := false
+	for _, mutation := range c.Attempts {
+		if (s.attemptPhase == "create" && mutation.Create != nil || s.attemptPhase == "finish" && mutation.Finish != nil) && !s.fired.Swap(true) {
+			fail = true
+		}
+	}
 	for _, e := range c.Entries {
 		if e.Kind == s.kind && !s.fired.Swap(true) {
 			fail = true

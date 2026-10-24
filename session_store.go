@@ -10,11 +10,25 @@ import (
 )
 
 func (s *Session) appendLocked(ctx context.Context, drafts ...Entry) ([]Entry, error) {
-	entries, err := s.prepareEntriesLocked(drafts)
+	return s.commitLocked(ctx, drafts, nil)
+}
+
+func (s *Session) commitLocked(ctx context.Context, drafts []Entry, attempts []AttemptMutation) ([]Entry, error) {
+	var entries []Entry
+	var err error
+	if len(drafts) > 0 {
+		entries, err = s.prepareEntriesLocked(drafts)
+	}
 	if err != nil {
 		return nil, err
 	}
-	commit := Commit{ID: newID(), ExpectedVersion: s.state.Version, Entries: entries}
+	for i := range attempts {
+		if attempts[i].Create != nil {
+			attempts[i].Create = clone(attempts[i].Create)
+			attempts[i].Create.Version = s.state.Version + 1
+		}
+	}
+	commit := Commit{ID: newID(), ExpectedVersion: s.state.Version, Entries: entries, Attempts: attempts}
 	digest, err := commit.Digest()
 	if err != nil {
 		return nil, err
@@ -167,7 +181,30 @@ func (s *Session) pruneWindow() {
 	s.setWindow(out)
 }
 func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, error) {
-	p := state.Branch
+	return loadContextWindow(ctx, s.config.Store, state.RolloutID, state.Branch, s.config.MaxContextBytes)
+}
+
+// ReadContext projects one immutable node's bounded context, independent of a
+// live Session head. Attempts and branch clones share this reference contract.
+func ReadContext(ctx context.Context, store Store, rolloutID, headID string, maxBytes int) (Context, error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultContextBytes
+	}
+	head, err := store.Get(ctx, rolloutID, headID)
+	if err != nil {
+		return Context{}, err
+	}
+	if head.Projection == nil || head.Projection.HeadID != headID {
+		return Context{}, fmt.Errorf("%w: context head is not a history node", ErrCorrupt)
+	}
+	entries, err := loadContextWindow(ctx, store, rolloutID, *head.Projection, maxBytes)
+	if err != nil {
+		return Context{}, err
+	}
+	return project(entries)
+}
+
+func loadContextWindow(ctx context.Context, store Store, rolloutID string, p Projection, maxBytes int) ([]Entry, error) {
 	if p.HeadID == "" {
 		return nil, nil
 	}
@@ -176,14 +213,14 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 	size := 0
 	cursor := ""
 	for {
-		page, err := s.config.Store.Scan(ctx, state.RolloutID, Query{PathHead: p.HeadID, StopID: p.ThroughID, Cursor: cursor, Limit: DefaultPageSize, MaxBytes: 2 * s.config.MaxContextBytes})
+		page, err := store.Scan(ctx, rolloutID, Query{PathHead: p.HeadID, StopID: p.ThroughID, Cursor: cursor, Limit: DefaultPageSize, MaxBytes: 2 * maxBytes})
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range page.Records {
 			b, _ := json.Marshal(r.Entry)
 			size += len(b)
-			if size > 2*s.config.MaxContextBytes {
+			if size > 2*maxBytes {
 				return nil, ErrBudget
 			}
 			entries = append(entries, r.Entry)
@@ -202,13 +239,13 @@ func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, 
 		if id == "" || seen[id] {
 			continue
 		}
-		r, err := s.config.Store.Get(ctx, state.RolloutID, id)
+		r, err := store.Get(ctx, rolloutID, id)
 		if err != nil {
 			return nil, err
 		}
 		b, _ := json.Marshal(r.Entry)
 		size += len(b)
-		if size > 2*s.config.MaxContextBytes {
+		if size > 2*maxBytes {
 			return nil, ErrBudget
 		}
 		entries = append(entries, r.Entry)

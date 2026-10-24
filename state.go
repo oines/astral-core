@@ -44,13 +44,16 @@ type RuntimeState struct {
 	Approvals     map[string]ApprovalRecord `json:"approvals,omitempty"`
 	PendingInputs map[InputKind]uint64      `json:"pending_inputs,omitempty"`
 	LastRun       *RunRecord                `json:"last_run,omitempty"`
+	// CurrentAttemptID pins the unfinished generation across process restarts.
+	// A committed reply or acknowledged terminal Run clears the pointer.
+	CurrentAttemptID string `json:"current_attempt_id,omitempty"`
 }
 
 // Reduce is the single state transition used by live commits, backend replay,
 // and checkpoint verification. Its cost depends on this batch and unfinished
 // work, never on the total number of historical records.
 func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
-	if c.ID == "" || len(c.Entries) == 0 || c.ExpectedVersion != previous.Version {
+	if c.ID == "" || len(c.Entries)+len(c.Attempts) == 0 || c.ExpectedVersion != previous.Version || previous.Version == 0 && len(c.Entries) == 0 {
 		return RuntimeState{}, nil, ErrConflict
 	}
 	if previous.Version > 0 && !SupportsFormat(previous.FormatVersion) {
@@ -110,8 +113,6 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			return RuntimeState{}, nil, fmt.Errorf("%w: operational parent", ErrCorrupt)
 		}
 		switch e.Kind {
-		case EntryModelRequest, EntryModelResponse:
-			state.FormatVersion = FormatVersion
 		case EntryConfiguration:
 			state.Branch.ConfigurationID = e.ID
 		case EntryContext:
@@ -126,7 +127,15 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 				return RuntimeState{}, nil, ErrOutcomeUnknown
 			}
 			state.Branch.LastMessageID = e.ID
+			if e.Message.Role == RoleAssistant {
+				state.CurrentAttemptID = ""
+			}
 			state.Branch.BatchConfigurationID = state.Branch.ConfigurationID
+			if e.Generation != nil {
+				// Model selection may advance the branch while a request is in
+				// flight. Its tool batch belongs to the configuration it actually saw.
+				state.Branch.BatchConfigurationID = e.Generation.ConfigurationID
+			}
 			state.Branch.PendingCalls = nil
 			state.Branch.ToolEntries = nil
 			state.Tools = nil
@@ -295,6 +304,12 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			state.Branch.ThroughID = e.Compaction.ThroughID
 		case EntryRun:
 			state.LastRun = clone(e.Run)
+			if e.Run.Status == "failed" || e.Run.Status == "cancelled" {
+				// An acknowledged stop ends this logical generation. A later
+				// Continue may apply queued steering and the current configuration.
+				// A process crash has no terminal Run commit and retains the input.
+				state.CurrentAttemptID = ""
+			}
 		}
 		r := Record{Entry: e}
 		if e.IsHistory() {
@@ -302,6 +317,18 @@ func Reduce(previous RuntimeState, c Commit) (RuntimeState, []Record, error) {
 			r.Projection = &p
 		}
 		records = append(records, r)
+	}
+	createdAttempt := false
+	for _, mutation := range c.Attempts {
+		if a := mutation.Create; a != nil {
+			if createdAttempt || a.ID != mutation.ID || a.SessionID != state.SessionID || a.Version != previous.Version+1 || a.Input.RolloutID != state.RolloutID {
+				return RuntimeState{}, nil, fmt.Errorf("%w: attempt identity or version", ErrCorrupt)
+			}
+			createdAttempt = true
+			if a.Purpose == "generation" {
+				state.CurrentAttemptID = a.ID
+			}
+		}
 	}
 	state.Version = previous.Version + 1
 	return state, records, nil
