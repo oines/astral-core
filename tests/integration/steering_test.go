@@ -12,14 +12,14 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
 type inputEndpoint interface {
-	Start(context.Context, astral.Message, ...astral.InputOptions) (*astral.Run, error)
-	Steer(context.Context, astral.Message, ...astral.InputOptions) (string, error)
-	FollowUp(context.Context, astral.Message, ...astral.InputOptions) (string, error)
+	Prompt(context.Context, astral.Input) (astral.PromptResult, error)
+	Steer(context.Context, astral.Input) (astral.InputReceipt, error)
+	FollowUp(context.Context, astral.Input) (astral.InputReceipt, error)
 }
 
 func steeringMessage(i int) astral.Message {
@@ -45,10 +45,10 @@ func TestMaxSteeringPerTurnConfiguration(t *testing.T) {
 			m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 				return answer("unused"), nil
 			})
-			core, coreErr := astral.New(astral.Config{Model: m, MaxSteeringPerTurn: limit})
+			core, coreErr := newMemorySession(astral.Config{Model: m, MaxSteeringPerTurn: limit})
 			c := testConfig(m, memory.New())
 			c.MaxSteeringPerTurn = limit
-			manager, sessionErr := sessions.New(c)
+			manager, sessionErr := astral.NewSession(context.Background(), c, astral.SessionOptions{})
 			if core != nil {
 				defer core.Close(context.Background())
 			}
@@ -66,7 +66,7 @@ func TestMaxSteeringPerTurnConfiguration(t *testing.T) {
 	}
 }
 
-func exerciseSteering(t *testing.T, store sessions.Store, limit, count int) ([]astral.Request, []string) {
+func exerciseSteering(t *testing.T, store astral.Store, limit, count int) ([]astral.Request, []string) {
 	t.Helper()
 	ctx := context.Background()
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -83,7 +83,7 @@ func exerciseSteering(t *testing.T, store sessions.Store, limit, count int) ([]a
 	})
 	var endpoint inputEndpoint
 	if store == nil {
-		a, err := astral.New(astral.Config{Model: m, MaxSteeringPerTurn: limit})
+		a, err := newMemorySession(astral.Config{Model: m, MaxSteeringPerTurn: limit})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,20 +92,20 @@ func exerciseSteering(t *testing.T, store sessions.Store, limit, count int) ([]a
 	} else {
 		c := testConfig(m, store)
 		c.MaxSteeringPerTurn = limit
-		endpoint = newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		endpoint = newSession(t, newSessions(t, c), astral.SessionOptions{})
 	}
-	run, err := endpoint.Start(ctx, astral.User("initial"))
+	run, err := prompt(endpoint, ctx, astral.User("initial"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	signal(t, entered)
-	if _, err := endpoint.FollowUp(ctx, astral.User("follow-0")); err != nil {
+	if _, err := followUp(endpoint, ctx, astral.User("follow-0")); err != nil {
 		t.Fatal(err)
 	}
 	var ids []string
 	for i := 0; i < count; i++ {
 		message := steeringMessage(i)
-		id, err := endpoint.Steer(ctx, message)
+		id, err := steer(endpoint, ctx, message)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -113,7 +113,7 @@ func exerciseSteering(t *testing.T, store sessions.Store, limit, count int) ([]a
 		message.Content[0].Text = "mutated by host"
 		message.Metadata[0] = '!'
 		if i == 0 {
-			if _, err := endpoint.FollowUp(ctx, astral.User("follow-1")); err != nil {
+			if _, err := followUp(endpoint, ctx, astral.User("follow-1")); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -149,7 +149,7 @@ func TestSteeringConfigurationPreservesDefaultsAndCoreSessionOrder(t *testing.T)
 	for _, test := range []struct{ limit, count int }{{0, 1}, {0, 3}, {1, 3}, {2, 5}, {16, 3}, {16, 19}} {
 		t.Run(fmt.Sprintf("limit=%d/count=%d", test.limit, test.count), func(t *testing.T) {
 			core, _ := exerciseSteering(t, nil, test.limit, test.count)
-			eachStore(t, func(t *testing.T, underlying sessions.Store) {
+			eachStore(t, func(t *testing.T, underlying astral.Store) {
 				capture := &capturedStore{Store: underlying}
 				persistent, ids := exerciseSteering(t, capture, test.limit, test.count)
 				if !reflect.DeepEqual(core, persistent) {
@@ -161,13 +161,16 @@ func TestSteeringConfigurationPreservesDefaultsAndCoreSessionOrder(t *testing.T)
 				for _, commit := range capture.commits {
 					steers, followups := 0, 0
 					for i, entry := range commit.Entries {
-						if entry.Kind != sessions.EntryInputConsumed {
+						if entry.Kind != astral.EntryInputConsumed {
 							continue
 						}
-						if i == 0 || commit.Entries[i-1].Kind != sessions.EntryMessage || commit.Entries[i-1].Message.Role != astral.RoleUser {
+						if i == 0 || commit.Entries[i-1].Kind != astral.EntryMessage || commit.Entries[i-1].Message.Role != astral.RoleUser {
 							t.Fatal("input consumption is not atomically paired with its message")
 						}
-						if entry.Input.Kind == sessions.InputSteer {
+						if entry.Input.Kind == astral.InputSteer {
+							if commit.Entries[i-1].Message.Content[0].Text == "initial" {
+								continue
+							}
 							steers++
 							if !reflect.DeepEqual(*commit.Entries[i-1].Message, steeringMessage(len(consumed))) {
 								t.Fatal("consumed input ID was paired with the wrong message")
@@ -190,55 +193,55 @@ func TestSteeringConfigurationPreservesDefaultsAndCoreSessionOrder(t *testing.T)
 }
 
 type steeringFaultStore struct {
-	sessions.Store
+	astral.Store
 	mode             string
 	fired            atomic.Bool
 	entered, release chan struct{}
 }
 
-func (s *steeringFaultStore) Commit(ctx context.Context, id string, c sessions.Commit) (sessions.Receipt, error) {
+func (s *steeringFaultStore) Commit(ctx context.Context, id string, c astral.Commit) (astral.Receipt, error) {
 	selected := false
 	for _, entry := range c.Entries {
-		if entry.Kind == sessions.EntryInputConsumed && !s.fired.Swap(true) {
+		if entry.Kind == astral.EntryInputConsumed && !s.fired.Swap(true) {
 			selected = true
 		}
 	}
 	if selected {
 		switch s.mode {
 		case "failure":
-			return sessions.Receipt{}, errors.New("injected input commit failure")
+			return astral.Receipt{}, errors.New("injected input commit failure")
 		case "conflict":
-			return sessions.Receipt{}, sessions.ErrConflict
+			return astral.Receipt{}, astral.ErrConflict
 		case "blocked", "cancel":
 			close(s.entered)
 			select {
 			case <-s.release:
 			case <-ctx.Done():
-				return sessions.Receipt{}, ctx.Err()
+				return astral.Receipt{}, ctx.Err()
 			}
 		}
 	}
 	receipt, err := s.Store.Commit(ctx, id, c)
 	if err == nil && selected && (s.mode == "lost-ack" || s.mode == "unconfirmed") {
-		return sessions.Receipt{}, errors.New("injected lost input commit receipt")
+		return astral.Receipt{}, errors.New("injected lost input commit receipt")
 	}
 	return receipt, err
 }
 
-func (s *steeringFaultStore) LookupCommit(ctx context.Context, id, key string) (sessions.Receipt, error) {
+func (s *steeringFaultStore) LookupCommit(ctx context.Context, id, key string) (astral.Receipt, error) {
 	if s.mode == "unconfirmed" && s.fired.Load() {
-		return sessions.Receipt{}, errors.New("injected unavailable confirmation")
+		return astral.Receipt{}, errors.New("injected unavailable confirmation")
 	}
 	return s.Store.LookupCommit(ctx, id, key)
 }
 
 func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
-	for _, backend := range []string{"memory", "jsonl", "sqlite"} {
+	for _, backend := range []string{"memory", "sqlite"} {
 		for _, mode := range []string{"failure", "conflict", "lost-ack", "unconfirmed", "cancel"} {
 			t.Run(backend+"/"+mode, func(t *testing.T) {
 				ctx := context.Background()
 				dir := t.TempDir()
-				var store sessions.Store = memory.New()
+				var store astral.Store = memory.New()
 				closeStore := func() {}
 				if backend != "memory" {
 					store, closeStore = durableStore(t, backend, dir)
@@ -250,12 +253,12 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 				})
 				c := testConfig(m, fault)
 				c.MaxSteeringPerTurn = 16
-				a := newAgent(t, c)
-				s := newSession(t, a, sessions.SessionOptions{ID: "input-recovery"})
+				a := newSessions(t, c)
+				s := newSession(t, a, astral.SessionOptions{ID: "input-recovery"})
 				seedCompletedBoundary(t, s, store)
 				var ids []string
 				for i := 0; i < 3; i++ {
-					id, err := s.Steer(ctx, steeringMessage(i))
+					id, err := steer(s, ctx, steeringMessage(i))
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -273,7 +276,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 				if (mode == "lost-ack") != (err == nil) {
 					t.Fatalf("unexpected injected outcome: %v", err)
 				}
-				if mode == "conflict" && !errors.Is(err, sessions.ErrConflict) {
+				if mode == "conflict" && !errors.Is(err, astral.ErrConflict) {
 					t.Fatalf("conflict was hidden: %v", err)
 				}
 				if mode == "cancel" && !errors.Is(err, context.Canceled) {
@@ -287,7 +290,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 					store, closeStore = durableStore(t, backend, dir)
 				}
 				c.Store = store
-				a = newAgent(t, c)
+				a = newSessions(t, c)
 				s, err = a.OpenSession(ctx, "input-recovery")
 				if err != nil {
 					t.Fatal(err)
@@ -297,7 +300,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 				if written {
 					wantPending = 0
 				}
-				if s.State().PendingInputs[sessions.InputSteer] != wantPending || len(entries(s)) == 0 {
+				if s.State().PendingInputs[astral.InputSteer] != wantPending || len(entries(s)) == 0 {
 					t.Fatal("partial input batch recovered")
 				}
 				for _, e := range entries(s) {
@@ -326,17 +329,17 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 				var consumed []string
 				var version uint64
 				for i, e := range snapshot.Entries {
-					if e.Kind != sessions.EntryInputConsumed {
+					if e.Kind != astral.EntryInputConsumed {
 						continue
 					}
 					previous := snapshot.Entries[i-1]
-					if previous.Kind != sessions.EntryMessage || previous.Version != e.Version || previous.Sequence+1 != e.Sequence || (version != 0 && version != e.Version) || !reflect.DeepEqual(*previous.Message, steeringMessage(len(consumed))) {
+					if previous.Kind != astral.EntryMessage || previous.Version != e.Version || previous.Sequence+1 != e.Sequence || (version != 0 && version != e.Version) || !reflect.DeepEqual(*previous.Message, steeringMessage(len(consumed))) {
 						t.Fatal("message/consumption facts were not one atomic commit")
 					}
 					version = e.Version
 					consumed = append(consumed, e.Input.ID)
 				}
-				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != 6 {
+				if !reflect.DeepEqual(consumed, ids) || len(s.State().PendingInputs) != 0 || s.State().FormatVersion != astral.FormatVersion {
 					t.Fatal("consumed IDs or V6 state changed during recovery")
 				}
 			})
@@ -345,7 +348,7 @@ func TestSteeringAtomicCommitAndColdRecovery(t *testing.T) {
 }
 
 func TestSteeringArrivingDuringCommitWaitsForNextBoundary(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		fault := &steeringFaultStore{Store: store, mode: "blocked", entered: make(chan struct{}), release: make(chan struct{})}
 		entered, release := make(chan struct{}), make(chan struct{})
@@ -365,10 +368,10 @@ func TestSteeringArrivingDuringCommitWaitsForNextBoundary(t *testing.T) {
 		})
 		c := testConfig(m, fault)
 		c.MaxSteeringPerTurn = 16
-		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		seedCompletedBoundary(t, s, store)
 		for i := 0; i < 3; i++ {
-			if _, err := s.Steer(ctx, steeringMessage(i)); err != nil {
+			if _, err := steer(s, ctx, steeringMessage(i)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -378,7 +381,7 @@ func TestSteeringArrivingDuringCommitWaitsForNextBoundary(t *testing.T) {
 		}
 		signal(t, fault.entered)
 		queued := make(chan error, 1)
-		go func() { _, err := s.Steer(ctx, steeringMessage(3)); queued <- err }()
+		go func() { _, err := steer(s, ctx, steeringMessage(3)); queued <- err }()
 		close(fault.release)
 		signal(t, entered)
 		select {
@@ -397,8 +400,8 @@ func TestSteeringArrivingDuringCommitWaitsForNextBoundary(t *testing.T) {
 	})
 }
 
-func TestSteeringByteBudgetConsumesOnlyPrefixAndRetainsOversizedHead(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+func TestSteeringByteBudgetCommitsNoPartialSelectedBatch(t *testing.T) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		entered, release := make(chan struct{}), make(chan struct{})
 		m := model(func(ctx context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
@@ -414,41 +417,41 @@ func TestSteeringByteBudgetConsumesOnlyPrefixAndRetainsOversizedHead(t *testing.
 		})
 		c := testConfig(m, store)
 		c.MaxContextBytes, c.MaxSteeringPerTurn = 4096, 16
-		a := newAgent(t, c)
-		s := newSession(t, a, sessions.SessionOptions{ID: "byte-prefix"})
+		a := newSessions(t, c)
+		s := newSession(t, a, astral.SessionOptions{ID: "byte-prefix"})
 		initial := astral.User("")
 		probe := astral.Request{ModelID: m.Spec().ID, MaxOutputTokens: 16384, Messages: []astral.Message{initial, answer("answer").Message, steeringMessage(0), steeringMessage(1)}}
 		raw, _ := json.Marshal(probe)
 		initial.Content[0].Text = strings.Repeat("h", 4096-len(raw)-32)
-		run, err := s.Start(ctx, initial)
+		run, err := prompt(s, ctx, initial)
 		if err != nil {
 			t.Fatal(err)
 		}
 		signal(t, entered)
 		var ids []string
 		for i := 0; i < 3; i++ {
-			id, err := s.Steer(ctx, steeringMessage(i))
+			id, err := steer(s, ctx, steeringMessage(i))
 			if err != nil {
 				t.Fatal(err)
 			}
 			ids = append(ids, id)
 		}
 		close(release)
-		if _, err := wait(t, run); !errors.Is(err, sessions.ErrBudget) {
+		if _, err := wait(t, run); !errors.Is(err, astral.ErrBudget) {
 			t.Fatalf("oversized head did not stop the next boundary: %v", err)
 		}
-		if len(m.observed()) != 2 || !reflect.DeepEqual(userMessages(m.observed()[1]), []astral.Message{initial, steeringMessage(0), steeringMessage(1)}) {
-			t.Fatal("byte admission did not select the fitting FIFO prefix")
+		if len(m.observed()) != 1 {
+			t.Fatal("failed preparation partially consumed its selected batch")
 		}
-		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{Kind: sessions.EntryInputQueued, InputKind: sessions.InputSteer, Limit: 16, MaxBytes: 4096})
-		if err != nil || len(pending.Records) != 1 || pending.Records[0].Entry.Input.ID != ids[2] {
+		pending, err := store.Pending(ctx, s.ID(), astral.PendingQuery{Kind: astral.EntryInputQueued, InputKind: astral.InputSteer, Limit: 16, MaxBytes: 4096})
+		if err != nil || len(pending.Records) != 3 || pending.Records[0].Entry.Input.ID != ids[0] || pending.Records[2].Entry.Input.ID != ids[2] {
 			t.Fatalf("oversized head was discarded: %+v %v", pending, err)
 		}
 		if err := a.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
 		c.MaxContextBytes = 8192
-		s, err = newAgent(t, c).OpenSession(ctx, s.ID())
+		s, err = newSessions(t, c).OpenSession(ctx, s.ID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -457,26 +460,26 @@ func TestSteeringByteBudgetConsumesOnlyPrefixAndRetainsOversizedHead(t *testing.
 			t.Fatal(err)
 		}
 		waitOK(t, run)
-		if len(m.observed()) != 3 || !reflect.DeepEqual(userMessages(m.observed()[2]), []astral.Message{initial, steeringMessage(0), steeringMessage(1), steeringMessage(2)}) {
+		if len(m.observed()) != 2 || !reflect.DeepEqual(userMessages(m.observed()[1]), []astral.Message{initial, steeringMessage(0), steeringMessage(1), steeringMessage(2)}) {
 			t.Fatal("retained input did not resume in FIFO order")
 		}
 	})
 }
 
 func TestOversizedInputBatchRejectedBeforeAdmission(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 			return answer("unused"), nil
 		})
 		c := testConfig(m, store)
 		c.MaxContextBytes = 4096
-		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		before := s.State()
 		large := astral.User(strings.Repeat("x", 5000))
-		if _, err := s.Steer(context.Background(), large); !errors.Is(err, sessions.ErrBudget) {
+		if _, err := steer(s, context.Background(), large); !errors.Is(err, astral.ErrBudget) {
 			t.Fatal(err)
 		}
-		if _, err := s.InjectContext(context.Background(), []astral.Message{large}); !errors.Is(err, sessions.ErrBudget) {
+		if _, err := inject(s, context.Background(), []astral.Message{large}); !errors.Is(err, astral.ErrBudget) {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(before, s.State()) || len(m.observed()) != 0 {
@@ -486,7 +489,7 @@ func TestOversizedInputBatchRejectedBeforeAdmission(t *testing.T) {
 }
 
 func TestSteeringLaterArrivalsUseTheFollowingRequestInCoreAndSession(t *testing.T) {
-	exercise := func(t *testing.T, store sessions.Store) []astral.Request {
+	exercise := func(t *testing.T, store astral.Store) []astral.Request {
 		ctx := context.Background()
 		entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
 		release := []chan struct{}{make(chan struct{}), make(chan struct{})}
@@ -503,7 +506,7 @@ func TestSteeringLaterArrivalsUseTheFollowingRequestInCoreAndSession(t *testing.
 		})
 		var endpoint inputEndpoint
 		if store == nil {
-			a, err := astral.New(astral.Config{Model: m, MaxSteeringPerTurn: 16})
+			a, err := newMemorySession(astral.Config{Model: m, MaxSteeringPerTurn: 16})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -512,21 +515,21 @@ func TestSteeringLaterArrivalsUseTheFollowingRequestInCoreAndSession(t *testing.
 		} else {
 			c := testConfig(m, store)
 			c.MaxSteeringPerTurn = 16
-			endpoint = newSession(t, newAgent(t, c), sessions.SessionOptions{})
+			endpoint = newSession(t, newSessions(t, c), astral.SessionOptions{})
 		}
-		run, err := endpoint.Start(ctx, astral.User("initial"))
+		run, err := prompt(endpoint, ctx, astral.User("initial"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		signal(t, entered[0])
 		for i := 0; i < 3; i++ {
-			if _, err := endpoint.Steer(ctx, steeringMessage(i)); err != nil {
+			if _, err := steer(endpoint, ctx, steeringMessage(i)); err != nil {
 				t.Fatal(err)
 			}
 		}
 		close(release[0])
 		signal(t, entered[1])
-		if _, err := endpoint.Steer(ctx, steeringMessage(3)); err != nil {
+		if _, err := steer(endpoint, ctx, steeringMessage(3)); err != nil {
 			t.Fatal(err)
 		}
 		close(release[1])
@@ -538,7 +541,7 @@ func TestSteeringLaterArrivalsUseTheFollowingRequestInCoreAndSession(t *testing.
 		return requests
 	}
 	core := exercise(t, nil)
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		if !reflect.DeepEqual(core, exercise(t, store)) {
 			t.Fatal("later-arrival request order differs between Core and Session")
 		}
@@ -546,18 +549,18 @@ func TestSteeringLaterArrivalsUseTheFollowingRequestInCoreAndSession(t *testing.
 }
 
 func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 			return answer("done"), nil
 		})
-		s := newSession(t, newAgent(t, testConfig(m, store)), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, testConfig(m, store)), astral.SessionOptions{})
 		seedCompletedBoundary(t, s, store)
 		message := steeringMessage(0)
 		// The input ID may equal its queued record's entry ID. A new
 		// message must keep a fresh history identity when this input is consumed.
-		queued := sessions.Entry{ID: "existing-input", Kind: sessions.EntryInputQueued, Input: &sessions.InputRecord{ID: "existing-input", Kind: sessions.InputSteer, Message: &message}}
-		if err := appendStore(ctx, store, s.ID(), s.State().Version, []sessions.Entry{queued}); err != nil {
+		queued := astral.Entry{ID: "existing-input", Kind: astral.EntryInputQueued, Input: &astral.InputRecord{ID: "existing-input", Kind: astral.InputSteer, Message: &message}}
+		if err := appendStore(ctx, store, s.ID(), s.State().Version, []astral.Entry{queued}); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Reload(ctx); err != nil {
@@ -571,7 +574,7 @@ func TestSteeringInputIDRemainsDistinctFromHistoryEntryIdentity(t *testing.T) {
 		if len(m.observed()) != 1 || !reflect.DeepEqual(userMessages(m.observed()[0]), []astral.Message{message}) {
 			t.Fatal("existing queued identity could not be consumed")
 		}
-		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{Kind: sessions.EntryInputQueued})
+		pending, err := store.Pending(ctx, s.ID(), astral.PendingQuery{Kind: astral.EntryInputQueued})
 		if err != nil || len(pending.Records) != 0 {
 			t.Fatal("existing input was not marked consumed")
 		}

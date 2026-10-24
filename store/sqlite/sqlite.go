@@ -11,14 +11,14 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	core "github.com/oines/astral-core"
-	s "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/internal/historypage"
 	"github.com/oines/astral-core/store/internal/pending"
 	"github.com/oines/astral-core/store/internal/targetlock"
@@ -42,9 +42,9 @@ func (st *Store) Stats() Statistics {
 }
 func (st *Store) Close() error { return st.db.Close() }
 
-const schema = `
+var schema = fmt.Sprintf(`
 CREATE TABLE format(version INTEGER NOT NULL);
-INSERT INTO format VALUES(6);
+INSERT INTO format VALUES(%d);
 CREATE TABLE rollouts(id TEXT PRIMARY KEY,status TEXT NOT NULL,seq INTEGER NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY,rollout_id TEXT NOT NULL,ready INTEGER NOT NULL,state BLOB NOT NULL,fork_digest TEXT NOT NULL DEFAULT '');
 CREATE INDEX session_rollout ON sessions(rollout_id,id);
@@ -60,8 +60,14 @@ CREATE TABLE pending(rollout_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT
 CREATE INDEX pending_order ON pending(session_id,kind,input_kind,seq);
 CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
-PRAGMA user_version=6;
-`
+CREATE TABLE inputs(session_id TEXT NOT NULL,id TEXT NOT NULL,kind TEXT NOT NULL,digest TEXT NOT NULL,accepted_at TEXT NOT NULL,payload BLOB NOT NULL,state TEXT NOT NULL,entry_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(session_id,id));
+CREATE INDEX input_status ON inputs(session_id,kind,state);
+CREATE TABLE attempts(session_id TEXT NOT NULL,id TEXT NOT NULL,rollout_id TEXT NOT NULL,version INTEGER NOT NULL,purpose TEXT NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(session_id,id),UNIQUE(session_id,version));
+CREATE INDEX attempt_purpose ON attempts(session_id,purpose,version);
+CREATE INDEX attempt_rollout ON attempts(rollout_id);
+
+PRAGMA user_version=%d;
+`, core.FormatVersion, core.FormatVersion)
 
 // CROSS JOIN keeps the bounded chain on the outside of each indexed lookup.
 // Without it SQLite can scan every entry in the session before joining a page.
@@ -74,7 +80,7 @@ func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, core.ErrInvalid
 	}
-	abs, err := filepath.Abs(path)
+	abs, err := databasePath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -86,12 +92,12 @@ func Open(path string) (*Store, error) {
 		if readErr == nil && string(head[:]) == "SQLite format 3\x00" {
 			existing = true
 		} else if n != 0 {
-			return nil, s.ErrUnsupportedFormat
+			return nil, core.ErrUnsupportedFormat
 		}
 	} else if !errors.Is(openErr, os.ErrNotExist) {
 		return nil, openErr
 	}
-	uri := url.URL{Scheme: "file", Path: abs}
+	uri := databaseURI(abs, runtime.GOOS)
 	// Inspect an existing database before any schema or journal mutation.
 	if existing {
 		check, err := sql.Open("sqlite", uri.String()+"?mode=ro")
@@ -101,12 +107,9 @@ func Open(path string) (*Store, error) {
 		var version int
 		err = check.QueryRow("SELECT version FROM format").Scan(&version)
 		check.Close()
-		if err != nil || version != s.FormatVersion {
-			return nil, s.ErrUnsupportedFormat
+		if err != nil || !core.SupportsFormat(version) {
+			return nil, core.ErrUnsupportedFormat
 		}
-	}
-	if err = os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
-		return nil, err
 	}
 	values := url.Values{}
 	values.Set("_txlock", "immediate")
@@ -119,9 +122,6 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	if resolved, e := filepath.EvalSymlinks(abs); e == nil {
-		abs = resolved
-	}
 	st := &Store{db: db, path: abs}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -144,67 +144,64 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if resolved, e := filepath.EvalSymlinks(abs); e == nil {
-		st.path = resolved
-	}
 	return st, nil
 }
-func decodeState(raw []byte, id string) (s.RuntimeState, error) {
-	var state s.RuntimeState
+func decodeState(raw []byte, id string) (core.RuntimeState, error) {
+	var state core.RuntimeState
 	if err := json.Unmarshal(raw, &state); err != nil {
-		return state, s.ErrCorrupt
+		return state, core.ErrCorrupt
 	}
-	if state.FormatVersion != s.FormatVersion {
-		return state, s.ErrUnsupportedFormat
+	if !core.SupportsFormat(state.FormatVersion) {
+		return state, core.ErrUnsupportedFormat
 	}
 	if state.SessionID != id || state.RolloutID == "" || state.Version == 0 {
-		return state, s.ErrCorrupt
+		return state, core.ErrCorrupt
 	}
 	return state, nil
 }
-func (st *Store) LoadState(ctx context.Context, id string) (s.RuntimeState, error) {
+func (st *Store) LoadState(ctx context.Context, id string) (core.RuntimeState, error) {
 	var raw []byte
 	err := st.db.QueryRowContext(ctx, "SELECT s.state FROM sessions s JOIN rollouts r ON r.id=s.rollout_id WHERE s.id=? AND s.ready=1 AND r.status='active'", id).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return s.RuntimeState{}, s.ErrNotFound
+		return core.RuntimeState{}, core.ErrNotFound
 	}
 	if err != nil {
-		return s.RuntimeState{}, err
+		return core.RuntimeState{}, err
 	}
 	st.rows.Add(1)
 	return decodeState(raw, id)
 }
-func decodeRecord(payload, projection []byte) (s.Record, error) {
-	var r s.Record
+func decodeRecord(payload, projection []byte) (core.Record, error) {
+	var r core.Record
 	if json.Unmarshal(payload, &r.Entry) != nil {
-		return r, s.ErrCorrupt
+		return r, core.ErrCorrupt
 	}
 	if len(projection) > 0 {
 		if json.Unmarshal(projection, &r.Projection) != nil {
-			return r, s.ErrCorrupt
+			return r, core.ErrCorrupt
 		}
 	}
 	return r, nil
 }
-func (st *Store) Get(ctx context.Context, id, key string) (s.Record, error) {
+func (st *Store) Get(ctx context.Context, id, key string) (core.Record, error) {
 	var payload, projection []byte
 	err := st.db.QueryRowContext(ctx, "SELECT e.payload,e.projection FROM entries e JOIN rollouts r ON r.id=e.rollout_id WHERE e.rollout_id=? AND e.id=? AND r.status='active'", id, key).Scan(&payload, &projection)
 	if errors.Is(err, sql.ErrNoRows) {
-		return s.Record{}, s.ErrNotFound
+		return core.Record{}, core.ErrNotFound
 	}
 	if err != nil {
-		return s.Record{}, err
+		return core.Record{}, err
 	}
 	st.rows.Add(1)
 	return decodeRecord(payload, projection)
 }
-func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, error) {
-	var r s.Receipt
+func (st *Store) LookupCommit(ctx context.Context, id, key string) (core.Receipt, error) {
+	var r core.Receipt
 	var raw []byte
 	r.CommitID = key
 	err := st.db.QueryRowContext(ctx, "SELECT r.version,r.digest,r.first_seq,r.last_seq,s.state FROM receipts r JOIN sessions s ON s.id=r.session_id JOIN rollouts o ON o.id=s.rollout_id WHERE r.session_id=? AND r.commit_id=? AND s.ready=1 AND o.status='active'", id, key).Scan(&r.Version, &r.Digest, &r.FirstSequence, &r.LastSequence, &raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return r, s.ErrNotFound
+		return r, core.ErrNotFound
 	}
 	if err != nil {
 		return r, err
@@ -214,8 +211,8 @@ func (st *Store) LookupCommit(ctx context.Context, id, key string) (s.Receipt, e
 	st.rows.Add(1)
 	return r, err
 }
-func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error) {
-	limit, maxBytes := s.PageLimits(q.Limit, q.MaxBytes)
+func (st *Store) Scan(ctx context.Context, id string, q core.Query) (core.Page, error) {
+	limit, maxBytes := core.PageLimits(q.Limit, q.MaxBytes)
 	var query string
 	var args []any
 	if q.PathHead != "" {
@@ -250,7 +247,7 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 		if q.Cursor != "" {
 			seq, err := strconv.ParseUint(q.Cursor, 10, 63)
 			if err != nil {
-				return s.Page{}, core.ErrInvalid
+				return core.Page{}, core.ErrInvalid
 			}
 			if q.Reverse {
 				query += " AND e.seq<?"
@@ -269,15 +266,15 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 	}
 	rows, err := st.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return s.Page{}, err
+		return core.Page{}, err
 	}
 	defer rows.Close()
-	page := s.Page{}
+	page := core.Page{}
 	size := 0
 	for rows.Next() {
 		var payload, projection []byte
 		if err = rows.Scan(&payload, &projection); err != nil {
-			return s.Page{}, err
+			return core.Page{}, err
 		}
 		st.rows.Add(1)
 		recordBytes := len(payload) + len(`{"entry":}`)
@@ -286,7 +283,7 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 		}
 		if len(page.Records) == limit || size+recordBytes > maxBytes {
 			if len(page.Records) == 0 {
-				return s.Page{}, s.ErrBudget
+				return core.Page{}, core.ErrBudget
 			}
 			last := page.Records[len(page.Records)-1].Entry
 			if q.PathHead != "" {
@@ -298,10 +295,10 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 		}
 		r, err := decodeRecord(payload, projection)
 		if err != nil {
-			return s.Page{}, err
+			return core.Page{}, err
 		}
 		if q.PathHead != "" && r.Projection == nil {
-			return s.Page{}, s.ErrNotFound
+			return core.Page{}, core.ErrNotFound
 		}
 		page.Records = append(page.Records, r)
 		size += recordBytes
@@ -310,20 +307,20 @@ func (st *Store) Scan(ctx context.Context, id string, q s.Query) (s.Page, error)
 		}
 	}
 	if err = rows.Err(); err != nil {
-		return s.Page{}, err
+		return core.Page{}, err
 	}
 	if len(page.Records) == 0 {
 		if err = st.activeRollout(ctx, id); err != nil {
-			return s.Page{}, err
+			return core.Page{}, err
 		}
 		if q.PathHead != "" {
-			return s.Page{}, s.ErrNotFound
+			return core.Page{}, core.ErrNotFound
 		}
 	}
 	return page, nil
 }
-func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Page, error) {
-	limit, maxBytes := s.PageLimits(q.Limit, q.MaxBytes)
+func (st *Store) Pending(ctx context.Context, id string, q core.PendingQuery) (core.Page, error) {
+	limit, maxBytes := core.PageLimits(q.Limit, q.MaxBytes)
 	query := "SELECT p.payload FROM pending p JOIN sessions s ON s.id=p.session_id JOIN rollouts r ON r.id=s.rollout_id WHERE p.session_id=? AND s.ready=1 AND r.status='active'"
 	args := []any{id}
 	if q.Kind != "" {
@@ -334,10 +331,14 @@ func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Pa
 		query += " AND p.input_kind=?"
 		args = append(args, string(q.InputKind))
 	}
+	if q.InputID != "" {
+		query += " AND p.kind=? AND p.key=?"
+		args = append(args, string(core.EntryInputQueued), q.InputID)
+	}
 	if q.Cursor != "" {
 		cursor, err := strconv.ParseUint(q.Cursor, 10, 63)
 		if err != nil {
-			return s.Page{}, core.ErrInvalid
+			return core.Page{}, core.ErrInvalid
 		}
 		query += " AND p.seq>?"
 		args = append(args, cursor)
@@ -346,34 +347,34 @@ func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Pa
 	args = append(args, limit+1)
 	rows, err := st.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return s.Page{}, err
+		return core.Page{}, err
 	}
 	defer rows.Close()
-	page := s.Page{}
+	page := core.Page{}
 	size := 0
 	for rows.Next() {
 		var raw []byte
 		if err = rows.Scan(&raw); err != nil {
-			return s.Page{}, err
+			return core.Page{}, err
 		}
 		st.rows.Add(1)
 		recordBytes := len(raw) + len(`{"entry":}`)
 		if len(page.Records) == limit || size+recordBytes > maxBytes {
 			if len(page.Records) == 0 {
-				return s.Page{}, s.ErrBudget
+				return core.Page{}, core.ErrBudget
 			}
 			page.Next = strconv.FormatUint(page.Records[len(page.Records)-1].Entry.Sequence, 10)
 			break
 		}
-		var e s.Entry
+		var e core.Entry
 		if json.Unmarshal(raw, &e) != nil {
-			return s.Page{}, s.ErrCorrupt
+			return core.Page{}, core.ErrCorrupt
 		}
-		page.Records = append(page.Records, s.Record{Entry: e})
+		page.Records = append(page.Records, core.Record{Entry: e})
 		size += recordBytes
 	}
 	if err = rows.Err(); err != nil {
-		return s.Page{}, err
+		return core.Page{}, err
 	}
 	if len(page.Records) == 0 {
 		_, err = st.LoadState(ctx, id)
@@ -383,25 +384,20 @@ func (st *Store) Pending(ctx context.Context, id string, q s.PendingQuery) (s.Pa
 func conflict(err error) error {
 	var code interface{ Code() int }
 	if errors.As(err, &code) && code.Code()&255 == 19 {
-		return fmt.Errorf("%w: %v", s.ErrConflict, err)
+		return fmt.Errorf("%w: %v", core.ErrConflict, err)
 	}
 	return err
-}
-func equal(a, b any) bool {
-	x, e := json.Marshal(a)
-	y, f := json.Marshal(b)
-	return e == nil && f == nil && string(x) == string(y)
 }
 func (st *Store) activeRollout(ctx context.Context, id string) error {
 	var one int
 	err := st.db.QueryRowContext(ctx, "SELECT 1 FROM rollouts WHERE id=? AND status='active'", id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
-		return s.ErrNotFound
+		return core.ErrNotFound
 	}
 	return err
 }
-func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.Receipt, err error) {
-	if id == "" || c.ID == s.ForkCommitID || len(c.Entries) == 0 {
+func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (receipt core.Receipt, err error) {
+	if id == "" || c.ID == core.ForkCommitID || len(c.Entries)+len(c.Attempts) == 0 {
 		return receipt, core.ErrInvalid
 	}
 	digest, err := c.Digest()
@@ -419,7 +415,7 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	var raw []byte
 	var rolloutID string
 	var ready int
-	state := s.RuntimeState{}
+	state := core.RuntimeState{}
 	err = tx.QueryRowContext(ctx, "SELECT rollout_id,ready,state FROM sessions WHERE id=?", id).Scan(&rolloutID, &ready, &raw)
 	exists := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -427,7 +423,7 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	}
 	if exists {
 		if ready != 1 {
-			return receipt, s.ErrConflict
+			return receipt, core.ErrConflict
 		}
 		state, err = decodeState(raw, id)
 		if err != nil {
@@ -435,9 +431,12 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 		}
 		st.rows.Add(1)
 	} else {
+		if len(c.Entries) == 0 {
+			return receipt, core.ErrCorrupt
+		}
 		created := c.Entries[0].Created
 		if created == nil || created.RolloutID == "" || created.Projection != nil {
-			return receipt, s.ErrCorrupt
+			return receipt, core.ErrCorrupt
 		}
 		rolloutID = created.RolloutID
 	}
@@ -446,11 +445,11 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	err = tx.QueryRowContext(ctx, "SELECT status,seq FROM rollouts WHERE id=?", rolloutID).Scan(&status, &sequence)
 	if exists {
 		if err != nil || status != "active" {
-			return receipt, s.ErrNotFound
+			return receipt, core.ErrNotFound
 		}
 	} else {
 		if err == nil {
-			return receipt, s.ErrConflict
+			return receipt, core.ErrConflict
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return receipt, err
@@ -459,11 +458,11 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 			return receipt, err
 		}
 	}
-	old := s.Receipt{CommitID: c.ID}
+	old := core.Receipt{CommitID: c.ID}
 	err = tx.QueryRowContext(ctx, "SELECT version,digest,first_seq,last_seq FROM receipts WHERE session_id=? AND commit_id=?", id, c.ID).Scan(&old.Version, &old.Digest, &old.FirstSequence, &old.LastSequence)
 	if err == nil {
 		if old.Digest != digest {
-			return receipt, s.ErrConflict
+			return receipt, core.ErrConflict
 		}
 		old.CurrentVersion = state.Version
 		return old, nil
@@ -472,41 +471,41 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 		return receipt, err
 	}
 	if state.Version != c.ExpectedVersion {
-		return receipt, s.ErrConflict
+		return receipt, core.ErrConflict
 	}
-	confirmed, receipt, err := s.AssignCommit(c, sequence+1)
+	confirmed, receipt, err := core.AssignCommit(c, sequence+1)
 	if err != nil {
 		return receipt, err
 	}
-	next, records, err := s.Reduce(state, confirmed)
+	next, records, err := core.Reduce(state, confirmed)
 	if err != nil {
 		return receipt, err
 	}
 	if next.SessionID != id || next.RolloutID != rolloutID {
-		return receipt, s.ErrCorrupt
+		return receipt, core.ErrCorrupt
 	}
 	for _, e := range confirmed.Entries {
 		var one int
 		check := tx.QueryRowContext(ctx, "SELECT 1 FROM entries WHERE rollout_id=? AND id=?", rolloutID, e.ID).Scan(&one)
 		if check == nil {
-			return receipt, s.ErrCorrupt
+			return receipt, core.ErrCorrupt
 		}
 		if !errors.Is(check, sql.ErrNoRows) {
 			return receipt, check
 		}
 		if e.Compaction != nil {
 			if err = tx.QueryRowContext(ctx, "SELECT 1 FROM entries WHERE rollout_id=? AND id=? AND projection IS NOT NULL", rolloutID, e.Compaction.ThroughID).Scan(&one); err != nil {
-				return receipt, s.ErrCorrupt
+				return receipt, core.ErrCorrupt
 			}
 		}
 	}
-	if err := pending.Validate(confirmed.Entries, func(key string) (s.InputKind, bool, error) {
+	if err := pending.Validate(confirmed.Entries, func(key string) (core.InputKind, bool, error) {
 		var kind string
-		err := tx.QueryRowContext(ctx, "SELECT input_kind FROM pending WHERE session_id=? AND kind=? AND key=?", id, string(s.EntryInputQueued), key).Scan(&kind)
+		err := tx.QueryRowContext(ctx, "SELECT input_kind FROM pending WHERE session_id=? AND kind=? AND key=?", id, string(core.EntryInputQueued), key).Scan(&kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
-		return s.InputKind(kind), err == nil, err
+		return core.InputKind(kind), err == nil, err
 	}); err != nil {
 		return receipt, err
 	}
@@ -526,11 +525,16 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	if err = insert(ctx, tx, rolloutID, records, true); err != nil {
 		return receipt, err
 	}
+	if err = saveAttempts(ctx, tx, id, rolloutID, confirmed.Attempts, confirmed.Entries); err != nil {
+		return receipt, err
+	}
 	if err = saveReceipt(ctx, tx, rolloutID, id, receipt); err != nil {
 		return receipt, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE rollouts SET seq=? WHERE id=?", receipt.LastSequence, rolloutID); err != nil {
-		return receipt, err
+	if receipt.LastSequence > 0 {
+		if _, err = tx.ExecContext(ctx, "UPDATE rollouts SET seq=? WHERE id=?", receipt.LastSequence, rolloutID); err != nil {
+			return receipt, err
+		}
 	}
 	err = tx.Commit()
 	if err == nil {
@@ -538,11 +542,11 @@ func (st *Store) Commit(ctx context.Context, id string, c s.Commit) (receipt s.R
 	}
 	return receipt, err
 }
-func saveReceipt(ctx context.Context, tx *sql.Tx, rolloutID, id string, r s.Receipt) error {
+func saveReceipt(ctx context.Context, tx *sql.Tx, rolloutID, id string, r core.Receipt) error {
 	_, err := tx.ExecContext(ctx, "INSERT INTO receipts(rollout_id,session_id,commit_id,version,digest,first_seq,last_seq) VALUES(?,?,?,?,?,?,?)", rolloutID, id, r.CommitID, r.Version, r.Digest, r.FirstSequence, r.LastSequence)
 	return err
 }
-func insert(ctx context.Context, tx *sql.Tx, id string, records []s.Record, pending bool) error {
+func insert(ctx context.Context, tx *sql.Tx, id string, records []core.Record, pending bool) error {
 	stmt, err := tx.PrepareContext(ctx, "INSERT INTO entries(rollout_id,session_id,id,seq,version,parent_id,kind,reference,payload,projection) VALUES(?,?,?,?,?,?,?,?,?,?)")
 	if err != nil {
 		return err
@@ -562,36 +566,72 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []s.Record, pend
 			}
 			projection = b
 		}
-		if _, err = stmt.ExecContext(ctx, id, e.SessionID, e.ID, e.Sequence, e.Version, e.ParentID, string(e.Kind), s.Reference(e), payload, projection); err != nil {
+		if _, err = stmt.ExecContext(ctx, id, e.SessionID, e.ID, e.Sequence, e.Version, e.ParentID, string(e.Kind), core.Reference(e), payload, projection); err != nil {
 			return err
 		}
 		if !pending {
 			continue
 		}
+		if e.InputID != "" && (e.Kind == core.EntryMessage || e.Kind == core.EntryContext) {
+			if _, err = tx.ExecContext(ctx, "UPDATE inputs SET entry_id=? WHERE session_id=? AND id=? AND (entry_id='' OR ?)", e.ID, e.SessionID, e.InputID, e.Kind == core.EntryMessage); err != nil {
+				return err
+			}
+		}
 		switch e.Kind {
-		case s.EntryInputQueued, s.EntryApprovalRequested:
-			kind, key, owner := "", s.Reference(e), ""
+		case core.EntryInputQueued, core.EntryInputRequeued:
+			frozen, encodeErr := json.Marshal(e.Input)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if e.Kind == core.EntryInputRequeued {
+				_, err = tx.ExecContext(ctx, "UPDATE inputs SET kind=?,payload=?,state=? WHERE session_id=? AND id=?", string(e.Input.Kind), frozen, string(core.InputPending), e.SessionID, e.Input.ID)
+			} else {
+				_, err = tx.ExecContext(ctx, "INSERT INTO inputs(session_id,id,kind,digest,accepted_at,payload,state) VALUES(?,?,?,?,?,?,?)", e.SessionID, e.Input.ID, string(e.Input.Kind), e.Input.Digest, e.Time.Format(time.RFC3339Nano), frozen, string(core.InputPending))
+			}
+			if err != nil {
+				return err
+			}
+			fallthrough
+		case core.EntryApprovalRequested:
+			kind, key, owner := "", core.Reference(e), ""
 			if e.Input != nil {
 				kind = string(e.Input.Kind)
 			}
 			if e.Approval != nil {
 				owner = e.Approval.ExecutionID
 			}
-			_, err = tx.ExecContext(ctx, "INSERT INTO pending(rollout_id,session_id,kind,input_kind,key,owner,seq,payload) VALUES(?,?,?,?,?,?,?,?)", id, e.SessionID, string(e.Kind), kind, key, owner, e.Sequence, payload)
-		case s.EntryInputCleared:
+			pendingKind := e.Kind
+			if pendingKind == core.EntryInputRequeued {
+				pendingKind = core.EntryInputQueued
+			}
+			_, err = tx.ExecContext(ctx, "INSERT INTO pending(rollout_id,session_id,kind,input_kind,key,owner,seq,payload) VALUES(?,?,?,?,?,?,?,?)", id, e.SessionID, string(pendingKind), kind, key, owner, e.Sequence, payload)
+		case core.EntryInputCleared:
+			if e.Input != nil {
+				if _, err = tx.ExecContext(ctx, "UPDATE inputs SET state=? WHERE session_id=? AND id=?", string(core.InputCleared), e.SessionID, e.Input.ID); err != nil {
+					return err
+				}
+				_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(core.EntryInputQueued), e.Input.ID)
+				break
+			}
 			for _, kind := range e.Clear.Kinds {
-				if _, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND input_kind=?", e.SessionID, string(s.EntryInputQueued), string(kind)); err != nil {
+				if _, err = tx.ExecContext(ctx, "UPDATE inputs SET state=? WHERE session_id=? AND kind=? AND state=?", string(core.InputCleared), e.SessionID, string(kind), string(core.InputPending)); err != nil {
+					return err
+				}
+				if _, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND input_kind=?", e.SessionID, string(core.EntryInputQueued), string(kind)); err != nil {
 					return err
 				}
 			}
-		case s.EntryInputConsumed:
-			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(s.EntryInputQueued), e.Input.ID)
-		case s.EntryApprovalDecided:
-			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(s.EntryApprovalRequested), e.Approval.ID)
-		case s.EntryToolResult, s.EntryToolResolution, s.EntryToolControl, s.EntryToolUnresolved:
-			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND owner=?", e.SessionID, string(s.EntryApprovalRequested), e.Tool.Invocation.ExecutionID)
-		case s.EntryMessage:
-			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=?", e.SessionID, string(s.EntryApprovalRequested))
+		case core.EntryInputConsumed:
+			if _, err = tx.ExecContext(ctx, "UPDATE inputs SET state=? WHERE session_id=? AND id=?", string(core.InputApplied), e.SessionID, e.Input.ID); err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(core.EntryInputQueued), e.Input.ID)
+		case core.EntryApprovalDecided:
+			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND key=?", e.SessionID, string(core.EntryApprovalRequested), e.Approval.ID)
+		case core.EntryToolResult, core.EntryToolResolution, core.EntryToolControl, core.EntryToolUnresolved:
+			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=? AND owner=?", e.SessionID, string(core.EntryApprovalRequested), e.Tool.Invocation.ExecutionID)
+		case core.EntryMessage:
+			_, err = tx.ExecContext(ctx, "DELETE FROM pending WHERE session_id=? AND kind=?", e.SessionID, string(core.EntryApprovalRequested))
 		}
 		if err != nil {
 			return err
@@ -605,34 +645,34 @@ var forkLocks targetlock.Map
 func (st *Store) lockFork(ctx context.Context, id string) (func(), error) {
 	return forkLocks.Lock(ctx, st.path+"\x00"+id)
 }
-func (st *Store) existingFork(ctx context.Context, r s.ForkRequest) (s.RuntimeState, bool, error) {
+func (st *Store) existingFork(ctx context.Context, r core.ForkRequest) (core.RuntimeState, bool, error) {
 	var ready int
 	var raw []byte
 	var digest, rolloutID string
 	err := st.db.QueryRowContext(ctx, "SELECT ready,state,fork_digest,rollout_id FROM sessions WHERE id=?", r.TargetID).Scan(&ready, &raw, &digest, &rolloutID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return s.RuntimeState{}, false, nil
+		return core.RuntimeState{}, false, nil
 	}
 	if err != nil {
-		return s.RuntimeState{}, false, err
+		return core.RuntimeState{}, false, err
 	}
 	want, err := r.Digest()
 	if err != nil {
-		return s.RuntimeState{}, false, err
+		return core.RuntimeState{}, false, err
 	}
 	if digest != want {
-		return s.RuntimeState{}, false, s.ErrConflict
+		return core.RuntimeState{}, false, core.ErrConflict
 	}
 	if ready == 0 {
-		return s.RuntimeState{}, false, nil
+		return core.RuntimeState{}, false, nil
 	}
 	if err = st.activeRollout(ctx, rolloutID); err != nil {
-		return s.RuntimeState{}, true, err
+		return core.RuntimeState{}, true, err
 	}
 	state, err := decodeState(raw, r.TargetID)
 	return state, true, err
 }
-func (st *Store) writeForkPage(ctx context.Context, rolloutID string, records []s.Record) error {
+func (st *Store) writeForkPage(ctx context.Context, rolloutID string, records []core.Record) error {
 	st.write.Lock()
 	defer st.write.Unlock()
 	tx, err := st.db.BeginTx(ctx, nil)
@@ -642,17 +682,17 @@ func (st *Store) writeForkPage(ctx context.Context, rolloutID string, records []
 	defer tx.Rollback()
 	var status string
 	if err = tx.QueryRowContext(ctx, "SELECT status FROM rollouts WHERE id=?", rolloutID).Scan(&status); err != nil || status != "building" {
-		return s.ErrNotFound
+		return core.ErrNotFound
 	}
 	if err = insert(ctx, tx, rolloutID, records, false); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
-func (st *Store) Fork(ctx context.Context, r s.ForkRequest) (s.RuntimeState, error) {
+func (st *Store) Fork(ctx context.Context, r core.ForkRequest) (core.RuntimeState, error) {
 	return st.fork(ctx, r, nil)
 }
-func (st *Store) fork(ctx context.Context, r s.ForkRequest, afterPage func()) (s.RuntimeState, error) {
+func (st *Store) fork(ctx context.Context, r core.ForkRequest, afterPage func()) (core.RuntimeState, error) {
 	return st.forkWithCheckpoint(ctx, r, func(phase string) {
 		if phase == "page" && afterPage != nil {
 			afterPage()
@@ -661,8 +701,8 @@ func (st *Store) fork(ctx context.Context, r s.ForkRequest, afterPage func()) (s
 }
 
 // The private checkpoint observes durable boundaries in real process-crash tests.
-func (st *Store) forkWithCheckpoint(ctx context.Context, r s.ForkRequest, checkpoint func(string)) (state s.RuntimeState, err error) {
-	if err = s.ValidateFork(r); err != nil {
+func (st *Store) forkWithCheckpoint(ctx context.Context, r core.ForkRequest, checkpoint func(string)) (state core.RuntimeState, err error) {
+	if err = core.ValidateFork(r); err != nil {
 		return state, err
 	}
 	unlock, err := st.lockFork(ctx, r.TargetID)
@@ -679,17 +719,17 @@ func (st *Store) forkWithCheckpoint(ctx context.Context, r s.ForkRequest, checkp
 		return state, err
 	}
 	if source.RolloutID != r.SourceRolloutID {
-		return state, s.ErrNotFound
+		return state, core.ErrNotFound
 	}
 	head, err := st.Get(ctx, r.SourceRolloutID, r.HeadID)
 	if err != nil {
 		return state, err
 	}
-	state, err = s.ForkState(r, head)
+	state, err = core.ForkState(r, head)
 	if err != nil {
 		return state, err
 	}
-	if r.Mode == s.ForkDetached {
+	if r.Mode == core.ForkDetached {
 		// A caller owns this stable target across processes; the process-local lock
 		// also serializes retries through distinct Store handles.
 		if err = st.discardUnpublished(ctx, r.TargetID); err != nil {
@@ -749,15 +789,15 @@ func (st *Store) forkWithCheckpoint(ctx context.Context, r s.ForkRequest, checkp
 	var sequence uint64
 	var status string
 	if err = tx.QueryRowContext(ctx, "SELECT status,seq FROM rollouts WHERE id=?", r.SourceRolloutID).Scan(&status, &sequence); err != nil || status != "active" {
-		return state, s.ErrNotFound
+		return state, core.ErrNotFound
 	}
-	if r.Mode == s.ForkDetached {
+	if r.Mode == core.ForkDetached {
 		if err = tx.QueryRowContext(ctx, "SELECT status FROM rollouts WHERE id=?", r.RolloutID()).Scan(&status); err != nil || status != "building" {
-			return state, s.ErrNotFound
+			return state, core.ErrNotFound
 		}
 		sequence = head.Entry.Sequence
 	}
-	_, state, records, receipt, err := s.PrepareFork(r, head, sequence+1)
+	_, state, records, receipt, err := core.PrepareFork(r, head, sequence+1)
 	if err != nil {
 		return state, err
 	}
@@ -766,7 +806,7 @@ func (st *Store) forkWithCheckpoint(ctx context.Context, r s.ForkRequest, checkp
 		return state, err
 	}
 	digest, _ := r.Digest()
-	if r.Mode == s.ForkShared {
+	if r.Mode == core.ForkShared {
 		_, err = tx.ExecContext(ctx, "INSERT INTO sessions(id,rollout_id,ready,state,fork_digest) VALUES(?,?,1,?,?)", r.TargetID, r.RolloutID(), raw, digest)
 	} else {
 		_, err = tx.ExecContext(ctx, "UPDATE sessions SET ready=1,state=? WHERE id=? AND ready=0", raw, r.TargetID)
@@ -828,15 +868,15 @@ func (st *Store) discardUnpublished(ctx context.Context, id string) error {
 			if err != nil {
 				return err
 			}
-			return s.ErrConflict
+			return core.ErrConflict
 		}
-		result, e := tx.ExecContext(ctx, "DELETE FROM entries WHERE rollout_id=? AND id IN (SELECT id FROM entries WHERE rollout_id=? LIMIT ?)", rolloutID, rolloutID, s.DefaultPageSize)
+		result, e := tx.ExecContext(ctx, "DELETE FROM entries WHERE rollout_id=? AND id IN (SELECT id FROM entries WHERE rollout_id=? LIMIT ?)", rolloutID, rolloutID, core.DefaultPageSize)
 		var n int64
 		if e == nil {
 			n, e = result.RowsAffected()
 		}
 		if e == nil && n == 0 {
-			for _, query := range []string{"DELETE FROM pending WHERE rollout_id=?", "DELETE FROM receipts WHERE rollout_id=?", "DELETE FROM sessions WHERE rollout_id=?", "DELETE FROM rollouts WHERE id=?"} {
+			for _, query := range []string{"DELETE FROM pending WHERE rollout_id=?", "DELETE FROM receipts WHERE rollout_id=?", "DELETE FROM attempts WHERE rollout_id=?", "DELETE FROM sessions WHERE rollout_id=?", "DELETE FROM rollouts WHERE id=?"} {
 				if _, e = tx.ExecContext(ctx, query, rolloutID); e != nil {
 					break
 				}
@@ -857,4 +897,23 @@ func (st *Store) discardUnpublished(ctx context.Context, id string) error {
 	}
 }
 
-var _ s.Store = (*Store)(nil)
+var _ core.Store = (*Store)(nil)
+
+func (st *Store) LookupInput(ctx context.Context, id, key string) (core.InputReceipt, error) {
+	var receipt core.InputReceipt
+	var raw []byte
+	var accepted string
+	err := st.db.QueryRowContext(ctx, "SELECT i.payload,i.accepted_at,i.state,i.entry_id FROM inputs i JOIN sessions ss ON ss.id=i.session_id JOIN rollouts r ON r.id=ss.rollout_id WHERE i.session_id=? AND i.id=? AND ss.ready=1 AND r.status='active'", id, key).Scan(&raw, &accepted, &receipt.State, &receipt.EntryID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return receipt, core.ErrNotFound
+	}
+	if err != nil {
+		return receipt, err
+	}
+	st.rows.Add(1)
+	if err = json.Unmarshal(raw, &receipt.InputRecord); err != nil {
+		return receipt, core.ErrCorrupt
+	}
+	receipt.AcceptedAt, err = time.Parse(time.RFC3339Nano, accepted)
+	return receipt, err
+}

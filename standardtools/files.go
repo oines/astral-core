@@ -62,7 +62,7 @@ func (t backendTool) read(ctx context.Context, inv astral.Invocation) (astral.To
 	lines := strings.Split(text, "\n")
 	start := r.Offset - 1
 	if start >= len(lines) {
-		return astral.ToolResult{}, fmt.Errorf("Offset %d is beyond end of file (%d lines total)", r.Offset, len(lines))
+		return astral.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", r.Offset, len(lines))
 	}
 	end := len(lines)
 	if r.Limit > 0 && r.Limit < end-start {

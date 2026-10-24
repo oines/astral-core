@@ -14,8 +14,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
-	"github.com/oines/astral-core/store/jsonl"
+
 	"github.com/oines/astral-core/store/sqlite"
 )
 
@@ -27,13 +26,13 @@ func crashBarrier() {
 }
 
 type crashStore struct {
-	sessions.Store
+	astral.Store
 	stage string
 }
 
-func (s crashStore) Commit(ctx context.Context, id string, c sessions.Commit) (sessions.Receipt, error) {
+func (s crashStore) Commit(ctx context.Context, id string, c astral.Commit) (astral.Receipt, error) {
 	for _, e := range c.Entries {
-		if s.stage == "before-start" && e.Kind == sessions.EntryToolStarted {
+		if s.stage == "before-start" && e.Kind == astral.EntryToolStarted {
 			crashBarrier()
 		}
 	}
@@ -42,16 +41,16 @@ func (s crashStore) Commit(ctx context.Context, id string, c sessions.Commit) (s
 		return r, err
 	}
 	for _, e := range c.Entries {
-		if s.stage == "lost-ack" && e.Kind == sessions.EntryToolStarted {
-			return sessions.Receipt{}, errors.New("lost commit acknowledgement")
+		if s.stage == "lost-ack" && e.Kind == astral.EntryToolStarted {
+			return astral.Receipt{}, errors.New("lost commit acknowledgement")
 		}
-		if s.stage == "started" && e.Kind == sessions.EntryToolStarted || s.stage == "completed" && e.Kind == sessions.EntryToolCompleted || s.stage == "result" && e.Kind == sessions.EntryToolResult {
+		if s.stage == "started" && e.Kind == astral.EntryToolStarted || s.stage == "completed" && e.Kind == astral.EntryToolCompleted || s.stage == "result" && e.Kind == astral.EntryToolResult {
 			crashBarrier()
 		}
 	}
 	return r, nil
 }
-func (s crashStore) LookupCommit(ctx context.Context, id, key string) (sessions.Receipt, error) {
+func (s crashStore) LookupCommit(ctx context.Context, id, key string) (astral.Receipt, error) {
 	if s.stage == "lost-ack" {
 		crashBarrier()
 	}
@@ -80,22 +79,18 @@ func readCount(t *testing.T, dir, name string) int {
 	}
 	return bytes.Count(b, []byte("1\n"))
 }
-func durableStore(t *testing.T, backend, dir string) (sessions.Store, func()) {
+func durableStore(t *testing.T, backend, dir string) (astral.Store, func()) {
 	t.Helper()
-	if backend == "sqlite" {
-		st, err := sqlite.Open(filepath.Join(dir, "history.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return st, func() { st.Close() }
+	if backend != "sqlite" {
+		t.Fatalf("unsupported test store %q", backend)
 	}
-	st, err := jsonl.Open(filepath.Join(dir, "journal"))
+	st, err := sqlite.Open(filepath.Join(dir, "history.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return st, func() { st.Close() }
 }
-func crashConfig(st sessions.Store, dir, stage string) sessions.Config {
+func crashConfig(st astral.Store, dir, stage string) astral.Config {
 	m := model(func(_ context.Context, _ int, r astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
 		for _, msg := range r.Messages {
 			if len(msg.ToolCalls()) > 0 {
@@ -114,7 +109,7 @@ func crashConfig(st sessions.Store, dir, stage string) sessions.Config {
 		}
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("original output"), Outcome: astral.OutcomeSucceeded}}, nil
 	})}
-	c.BeforeToolCall = func(context.Context, sessions.ToolContext) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(context.Context, astral.ToolContext) (astral.ToolDecision, error) {
 		return astral.ToolDecision{}, durableCount(dir, "before")
 	}
 	c.AfterToolCall = func(context.Context, astral.Invocation, astral.ToolResult) (astral.ToolResultPatch, error) {
@@ -136,9 +131,9 @@ func TestCrashWorker(t *testing.T) {
 	dir, backend, stage := os.Getenv("ASTRAL_CRASH_DIR"), os.Getenv("ASTRAL_CRASH_BACKEND"), os.Getenv("ASTRAL_CRASH_STAGE")
 	st, closeStore := durableStore(t, backend, dir)
 	defer closeStore()
-	a := newAgent(t, crashConfig(crashStore{st, stage}, dir, stage))
-	s := newSession(t, a, sessions.SessionOptions{ID: "crash"})
-	r, err := s.Start(context.Background(), astral.User("go"))
+	a := newSessions(t, crashConfig(crashStore{st, stage}, dir, stage))
+	s := newSession(t, a, astral.SessionOptions{ID: "crash"})
+	r, err := prompt(s, context.Background(), astral.User("go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +144,7 @@ func TestCrashWorker(t *testing.T) {
 }
 
 func TestRealProcessCrashDoesNotReplaySideEffects(t *testing.T) {
-	for _, backend := range []string{"sqlite", "jsonl"} {
+	for _, backend := range []string{"sqlite"} {
 		for _, stage := range []string{"before-start", "started", "lost-ack", "executed", "completed", "after-hook", "result"} {
 			t.Run(backend+"/"+stage, func(t *testing.T) {
 				dir := t.TempDir()
@@ -184,7 +179,7 @@ func TestRealProcessCrashDoesNotReplaySideEffects(t *testing.T) {
 				}
 				st, closeStore := durableStore(t, backend, dir)
 				defer closeStore()
-				a := newAgent(t, crashConfig(st, dir, ""))
+				a := newSessions(t, crashConfig(st, dir, ""))
 				s, err := a.OpenSession(ctx, "crash")
 				if err != nil {
 					t.Fatal(err)

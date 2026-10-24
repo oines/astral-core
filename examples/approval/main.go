@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	sessions "github.com/oines/astral-core/session"
-	"github.com/oines/astral-core/store/jsonl"
+	"github.com/oines/astral-core/store/sqlite"
 )
 
 func main() {
@@ -26,7 +26,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 	defer os.RemoveAll(directory)
-	store, err := jsonl.Open(directory)
+	store, err := sqlite.Open(filepath.Join(directory, "history.db"))
 	if err != nil {
 		return err
 	}
@@ -39,7 +39,7 @@ func run(ctx context.Context) error {
 			return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Record updated.")}}, nil
 		},
 	}
-	config := sessions.Config{EstimateTokens: demo.EstimateTokens,
+	config := astral.Config{EstimateTokens: demo.EstimateTokens,
 		Store: store, Tools: []astral.Tool{tool},
 		Model: demo.Model(func(request astral.Request) (astral.Reply, error) {
 			if demo.LastTool(request, "update_record") != nil {
@@ -47,29 +47,25 @@ func run(ctx context.Context) error {
 			}
 			return demo.Calls(demo.Call("update-1", "update_record", `{}`)), nil
 		}),
-		BeforeToolCall: func(ctx context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
-			decision, err := inv.AwaitApproval(ctx, sessions.ApprovalRequest{Prompt: "Allow this record update?"})
+		BeforeToolCall: func(ctx context.Context, inv astral.ToolContext) (astral.ToolDecision, error) {
+			decision, err := inv.AwaitApproval(ctx, astral.ApprovalRequest{Prompt: "Allow this record update?"})
 			return astral.ToolDecision{Block: !decision.Approved, Reason: decision.Reason}, err
 		},
 	}
-	agent, err := sessions.New(config)
+	session, err := astral.NewSession(ctx, config, astral.SessionOptions{ID: "approval-demo"})
 	if err != nil {
 		return err
 	}
-	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, sessions.SessionOptions{ID: "approval-demo"})
-	if err != nil {
-		return err
-	}
+	defer session.Close(context.Background())
 	subscription := session.Subscribe(128)
 	defer subscription.Close()
-	activity, err := session.Start(ctx, astral.User("Update the record."))
+	activity, err := session.Prompt(ctx, astral.Input{ID: "update", Message: astral.User("Update the record.")})
 	if err != nil {
 		return err
 	}
 	for event := range subscription.C {
 		if event.Type == astral.EventApproval {
-			if err := session.DecideApproval(ctx, event.ApprovalID, sessions.ApprovalDecision{Approved: true, Reason: "Demo host policy"}); err != nil {
+			if err := session.DecideApproval(ctx, event.ApprovalID, astral.ApprovalDecision{Approved: true, Reason: "Demo host policy"}); err != nil {
 				return err
 			}
 		}
@@ -80,29 +76,25 @@ func run(ctx context.Context) error {
 	if err := subscription.Err(); err != nil {
 		return err
 	}
-	if _, err = activity.Wait(ctx); err != nil {
+	if _, err = activity.Run.Wait(ctx); err != nil {
 		return err
 	}
-	if err = agent.Close(ctx); err != nil {
+	if err = session.Close(ctx); err != nil {
 		return err
 	}
 	// Closing the old owner before reopening is essential for side-effect safety.
-	reopenedAgent, err := sessions.New(config)
+	reopened, err := astral.OpenSession(ctx, config, session.ID())
 	if err != nil {
 		return err
 	}
-	defer reopenedAgent.Close(context.Background())
-	reopened, err := reopenedAgent.OpenSession(ctx, session.ID())
-	if err != nil {
-		return err
-	}
+	defer reopened.Close(context.Background())
 	approved := false
-	page, err := reopened.History().Scan(ctx, sessions.Query{Kind: sessions.EntryApprovalDecided, Reverse: true, Limit: 1})
+	page, err := reopened.History().Scan(ctx, astral.Query{Kind: astral.EntryApprovalDecided, Reverse: true, Limit: 1})
 	if err != nil {
 		return err
 	}
 	for _, entry := range page.Entries {
-		if entry.Kind == sessions.EntryApprovalDecided {
+		if entry.Kind == astral.EntryApprovalDecided {
 			approved = entry.Approval.Decision.Approved
 		}
 	}

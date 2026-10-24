@@ -153,17 +153,35 @@ func (b headTailBuffer) text() (string, int64) {
 	return strings.ToValidUTF8(string(head), "\ufffd") + fmt.Sprintf("\n... %d bytes omitted ...\n", omitted) + strings.ToValidUTF8(string(tail), "\ufffd"), omitted
 }
 
-func limitCommandOutput(text string, original int64, tokens int) string {
-	budget := min(tokens, int(^uint(0)>>1)/4) * 4
-	if budget == 0 {
-		return ""
+func commandByteBudget(tokens int) int {
+	return min(tokens, int(^uint(0)>>1)/4) * 4
+}
+
+// Codex keeps the content budget separate from its warning and middle marker.
+// Collection omissions are a separate fact: a later token truncation must not
+// remove the only notice that the process buffer already dropped some bytes.
+func limitCommandOutput(text string, originalTokens, omitted int64, tokens int) string {
+	budget := commandByteBudget(tokens)
+	omission := ""
+	if omitted > 0 {
+		omission = fmt.Sprintf("... %d bytes omitted ...", omitted)
 	}
 	if len(text) <= budget {
+		if omission != "" && !strings.Contains(text, omission) {
+			return omission + "\n" + text
+		}
 		return text
 	}
-	prefix := fmt.Sprintf("Warning: truncated output (original token count: %d)\nTotal output lines: %d\n\n", (original+3)/4, len(countedLines(text)))
-	marker := "\n... output truncated ...\n"
-	available := max(0, budget-len(prefix)-len(marker))
 	data := []byte(text)
-	return prefix + string(utf8Head(data, available/2)) + marker + string(utf8Tail(data, available-available/2))
+	marker := fmt.Sprintf("…%d tokens truncated…", (len(text)-budget+3)/4)
+	truncated := string(utf8Head(data, budget/2)) + marker + string(utf8Tail(data, budget-budget/2))
+	if omission == "" {
+		return fmt.Sprintf("Warning: truncated output (original token count: %d)\nTotal output lines: %d\n\n%s", (len(text)+3)/4, len(countedLines(text)), truncated)
+	}
+	if strings.Contains(truncated, omission) {
+		omission = ""
+	} else {
+		omission += "\n"
+	}
+	return fmt.Sprintf("Warning: truncated output (original token count: %d)\n%s\n%s", originalTokens, omission, truncated)
 }

@@ -9,7 +9,6 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	"github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -29,20 +28,16 @@ func run() error {
 		}
 		return demo.Answer("Ready"), nil
 	})
-	manager, err := session.New(session.Config{Model: model, Store: memory.New(), EstimateTokens: demo.EstimateTokens})
+	parent, err := astral.NewSession(ctx, astral.Config{Model: model, Store: memory.New(), EstimateTokens: demo.EstimateTokens}, astral.SessionOptions{ID: "conversation"})
 	if err != nil {
 		return err
 	}
-	defer manager.Close(ctx)
-	parent, err := manager.NewSession(ctx, session.SessionOptions{ID: "conversation"})
+	defer parent.Close(ctx)
+	prompt, err := parent.Prompt(ctx, astral.Input{ID: "original", Message: astral.User("Original question")})
 	if err != nil {
 		return err
 	}
-	run, err := parent.Start(ctx, astral.User("Original question"))
-	if err != nil {
-		return err
-	}
-	original, err := run.Wait(ctx)
+	original, err := prompt.Run.Wait(ctx)
 	if err != nil {
 		return err
 	}
@@ -53,11 +48,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	regenerated, err := parent.Fork(ctx, assistant.ParentID, session.ForkOptions{ID: "regenerated"})
+	regenerated, err := parent.Fork(ctx, assistant.ParentID, astral.ForkOptions{ID: "regenerated"})
 	if err != nil {
 		return err
 	}
-	run, err = regenerated.Continue(ctx)
+	defer regenerated.Close(ctx)
+	run, err := regenerated.Continue(ctx)
 	if err != nil {
 		return err
 	}
@@ -65,7 +61,7 @@ func run() error {
 		return err
 	}
 	fmt.Println("regeneration shares rollout:", parent.RolloutID() == regenerated.RolloutID())
-	detached, err := parent.Fork(ctx, original.LastMessageID, session.ForkOptions{ID: "independent", Mode: session.ForkDetached})
+	detached, err := parent.Fork(ctx, original.LastMessageID, astral.ForkOptions{ID: "independent", Mode: astral.ForkDetached})
 	if err != nil {
 		return err
 	}
@@ -74,11 +70,12 @@ func run() error {
 	if err = parent.Close(ctx); err != nil {
 		return err
 	}
-	run, err = detached.Start(ctx, astral.User("Independent follow-up"))
+	defer detached.Close(ctx)
+	prompt, err = detached.Prompt(ctx, astral.Input{ID: "follow-up", Message: astral.User("Independent follow-up")})
 	if err != nil {
 		return err
 	}
-	result, err := run.Wait(ctx)
+	result, err := prompt.Run.Wait(ctx)
 	if err != nil {
 		return err
 	}

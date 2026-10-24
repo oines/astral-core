@@ -19,6 +19,67 @@ type Model interface {
 	Stream(context.Context, Request, func(ModelEvent)) (Reply, error)
 }
 
+// RequestPreparer freezes host context before estimation, persistence and
+// generation. Stream must use that snapshot, without resolving mutable files
+// or appending live environment data. Preparation may run for inspection or
+// budgeting without a subsequent model call and must have no external effects.
+type RequestPreparer interface {
+	PrepareRequest(context.Context, Request) (Request, error)
+}
+
+// RequestValidator checks a complete frozen request against the provider's
+// wire contract. It is separate from content estimation, which also measures
+// partial tails. Validation runs after the dynamic output limit is chosen and
+// before any selected inputs or compaction are committed.
+type RequestValidator interface {
+	ValidateRequest(context.Context, Request) error
+}
+
+func ValidateRequest(ctx context.Context, model Model, request Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("model request validation panicked: %v", p)
+		}
+	}()
+	if validator, ok := model.(RequestValidator); ok {
+		return validator.ValidateRequest(ctx, clone(request))
+	}
+	return nil
+}
+
+// PrepareRequest owns both sides of the optional preparation boundary.
+func PrepareRequest(ctx context.Context, model Model, request Request) (out Request, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("model request preparation panicked: %v", p)
+		}
+	}()
+	out, err = copyJSON(request)
+	if err != nil {
+		return Request{}, err
+	}
+	if preparer, ok := model.(RequestPreparer); ok {
+		out, err = preparer.PrepareRequest(ctx, out)
+		if err != nil {
+			return Request{}, err
+		}
+	}
+	if out.ModelID != request.ModelID || out.ModelRevision != request.ModelRevision ||
+		out.MaxOutputTokens != request.MaxOutputTokens || !sameJSON(out.Tools, request.Tools) ||
+		!sameJSON(out.Options, request.Options) {
+		return Request{}, fmtInvalid("request preparation changed model configuration")
+	}
+	if err = out.Options.Validate(); err != nil {
+		return Request{}, err
+	}
+	for _, message := range out.Messages {
+		if err = validateMessage(message); err != nil {
+			return Request{}, err
+		}
+	}
+	return copyJSON(out)
+}
+
 // ModelFunc adapts host functions without a provider-specific SDK dependency.
 type ModelFunc struct {
 	Specification ModelSpec
@@ -27,16 +88,20 @@ type ModelFunc struct {
 
 type ModelSpec struct {
 	ID              string `json:"id"`
+	Revision        string `json:"revision,omitempty"`
 	ContextWindow   int    `json:"context_window"`
+	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
 	MaxOutputTokens int    `json:"max_output_tokens"`
 }
 
 type Request struct {
-	ModelID         string           `json:"model_id"`
-	SystemPrompt    string           `json:"system_prompt"`
-	Messages        []Message        `json:"messages"`
-	Tools           []ToolDefinition `json:"tools,omitempty"`
-	MaxOutputTokens int              `json:"max_output_tokens"`
+	ModelID         string            `json:"model_id"`
+	ModelRevision   string            `json:"model_revision,omitempty"`
+	SystemPrompt    string            `json:"system_prompt"`
+	Messages        []Message         `json:"messages"`
+	Tools           []ToolDefinition  `json:"tools,omitempty"`
+	MaxOutputTokens int               `json:"max_output_tokens"`
+	Options         GenerationOptions `json:"options,omitempty"`
 }
 
 type Reply struct {
@@ -45,8 +110,15 @@ type Reply struct {
 }
 
 type Usage struct {
+	// InputTokens includes cached reads and cache writes. Cache fields are
+	// breakdowns, never additional input to be summed into context usage.
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
+	// Available distinguishes a provider's reported zero usage from no report.
+	Available         bool `json:"available,omitempty"`
+	CachedInputTokens *int `json:"cached_input_tokens,omitempty"`
+	CacheWriteTokens  *int `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens   *int `json:"reasoning_tokens,omitempty"`
 }
 
 type FinishReason string
@@ -72,17 +144,6 @@ type ModelEvent struct {
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
-type ModelFailure struct {
-	SessionID, ModelID string
-	Attempts           int
-	Err                error
-}
-
-type Fallback struct {
-	ModelID    string
-	Persistent bool
-}
-
 func (m ModelFunc) Spec() ModelSpec { return m.Specification }
 
 func (m ModelFunc) Stream(ctx context.Context, request Request, emit func(ModelEvent)) (Reply, error) {
@@ -93,36 +154,10 @@ func (m ModelFunc) Stream(ctx context.Context, request Request, emit func(ModelE
 }
 
 func validateModelSpec(spec ModelSpec) error {
-	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 {
+	if spec.ID == "" || spec.ContextWindow < 1 || spec.MaxOutputTokens < 1 || spec.MaxInputTokens < 0 {
 		return fmtInvalid("model needs a stable ID and positive token limits")
 	}
 	return nil
-}
-
-func (a *Agent) model(ctx context.Context, id string) (Model, error) {
-	var m Model
-	var err error
-	if id == a.modelID {
-		m = a.config.Model
-	} else if a.config.ResolveModel != nil {
-		m, err = a.config.ResolveModel(ctx, id)
-	} else {
-		return nil, fmtInvalid("model %q has no host resolver", id)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if m == nil {
-		return nil, fmtInvalid("model resolver returned nil for %q", id)
-	}
-	spec := m.Spec()
-	if err = validateModelSpec(spec); err != nil {
-		return nil, err
-	}
-	if spec.ID != id {
-		return nil, fmtInvalid("model resolver returned %q for %q", spec.ID, id)
-	}
-	return m, nil
 }
 
 func stream(ctx context.Context, model Model, request Request, emit func(ModelEvent)) (reply Reply, err error) {
@@ -175,7 +210,7 @@ func validateReply(reply Reply) error {
 	if reply.Message.FinishReason == FinishCancelled {
 		return context.Canceled
 	}
-	if reply.Message.FinishReason != FinishStop && reply.Message.FinishReason != FinishToolCalls && reply.Message.FinishReason != FinishLength {
+	if reply.Message.FinishReason != FinishStop && reply.Message.FinishReason != FinishToolCalls {
 		return fmt.Errorf("%w: finish reason %q: %s", ErrIncompleteResponse, reply.Message.FinishReason, reply.Message.ErrorMessage)
 	}
 	if reply.Message.Role != RoleAssistant {

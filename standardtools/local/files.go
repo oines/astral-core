@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	astral "github.com/oines/astral-core"
@@ -27,21 +28,21 @@ func expandPath(path, cwd, home string) (string, error) {
 		}
 		return r
 	}, path)
-	if path == "~" || strings.HasPrefix(path, "~/") {
+	if path == "~" || strings.HasPrefix(path, "~/") || runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`) {
 		if home == "" {
 			return "", errors.New("home directory is unavailable")
 		}
-		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+		path = filepath.Join(home, strings.TrimLeft(strings.TrimPrefix(path, "~"), `/\`))
 	}
 	if strings.HasPrefix(path, "file://") {
 		u, err := url.Parse(path)
 		if err != nil {
 			return "", err
 		}
-		if u.Host != "" && u.Host != "localhost" {
-			return "", errors.New("non-local file URL")
+		path, err = fileURLPath(u)
+		if err != nil {
+			return "", err
 		}
-		path = filepath.FromSlash(u.Path)
 	}
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(cwd, path)
@@ -72,7 +73,7 @@ func (fs *fileSystem) ResolvePath(ctx context.Context, path string, forRead bool
 	if err != nil {
 		return standardtools.ResolvedPath{}, err
 	}
-	return standardtools.ResolvedPath{Path: resolved, Parent: filepath.Dir(resolved), Key: "local:" + canonical}, nil
+	return standardtools.ResolvedPath{Path: resolved, Parent: filepath.Dir(resolved), Key: "local:" + pathKey(canonical)}, nil
 }
 
 var screenshotTime = regexp.MustCompile(`(?i) (AM|PM)\.`)

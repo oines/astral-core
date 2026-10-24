@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	astral "github.com/oines/astral-core"
@@ -33,6 +34,11 @@ type Backend struct {
 	env              []string
 	resolveBinding   func(context.Context, astral.Invocation) (cwd, shell string, err error)
 }
+
+// DefaultShell returns the executable used by a new local backend. On Windows
+// it discovers PowerShell (preferring PowerShell 7); on Unix it uses SHELL or sh.
+// An empty result means that no supported shell could be located.
+func DefaultShell() string { return defaultShell() }
 
 func New(options ...Options) (*Backend, error) {
 	if len(options) > 1 {
@@ -135,15 +141,20 @@ func beforeStart(err error) error {
 
 func mergeEnv(base, extra []string) []string {
 	result := append([]string(nil), base...)
+	result = result[:0]
 	positions := map[string]int{}
-	for i, value := range result {
-		key, _, _ := strings.Cut(value, "=")
-		positions[key] = i
-	}
-	for _, value := range extra {
-		key, _, ok := strings.Cut(value, "=")
+	for _, value := range append(append([]string(nil), base...), extra...) {
+		// Windows also has special drive-current-directory variables (=C:=...).
+		start := 0
+		if runtime.GOOS == "windows" && strings.HasPrefix(value, "=") {
+			start = 1
+		}
+		key, _, ok := strings.Cut(value[start:], "=")
 		if !ok || key == "" {
 			continue
+		}
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(value[:start] + key)
 		}
 		if i, ok := positions[key]; ok {
 			result[i] = value

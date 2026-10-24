@@ -2,23 +2,19 @@ package integration_test
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
 )
 
 func TestDetachedReopensWithoutSourceRollout(t *testing.T) {
-	for _, backend := range []string{"jsonl", "sqlite"} {
+	for _, backend := range []string{"sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
@@ -27,12 +23,12 @@ func TestDetachedReopensWithoutSourceRollout(t *testing.T) {
 				return answer("done"), nil
 			})
 			c := testConfig(m, st)
-			a := newAgent(t, c)
-			parent := newSession(t, a, sessions.SessionOptions{ID: "parent"})
+			a := newSessions(t, c)
+			parent := newSession(t, a, astral.SessionOptions{ID: "parent"})
 			for i := 0; i < 3; i++ {
 				waitOK(t, start(t, parent, "ancestor"))
 			}
-			child, err := parent.Fork(ctx, parent.Head(), sessions.ForkOptions{ID: "independent", Mode: sessions.ForkDetached})
+			child, err := parent.Fork(ctx, parent.Head(), astral.ForkOptions{ID: "independent", Mode: astral.ForkDetached})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -49,28 +45,20 @@ func TestDetachedReopensWithoutSourceRollout(t *testing.T) {
 				t.Fatal(err)
 			}
 			closeStore()
-			if backend == "jsonl" {
-				sum := sha256.Sum256([]byte(root))
-				path := filepath.Join(dir, "journal", hex.EncodeToString(sum[:])+".jsonl")
-				if err = os.Rename(path, filepath.Join(dir, "unavailable-source")); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				db, err := sql.Open("sqlite", filepath.Join(dir, "history.db"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, err = db.Exec("UPDATE rollouts SET status='unavailable' WHERE id=?", root)
-				db.Close()
-				if err != nil {
-					t.Fatal(err)
-				}
+			db, err := sql.Open("sqlite", filepath.Join(dir, "history.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.Exec("UPDATE rollouts SET status='unavailable' WHERE id=?", root)
+			db.Close()
+			if err != nil {
+				t.Fatal(err)
 			}
 			st, closeStore = durableStore(t, backend, dir)
 			defer closeStore()
 			c.Store = st
-			a = newAgent(t, c)
-			if _, err = a.OpenSession(ctx, "parent"); !errors.Is(err, sessions.ErrNotFound) {
+			a = newSessions(t, c)
+			if _, err = a.OpenSession(ctx, "parent"); !errors.Is(err, astral.ErrNotFound) {
 				t.Fatalf("source still accessible: %v", err)
 			}
 			child, err = a.OpenSession(ctx, "independent")
@@ -85,7 +73,7 @@ func TestDetachedReopensWithoutSourceRollout(t *testing.T) {
 				t.Fatalf("detached context lost: %v", err)
 			}
 			waitOK(t, start(t, child, "source independent"))
-			request := sessions.ForkRequest{SourceID: "parent", SourceRolloutID: root, TargetID: "independent", HeadID: saved.Creation.ForkEntryID, Mode: sessions.ForkDetached}
+			request := astral.ForkRequest{SourceID: "parent", SourceRolloutID: root, TargetID: "independent", HeadID: saved.Creation.ForkEntryID, Mode: astral.ForkDetached}
 			retried, err := st.Fork(ctx, request)
 			if err != nil || retried.Version != child.State().Version {
 				t.Fatalf("existing child depends on source: %v", err)
@@ -95,8 +83,8 @@ func TestDetachedReopensWithoutSourceRollout(t *testing.T) {
 }
 
 func TestHistoricalToolResultForkSurvivesColdReplay(t *testing.T) {
-	for _, backend := range []string{"sqlite", "jsonl"} {
-		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
+	for _, backend := range []string{"sqlite"} {
+		for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
 			t.Run(fmt.Sprintf("%s/%d", backend, mode), func(t *testing.T) {
 				ctx := context.Background()
 				dir := t.TempDir()
@@ -110,16 +98,16 @@ func TestHistoricalToolResultForkSurvivesColdReplay(t *testing.T) {
 				})
 				c := testConfig(m, st)
 				c.Tools = []astral.Tool{echoTool(&effects)}
-				a := newAgent(t, c)
-				parent := newSession(t, a, sessions.SessionOptions{})
+				a := newSessions(t, c)
+				parent := newSession(t, a, astral.SessionOptions{})
 				waitOK(t, start(t, parent, "run"))
 				var boundary string
 				for _, e := range entries(parent) {
-					if e.Kind == sessions.EntryToolResult {
+					if e.Kind == astral.EntryToolResult {
 						boundary = e.ID
 					}
 				}
-				child, err := parent.Fork(ctx, boundary, sessions.ForkOptions{ID: "cold-result", Mode: mode})
+				child, err := parent.Fork(ctx, boundary, astral.ForkOptions{ID: "cold-result", Mode: mode})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -131,7 +119,7 @@ func TestHistoricalToolResultForkSurvivesColdReplay(t *testing.T) {
 				st, closeStore = durableStore(t, backend, dir)
 				defer closeStore()
 				c.Store = st
-				a = newAgent(t, c)
+				a = newSessions(t, c)
 				child, err = a.OpenSession(ctx, "cold-result")
 				if err != nil || !reflect.DeepEqual(child.State(), initial) {
 					t.Fatalf("replay lost result projection: %v", err)

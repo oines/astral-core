@@ -7,20 +7,19 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
 )
 
 type controlFaultStore struct {
-	sessions.Store
+	astral.Store
 	stage  string
 	fired  atomic.Bool
 	cancel context.CancelFunc
 }
 
-func (s *controlFaultStore) Commit(ctx context.Context, id string, c sessions.Commit) (sessions.Receipt, error) {
-	target := sessions.EntryToolControl
+func (s *controlFaultStore) Commit(ctx context.Context, id string, c astral.Commit) (astral.Receipt, error) {
+	target := astral.EntryToolControl
 	if s.stage == "before-start" || s.stage == "started" {
-		target = sessions.EntryToolStarted
+		target = astral.EntryToolStarted
 	}
 	fail := false
 	for _, e := range c.Entries {
@@ -29,7 +28,7 @@ func (s *controlFaultStore) Commit(ctx context.Context, id string, c sessions.Co
 		}
 	}
 	if fail && (s.stage == "before-start" || s.stage == "before-control") {
-		return sessions.Receipt{}, errors.New("injected commit failure")
+		return astral.Receipt{}, errors.New("injected commit failure")
 	}
 	receipt, err := s.Store.Commit(ctx, id, c)
 	if err != nil {
@@ -39,15 +38,15 @@ func (s *controlFaultStore) Commit(ctx context.Context, id string, c sessions.Co
 		if s.stage == "cancel" {
 			s.cancel()
 		} else {
-			return sessions.Receipt{}, errors.New("lost commit acknowledgement")
+			return astral.Receipt{}, errors.New("lost commit acknowledgement")
 		}
 	}
 	return receipt, nil
 }
 
-func (s *controlFaultStore) LookupCommit(ctx context.Context, id, key string) (sessions.Receipt, error) {
+func (s *controlFaultStore) LookupCommit(ctx context.Context, id, key string) (astral.Receipt, error) {
 	if s.fired.Load() && (s.stage == "started" || s.stage == "unconfirmed-control") {
-		return sessions.Receipt{}, errors.New("commit query unavailable")
+		return astral.Receipt{}, errors.New("commit query unavailable")
 	}
 	return s.Store.LookupCommit(ctx, id, key)
 }
@@ -55,7 +54,7 @@ func (s *controlFaultStore) LookupCommit(ctx context.Context, id, key string) (s
 func TestToolControlCommitFailuresAndCancellation(t *testing.T) {
 	for _, stage := range []string{"before-start", "started", "before-control", "lost-ack", "unconfirmed-control", "cancel"} {
 		t.Run(stage, func(t *testing.T) {
-			eachStore(t, func(t *testing.T, base sessions.Store) {
+			eachStore(t, func(t *testing.T, base astral.Store) {
 				ctx := context.Background()
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
@@ -73,9 +72,9 @@ func TestToolControlCommitFailuresAndCancellation(t *testing.T) {
 				})
 				c := testConfig(m, st)
 				c.Tools = []astral.Tool{stop}
-				manager := newAgent(t, c)
-				s := newSession(t, manager, sessions.SessionOptions{})
-				run, err := s.Start(runCtx, astral.User("work"))
+				manager := newSessions(t, c)
+				s := newSession(t, manager, astral.SessionOptions{})
+				run, err := prompt(s, runCtx, astral.User("work"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -92,7 +91,7 @@ func TestToolControlCommitFailuresAndCancellation(t *testing.T) {
 					t.Fatal(err)
 				}
 				c.Store = base
-				reopened, err := newAgent(t, c).OpenSession(ctx, s.ID())
+				reopened, err := newSessions(t, c).OpenSession(ctx, s.ID())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -118,10 +117,10 @@ func TestToolControlCommitFailuresAndCancellation(t *testing.T) {
 					}
 					count := 0
 					for _, e := range entries(reopened) {
-						if e.Kind == sessions.EntryToolResult {
+						if e.Kind == astral.EntryToolResult {
 							t.Fatal("recovery synthesized an ordinary result")
 						}
-						if e.Kind == sessions.EntryToolUnresolved {
+						if e.Kind == astral.EntryToolUnresolved {
 							count++
 						}
 					}
@@ -158,7 +157,7 @@ func TestToolControlCommitFailuresAndCancellation(t *testing.T) {
 }
 
 func TestUnresolvedControlCanBeResolvedToOrdinaryResult(t *testing.T) {
-	eachStore(t, func(t *testing.T, base sessions.Store) {
+	eachStore(t, func(t *testing.T, base astral.Store) {
 		ctx := context.Background()
 		st := &controlFaultStore{Store: base, stage: "before-control"}
 		var effects atomic.Int32
@@ -174,7 +173,7 @@ func TestUnresolvedControlCanBeResolvedToOrdinaryResult(t *testing.T) {
 		})
 		c := testConfig(m, st)
 		c.Tools = []astral.Tool{stop}
-		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		if _, err := wait(t, start(t, s, "go")); err == nil {
 			t.Fatal("commit failure hidden")
 		}
@@ -205,7 +204,7 @@ func TestUnresolvedControlCanBeResolvedToOrdinaryResult(t *testing.T) {
 			t.Fatalf("host result missing: %v", got)
 		}
 		for _, e := range entries(s) {
-			if e.Kind == sessions.EntryToolControl || e.Kind == sessions.EntryToolResult {
+			if e.Kind == astral.EntryToolControl || e.Kind == astral.EntryToolResult {
 				t.Fatalf("unexpected completion fact: %s", e.Kind)
 			}
 		}
@@ -213,7 +212,7 @@ func TestUnresolvedControlCanBeResolvedToOrdinaryResult(t *testing.T) {
 }
 
 func TestCompletedToolControlSurvivesColdStoreReopen(t *testing.T) {
-	for _, backend := range []string{"jsonl", "sqlite"} {
+	for _, backend := range []string{"sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
@@ -231,8 +230,8 @@ func TestCompletedToolControlSurvivesColdStoreReopen(t *testing.T) {
 			})
 			c := testConfig(m, st)
 			c.Tools = []astral.Tool{stop}
-			a := newAgent(t, c)
-			s := newSession(t, a, sessions.SessionOptions{})
+			a := newSessions(t, c)
+			s := newSession(t, a, astral.SessionOptions{})
 			waitOK(t, start(t, s, "initial"))
 			if err := a.Close(ctx); err != nil {
 				t.Fatal(err)
@@ -240,7 +239,7 @@ func TestCompletedToolControlSurvivesColdStoreReopen(t *testing.T) {
 			closeStore()
 			c.Store, closeStore = durableStore(t, backend, dir)
 			defer closeStore()
-			reopened, err := newAgent(t, c).OpenSession(ctx, s.ID())
+			reopened, err := newSessions(t, c).OpenSession(ctx, s.ID())
 			if err != nil {
 				t.Fatal(err)
 			}

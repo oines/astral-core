@@ -14,23 +14,22 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	s "github.com/oines/astral-core/session"
 )
 
-func rolloutCrashFixture(t *testing.T, st *Store) s.ForkRequest {
+func rolloutCrashFixture(t *testing.T, st *Store) astral.ForkRequest {
 	t.Helper()
-	entries := []s.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: s.EntryCreated, Created: &s.CreationRecord{FormatVersion: s.FormatVersion, SessionID: "parent", RolloutID: "root-rollout"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: s.EntryConfiguration, Configuration: &s.Configuration{ModelID: "test"}}}
+	entries := []astral.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: astral.FormatVersion, SessionID: "parent", RolloutID: "root-rollout"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{ModelID: "test"}}}
 	parent := "config"
 	for i := 0; i < 700; i++ {
 		id := fmt.Sprintf("node-%d", i)
 		m := astral.User("durable ancestor")
-		entries = append(entries, s.Entry{ID: id, SessionID: "parent", Version: 1, ParentID: parent, Kind: s.EntryMessage, Message: &m})
+		entries = append(entries, astral.Entry{ID: id, SessionID: "parent", Version: 1, ParentID: parent, Kind: astral.EntryMessage, Message: &m})
 		parent = id
 	}
-	if _, err := st.Commit(context.Background(), "parent", s.Commit{ID: "fixture", Entries: entries}); err != nil {
+	if _, err := st.Commit(context.Background(), "parent", astral.Commit{ID: "fixture", Entries: entries}); err != nil {
 		t.Fatal(err)
 	}
-	return s.ForkRequest{SourceID: "parent", SourceRolloutID: "root-rollout", TargetID: "child", HeadID: parent, Mode: s.ForkDetached}
+	return astral.ForkRequest{SourceID: "parent", SourceRolloutID: "root-rollout", TargetID: "child", HeadID: parent, Mode: astral.ForkDetached}
 }
 func TestRolloutForkCrashWorker(t *testing.T) {
 	path := os.Getenv("ASTRAL_ROLLOUT_CRASH_PATH")
@@ -87,17 +86,17 @@ func TestRolloutForkSIGKILLPublicationAndRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer st.Close()
-			request := s.ForkRequest{SourceID: "parent", SourceRolloutID: "root-rollout", TargetID: "child", HeadID: "node-699", Mode: s.ForkDetached}
+			request := astral.ForkRequest{SourceID: "parent", SourceRolloutID: "root-rollout", TargetID: "child", HeadID: "node-699", Mode: astral.ForkDetached}
 			_, err = st.LoadState(ctx, "child")
 			if phase == "after_publish" && err != nil {
 				t.Fatalf("published child lost: %v", err)
 			}
-			if phase != "after_publish" && !errors.Is(err, s.ErrNotFound) {
+			if phase != "after_publish" && !errors.Is(err, astral.ErrNotFound) {
 				t.Fatalf("unpublished child visible: %v", err)
 			}
 			changed := request
 			changed.HeadID = "node-1"
-			if _, err = st.Fork(ctx, changed); !errors.Is(err, s.ErrConflict) {
+			if _, err = st.Fork(ctx, changed); !errors.Is(err, astral.ErrConflict) {
 				t.Fatalf("pending identity mismatch: %v", err)
 			}
 			child, err := st.Fork(ctx, request)
@@ -115,15 +114,15 @@ func TestRolloutForkSIGKILLPublicationAndRetry(t *testing.T) {
 			if err != nil || !reflect.DeepEqual(copied, original) {
 				t.Fatal("import changed provenance")
 			}
-			page, err := st.Scan(ctx, child.RolloutID, s.Query{Limit: 1000})
+			page, err := st.Scan(ctx, child.RolloutID, astral.Query{Limit: 1000})
 			if err != nil || len(page.Records) != 702 {
 				t.Fatalf("incomplete copy: %d %v", len(page.Records), err)
 			}
-			receipt, err := st.LookupCommit(ctx, "child", s.ForkCommitID)
+			receipt, err := st.LookupCommit(ctx, "child", astral.ForkCommitID)
 			if err != nil || receipt.Version != 1 {
 				t.Fatal("missing creation receipt")
 			}
-			if err = st.DiscardUnpublished(ctx, "child"); !errors.Is(err, s.ErrConflict) {
+			if err = st.DiscardUnpublished(ctx, "child"); !errors.Is(err, astral.ErrConflict) {
 				t.Fatal("published child cleanup accepted")
 			}
 		})

@@ -4,39 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"reflect"
+
 	"sync/atomic"
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
+	"github.com/oines/astral-core/store/memory"
 )
 
-func eachControlEngine(t *testing.T, test func(*testing.T, sessions.Store)) {
+func eachControlEngine(t *testing.T, test func(*testing.T, astral.Store)) {
 	t.Helper()
-	t.Run("standalone", func(t *testing.T) { test(t, nil) })
 	eachStore(t, test)
 }
-
-func controlEndpoint(t *testing.T, store sessions.Store, c astral.Config) (contextEndpoint, *sessions.Session) {
+func controlEndpoint(t *testing.T, store astral.Store, c astral.Config) (contextEndpoint, *astral.Session) {
 	t.Helper()
-	c.Retry.MaxAttempts = 1
 	if store == nil {
-		a, err := astral.New(c)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = a.Close(context.Background()) })
-		return a, nil
+		store = memory.New()
 	}
 	config := testConfig(c.Model, store)
-	config.Tools, config.AfterToolCall, config.FinishTurn = c.Tools, c.AfterToolCall, c.FinishTurn
-	if c.BeforeToolCall != nil {
-		config.BeforeToolCall = func(ctx context.Context, tc sessions.ToolContext) (astral.ToolDecision, error) {
-			return c.BeforeToolCall(ctx, tc.Invocation)
-		}
-	}
-	s := newSession(t, newAgent(t, config), sessions.SessionOptions{})
+	config.Tools, config.AfterToolCall, config.BeforeToolCall = c.Tools, c.AfterToolCall, c.BeforeToolCall
+	s := newSession(t, newSessions(t, config), astral.SessionOptions{})
 	return s, s
 }
 
@@ -67,26 +55,25 @@ func checkControlProjection(t *testing.T, messages []astral.Message) {
 	}
 }
 
-func checkControlHistory(t *testing.T, s *sessions.Session, reason string) string {
+func checkControlHistory(t *testing.T, s *astral.Session, reason string) string {
 	t.Helper()
 	all := entries(s)
 	controlID := ""
 	for i, e := range all {
-		if e.Kind == sessions.EntryToolResult {
+		if e.Kind == astral.EntryToolResult {
 			t.Fatal("control created an ordinary ToolResult")
 		}
-		if e.Kind != sessions.EntryToolControl {
+		if e.Kind != astral.EntryToolControl {
 			continue
 		}
 		if controlID != "" || e.Tool.Result != nil || e.Tool.Control == nil || e.Tool.Control.Reason != reason {
 			t.Fatalf("invalid control fact: %+v", e)
 		}
 		controlID = e.ID
-		if i+2 >= len(all) || all[i+1].Kind != sessions.EntryTurn || all[i+2].Kind != sessions.EntryRun ||
-			all[i+1].Version != e.Version || all[i+2].Version != e.Version ||
-			all[i+2].Run.Status != "completed" || all[i+2].Run.EndReason != reason {
-			t.Fatal("tool completion and Run termination were not one atomic commit")
+		if i+1 >= len(all) || all[i+1].Kind != astral.EntryRun || all[i+1].Version != e.Version || all[i+1].Run.Status != "completed" || all[i+1].Run.EndReason != reason {
+			t.Fatal("tool completion and activation termination were not atomic")
 		}
+
 	}
 	if controlID == "" {
 		t.Fatal("missing durable control fact")
@@ -94,130 +81,58 @@ func checkControlHistory(t *testing.T, s *sessions.Session, reason string) strin
 	return controlID
 }
 
-func TestToolEndRunPreservesInputsAndSkipsResultHooks(t *testing.T) {
-	for _, mode := range []string{"empty", "passive", "driving"} {
-		t.Run(mode, func(t *testing.T) {
-			queued, passive := mode == "driving", mode != "empty"
-			eachControlEngine(t, func(t *testing.T, store sessions.Store) {
-				ctx := context.Background()
-				entered, release := make(chan struct{}), make(chan struct{})
-				var effects, after, finish atomic.Int32
-				stop := controlTool("host_decides_to_stop", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
-					effects.Add(1)
-					close(entered)
-					<-release
-					return astral.ToolExecution{EndRun: &astral.RunEnd{Reason: "host_choice"}}, nil
-				})
-				m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-					if n == 1 {
-						return controlReply(stop.Spec.Name), nil
-					}
-					return answer("next activation"), nil
-				})
-				e, s := controlEndpoint(t, store, astral.Config{Model: m, Tools: []astral.Tool{stop},
-					AfterToolCall: func(context.Context, astral.Invocation, astral.ToolResult) (astral.ToolResultPatch, error) {
-						after.Add(1)
-						return astral.ToolResultPatch{}, nil
-					},
-					FinishTurn: func(context.Context, astral.TurnContext) (astral.TurnDecision, error) {
-						finish.Add(1)
-						return astral.TurnDefault, nil
-					}})
-				sub := e.Subscribe(256)
-				defer sub.Close()
-				run, err := e.Start(ctx, astral.User("initial"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				signal(t, entered)
-				if queued {
-					if _, err = e.Steer(ctx, astral.User("steer")); err != nil {
-						t.Fatal(err)
-					}
-					if _, err = e.FollowUp(ctx, astral.User("follow up")); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if passive {
-					if _, err = e.InjectContext(ctx, []astral.Message{astral.User("passive observation")}); err != nil {
-						t.Fatal(err)
-					}
-				}
-				close(release)
-				result := waitOK(t, run)
-				if result.Status != "completed" || result.EndReason != "host_choice" || len(m.observed()) != 1 || effects.Load() != 1 || after.Load() != 0 || finish.Load() != 0 {
-					t.Fatalf("incorrect terminal path: result=%+v models=%d effects=%d after=%d finish=%d", result, len(m.observed()), effects.Load(), after.Load(), finish.Load())
-				}
-				var terminal []astral.EventType
-				for len(sub.C) > 0 {
-					event := <-sub.C
-					if event.Type == astral.EventContextApplied {
-						t.Fatal("terminal path drained passive input")
-					}
-					if event.Type == astral.EventToolEnd || event.Type == astral.EventTurnEnd || event.Type == astral.EventRunEnd {
-						terminal = append(terminal, event.Type)
-					}
-					if event.Type == astral.EventRunEnd && (event.Status != "completed" || event.EndReason != "host_choice" || event.Error != "") {
-						t.Fatalf("wrong RunEnd event: %+v", event)
-					}
-				}
-				if !reflect.DeepEqual(terminal, []astral.EventType{astral.EventToolEnd, astral.EventTurnEnd, astral.EventRunEnd}) {
-					t.Fatalf("terminal events: %v", terminal)
-				}
-				pending, err := e.PeekQueuedInputs(ctx)
-				if err != nil || len(pending) != map[bool]int{false: 0, true: 2}[queued] {
-					t.Fatalf("driving queue changed: %+v %v", pending, err)
-				}
-				if s != nil {
-					checkControlHistory(t, s, "host_choice")
-					if passive && s.State().PendingInputs[sessions.InputContext] != 1 {
-						t.Fatal("passive queue changed")
-					}
-					view, err := s.InspectContext(ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					checkControlProjection(t, view.Request.Messages)
-				}
-				if queued {
-					run, err = e.Continue(ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					next := waitOK(t, run)
-					if next.RunID == result.RunID || next.EndReason != "" || len(m.observed()) != 3 {
-						t.Fatalf("queued activation did not start a new Run: %+v", next)
-					}
-					if !hasMessage(m.observed()[1].Messages, astral.User("passive observation")) {
-						t.Fatal("passive observation was lost")
-					}
-				}
-				if _, err = e.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
-					t.Fatalf("empty continuation: %v", err)
-				}
-				run, err = e.Start(ctx, astral.User("new prompt"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				waitOK(t, run)
-				if passive && !hasMessage(m.observed()[1].Messages, astral.User("passive observation")) {
-					t.Fatal("next activation lost pending passive context")
-				}
-				for _, request := range m.observed()[1:] {
-					checkControlProjection(t, request.Messages)
-				}
-				if effects.Load() != 1 {
-					t.Fatal("completed control executed again")
-				}
-			})
+func TestToolEndRunDrainsIndependentInputsAndSkipsResultHooks(t *testing.T) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
+		ctx := context.Background()
+		entered, release := make(chan struct{}), make(chan struct{})
+		var effects, after atomic.Int32
+		stop := controlTool("no_reply", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
+			effects.Add(1)
+			close(entered)
+			<-release
+			return astral.ToolExecution{EndRun: &astral.RunEnd{Reason: "no_reply"}}, nil
 		})
-	}
+		m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+			if n == 1 {
+				return controlReply(stop.Spec.Name), nil
+			}
+			return answer("next activation"), nil
+		})
+		e, s := controlEndpoint(t, store, astral.Config{Model: m, Tools: []astral.Tool{stop}, AfterToolCall: func(context.Context, astral.Invocation, astral.ToolResult) (astral.ToolResultPatch, error) {
+			after.Add(1)
+			return astral.ToolResultPatch{}, nil
+		}})
+		run, err := prompt(e, ctx, astral.User("initial"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		signal(t, entered)
+		if _, err = steer(e, ctx, astral.User("steer")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = followUp(e, ctx, astral.User("follow up")); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		result := waitOK(t, run)
+		waitSessionIdle(t, s)
+		if result.Status != "completed" || result.EndReason != "no_reply" || len(m.observed()) != 3 || effects.Load() != 1 || after.Load() != 0 {
+			t.Fatalf("terminal/queued path: %+v models=%d effects=%d hooks=%d", result, len(m.observed()), effects.Load(), after.Load())
+		}
+		checkControlHistory(t, s, "no_reply")
+		for _, request := range m.observed()[1:] {
+			checkControlProjection(t, request.Messages)
+		}
+		if _, err := s.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestControlBatchValidationPrecedesEveryToolEffect(t *testing.T) {
 	for _, kind := range []string{"control-first", "control-last", "two-controls", "text", "image", "extension", "exclusive"} {
 		t.Run(kind, func(t *testing.T) {
-			eachControlEngine(t, func(t *testing.T, store sessions.Store) {
+			eachControlEngine(t, func(t *testing.T, store astral.Store) {
 				var effects, before atomic.Int32
 				stop := controlTool("halt", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 					effects.Add(1)
@@ -251,11 +166,11 @@ func TestControlBatchValidationPrecedesEveryToolEffect(t *testing.T) {
 					return reply, nil
 				})
 				e, s := controlEndpoint(t, store, astral.Config{Model: m, Tools: []astral.Tool{stop, work, exclusive},
-					BeforeToolCall: func(context.Context, astral.Invocation) (astral.ToolDecision, error) {
+					BeforeToolCall: func(context.Context, astral.ToolContext) (astral.ToolDecision, error) {
 						before.Add(1)
 						return astral.ToolDecision{}, nil
 					}})
-				run, err := e.Start(context.Background(), astral.User("work"))
+				run, err := prompt(e, context.Background(), astral.User("work"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -264,7 +179,7 @@ func TestControlBatchValidationPrecedesEveryToolEffect(t *testing.T) {
 				}
 				if s != nil {
 					for _, entry := range entries(s) {
-						if entry.Kind == sessions.EntryMessage && entry.Message.Role == astral.RoleAssistant && !entry.Message.Failed() {
+						if entry.Kind == astral.EntryMessage && entry.Message.Role == astral.RoleAssistant && !entry.Message.Failed() {
 							t.Fatal("invalid reply committed as a valid assistant")
 						}
 					}
@@ -277,7 +192,7 @@ func TestControlBatchValidationPrecedesEveryToolEffect(t *testing.T) {
 func TestControlReturnValidationAndOrdinaryResultFallback(t *testing.T) {
 	for _, kind := range []string{"empty", "both", "undeclared", "error", "result"} {
 		t.Run(kind, func(t *testing.T) {
-			eachControlEngine(t, func(t *testing.T, store sessions.Store) {
+			eachControlEngine(t, func(t *testing.T, store astral.Store) {
 				stop := controlTool("finish_if_ready", func(context.Context, astral.Invocation, func(astral.ToolProgress)) (astral.ToolExecution, error) {
 					switch kind {
 					case "empty":
@@ -302,7 +217,7 @@ func TestControlReturnValidationAndOrdinaryResultFallback(t *testing.T) {
 					return answer("ordinary completion"), nil
 				})
 				e, s := controlEndpoint(t, store, astral.Config{Model: m, Tools: []astral.Tool{stop}})
-				run, err := e.Start(context.Background(), astral.User("work"))
+				run, err := prompt(e, context.Background(), astral.User("work"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -313,7 +228,7 @@ func TestControlReturnValidationAndOrdinaryResultFallback(t *testing.T) {
 				}
 				if s != nil {
 					for _, entry := range entries(s) {
-						if entry.Kind == sessions.EntryToolControl {
+						if entry.Kind == astral.EntryToolControl {
 							t.Fatal("non-control return created a control fact")
 						}
 					}

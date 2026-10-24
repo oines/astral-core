@@ -12,8 +12,8 @@ type batchOutcome struct {
 	EndRun  *RunEnd
 }
 
-func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (batchOutcome, error) {
-	state := a.driver.Snapshot()
+func (a *Session) executeBatch(ctx context.Context, run *Run, assistant Frame) (batchOutcome, error) {
+	state := a.executionSnapshot()
 	definitions := map[string]ToolDefinition{}
 	declarations := state.BatchTools
 	if declarations == nil {
@@ -70,7 +70,7 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (ba
 	}
 	// A committed control is the terminal fact. A concurrent cancellation cannot
 	// turn that completed Run into a cancelled one.
-	if end := a.driver.Snapshot().controlEnd(); end != nil {
+	if end := a.executionSnapshot().controlEnd(); end != nil {
 		return batchOutcome{Natural: true, EndRun: clone(end)}, nil
 	}
 	if err := errors.Join(append(errs, ctx.Err())...); err != nil {
@@ -82,13 +82,13 @@ func (a *Agent) executeBatch(ctx context.Context, run *Run, assistant Frame) (ba
 	}
 	return batchOutcome{Natural: terminate}, nil
 }
-func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call ToolCall, definition ToolDefinition, skip, preflight bool) (result ToolResult, err error) {
+func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, call ToolCall, definition ToolDefinition, skip, preflight bool) (result ToolResult, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("tool pipeline panicked: %v", p)
 		}
 	}()
-	snapshot := a.driver.Snapshot()
+	snapshot := a.executionSnapshot()
 	state := snapshot.Calls[call.ID]
 	if state.Control != nil {
 		return ToolResult{}, nil
@@ -138,7 +138,7 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 			}
 			inv.Binding = binding
 		}
-		if err = a.commitTool(ctx, TransitionPrepared, inv, nil, nil, false); err != nil {
+		if err = a.commitTool(ctx, EntryToolPrepared, inv, nil, nil, false); err != nil {
 			return ToolResult{}, err
 		}
 	}
@@ -147,12 +147,14 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 		decision = *state.Decision
 	} else {
 		if a.config.BeforeToolCall != nil {
-			decision, err = beforeTool(ctx, a.config.BeforeToolCall, clone(inv))
+			decision, err = beforeTool(ctx, a.config.BeforeToolCall, ToolContext{Invocation: clone(inv), awaitApproval: func(ctx context.Context, request ApprovalRequest) (ApprovalDecision, error) {
+				return a.awaitApproval(ctx, inv, request)
+			}})
 			if err != nil {
 				return a.commitToolResult(ctx, inv, toolFailure("before_tool_failed", "Tool was not executed: "+err.Error(), OutcomeNotExecuted), false)
 			}
 		}
-		if err = a.commitTool(ctx, TransitionAuthorized, inv, &decision, nil, false); err != nil {
+		if err = a.commitTool(ctx, EntryToolAuthorized, inv, &decision, nil, false); err != nil {
 			return ToolResult{}, err
 		}
 	}
@@ -167,15 +169,15 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 	if ctx.Err() != nil {
 		return a.commitToolResult(ctx, inv, toolFailure("cancelled", "Cancelled before tool execution.", OutcomeNotExecuted), false)
 	}
-	if err = a.commitTool(ctx, TransitionStarted, inv, nil, nil, false); err != nil {
+	if err = a.commitTool(ctx, EntryToolStarted, inv, nil, nil, false); err != nil {
 		return ToolResult{}, err
 	}
 	if ctx.Err() != nil {
 		return a.commitToolResult(ctx, inv, toolFailure("cancelled", "Cancelled before dispatch.", OutcomeNotExecuted), false)
 	}
-	a.Publish(Event{Type: EventToolStart, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID})
+	a.publish(Event{Type: EventToolStart, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID})
 	execution, executeErr := invokeTool(ctx, registered.tool, inv, func(p ToolProgress) {
-		a.Publish(Event{Type: EventToolUpdate, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID, Progress: &p})
+		a.publish(Event{Type: EventToolUpdate, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID, Progress: &p})
 	})
 	if execution.Result != nil {
 		result = *execution.Result
@@ -218,7 +220,7 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 	}
 	fact := ToolResult{Outcome: result.Outcome, Artifact: result.Artifact, Terminate: result.Terminate}
 	cleanup, cancel := persistContext(ctx)
-	err = a.commitTool(cleanup, TransitionCompleted, inv, nil, &fact, false)
+	err = a.commitTool(cleanup, EntryToolCompleted, inv, nil, &fact, false)
 	cancel()
 	if err != nil {
 		return ToolResult{}, err
@@ -242,44 +244,33 @@ func (a *Agent) executeTool(ctx context.Context, run *Run, assistant Frame, call
 	return a.commitToolResult(ctx, inv, result, result.Outcome == OutcomeUnknown)
 }
 
-func (a *Agent) commitToolControl(ctx context.Context, runID string, inv Invocation, end RunEnd) error {
+func (s *Session) commitToolControl(ctx context.Context, runID string, inv Invocation, end RunEnd) error {
 	cleanup, cancel := persistContext(ctx)
 	defer cancel()
-	id := newID()
-	if err := a.driver.Commit(cleanup, Transition{Kind: TransitionToolControl, ID: id, RunID: runID, TurnID: inv.TurnID, Invocation: inv, Control: &end}); err != nil {
-		return err
-	}
-	a.Publish(Event{Type: EventToolEnd, RunID: runID, TurnID: inv.TurnID, ToolCallID: inv.Call.ID, ExecutionID: inv.ExecutionID, EntryID: id, Status: "completed", EndReason: end.Reason})
-	return nil
-}
-
-func (a *Agent) commitToolUnresolved(ctx context.Context, inv Invocation) error {
-	cleanup, cancel := persistContext(ctx)
-	defer cancel()
-	id := newID()
-	if err := a.driver.Commit(cleanup, Transition{Kind: TransitionToolUnresolved, ID: id, RunID: inv.RunID, TurnID: inv.TurnID, Invocation: inv, NeedsResolution: true}); err != nil {
-		return err
-	}
-	err := &UnknownOutcomeError{ExecutionID: inv.ExecutionID}
-	a.Publish(Event{Type: EventToolEnd, RunID: inv.RunID, TurnID: inv.TurnID, ToolCallID: inv.Call.ID, ExecutionID: inv.ExecutionID, EntryID: id, Error: err.Error()})
+	_, err := s.append(cleanup, Entry{Kind: EntryToolControl, RunID: runID, TurnID: inv.TurnID, Tool: &ToolRecord{Invocation: inv, Control: &end}}, Entry{Kind: EntryRun, RunID: runID, Run: &RunRecord{ID: runID, Status: "completed", EndReason: end.Reason}})
 	return err
 }
-func (a *Agent) commitTool(ctx context.Context, kind TransitionKind, inv Invocation, decision *ToolDecision, result *ToolResult, needs bool) error {
-	return a.driver.Commit(ctx, Transition{Kind: kind, ID: newID(), RunID: inv.RunID, TurnID: inv.TurnID, Invocation: inv, Decision: decision, Result: result, NeedsResolution: needs})
+func (s *Session) commitToolUnresolved(ctx context.Context, inv Invocation) error {
+	cleanup, cancel := persistContext(ctx)
+	defer cancel()
+	_, err := s.append(cleanup, Entry{Kind: EntryToolUnresolved, RunID: inv.RunID, TurnID: inv.TurnID, Tool: &ToolRecord{Invocation: inv, NeedsResolution: true}})
+	if err == nil {
+		return &UnknownOutcomeError{ExecutionID: inv.ExecutionID}
+	}
+	return err
 }
-func (a *Agent) commitToolResult(ctx context.Context, inv Invocation, result ToolResult, needs bool) (ToolResult, error) {
+func (s *Session) commitTool(ctx context.Context, kind EntryKind, inv Invocation, decision *ToolDecision, result *ToolResult, needs bool) error {
+	_, err := s.append(ctx, Entry{Kind: kind, RunID: inv.RunID, TurnID: inv.TurnID, Tool: &ToolRecord{Invocation: inv, Decision: decision, Result: result, NeedsResolution: needs}})
+	return err
+}
+func (s *Session) commitToolResult(ctx context.Context, inv Invocation, result ToolResult, needs bool) (ToolResult, error) {
 	cleanup, cancel := persistContext(ctx)
 	defer cancel()
 	result = normalizeResult(result)
-	bounded, budgetErr := a.driver.AcceptResult(cleanup, inv, result)
-	result = bounded
-	id := newID()
-	if err := a.driver.Commit(cleanup, Transition{Kind: TransitionResult, ID: id, RunID: inv.RunID, TurnID: inv.TurnID, Invocation: inv, Result: &result, NeedsResolution: needs}); err != nil {
-		return result, err
+	bounded, budgetErr := s.boundResult(cleanup, inv, result)
+	err := s.commitTool(cleanup, EntryToolResult, inv, nil, &bounded, needs)
+	if err == nil && needs {
+		err = &UnknownOutcomeError{ExecutionID: inv.ExecutionID}
 	}
-	a.Publish(Event{Type: EventToolEnd, RunID: inv.RunID, TurnID: inv.TurnID, ToolCallID: inv.Call.ID, ExecutionID: inv.ExecutionID, EntryID: id})
-	if needs {
-		return result, &UnknownOutcomeError{ExecutionID: inv.ExecutionID}
-	}
-	return result, budgetErr
+	return bounded, errors.Join(budgetErr, err)
 }
