@@ -36,6 +36,15 @@ type Store interface {
 	Fork(context.Context, ForkRequest) (RuntimeState, error)
 }
 
+// SessionDeleter is an optional host maintenance capability. The host must
+// close the Session and prevent new execution before calling it. Deletion is
+// atomic and idempotent, and removes history, attempts, inputs and receipts.
+// A Rollout shared by multiple Sessions returns ErrConflict without changes;
+// detached Forks own their copies and are not affected.
+type SessionDeleter interface {
+	DeleteSession(context.Context, string) error
+}
+
 // Record pairs immutable history with the branch projection at that node.
 // Operational entries have no Projection.
 type Record struct {

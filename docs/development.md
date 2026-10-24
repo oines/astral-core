@@ -51,6 +51,7 @@ CGO_ENABLED=0 go test ./store/sqlite ./tests/integration
 | `context_injection_test.go` / `steering_test.go` | 多模态、FIFO、完整投递组、被动上下文、清除、预算及两后端一致性 |
 | `model_recovery_test.go` / `model_snapshot_test.go` | 受限协议修复、实际请求审计、冻结附件、不重复工具、只支持新格式 |
 | `attempt_crash_test.go` / `attempt_store_test.go` | 输入/回复原子边界的真实强杀、回执丢失、冻结续接、失败回滚、跨分支隔离 |
+| `delete_test.go` | 私有 Rollout 永久删除、幂等、Detached 副本独立、拒绝误删共享历史 |
 | `request_input_test.go` | 消息裁剪与 reasoning 删除保留图片引用、结构差异重建、opaque JSON 整数精度 |
 | `execution_semantics_test.go` / `lifecycle_test.go` | Continue、串行预检、不可变目标、平衡终止事件、关闭与模型选择竞争 |
 | `tool_control*_test.go` | EndRun 原子完成、已排队独立输入、恢复、Fork、投影与未知控制效果 |

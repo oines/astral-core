@@ -99,6 +99,8 @@ MayEndRun 要求唯一 ToolCall，允许 Reasoning、不允许普通正文。返
 
 格式 **10** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
 
+可选维护接口 SessionDeleter.DeleteSession 由 Memory 和 SQLite 实现。Host 必须先停止并关闭目标 Session、阻止新的执行，再调用原子、幂等的永久删除；它清除私有 Rollout 的历史、Attempt、输入、队列与提交回执。多个 Session 共享同一 Rollout 时返回 ErrConflict，保留全部数据。Detached Fork 拥有独立副本，不受来源删除影响。删除业务元数据、索引和恢复未完成维护由 Host 负责，不调用模型或工具。
+
 Commit 包含稳定 ID、ExpectedVersion、Entries 和 Attempts 变更。Store 在一次原子操作中检查 CAS、分配 Rollout Sequence、执行同一个 Reduce 与 ApplyAttemptMutation、保存记录、Projection、RuntimeState、Attempt、Pending、Input 索引及回执。只有 Attempt 变更的提交仍推进 Session Version，Receipt 的 FirstSequence/LastSequence 均为零，不占用 Rollout Sequence。Entry.Version 是写入 Session 的本地版本；Entry.Sequence 是 Rollout 顺序，两者独立。创建 Attempt 时必须验证固定 Head 的协议完整性、Configuration 引用与归属；成功结果只能关联同一提交中新写入的合法节点。
 
 确认前 Session 不推进缓存。错误后最多用独立 5 秒 Context 查询 LookupCommit，验证 ID、Digest、Version 和 CurrentVersion；其他所有者已推进版本时仍停止。相同 Commit ID 相同内容幂等，不同内容冲突。Reload 只供 Host 重新建立独占所有权后的空闲句柄使用。
