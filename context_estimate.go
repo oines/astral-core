@@ -33,7 +33,8 @@ func contextDigest(request Request) string {
 // reopen/fork on its assistant entry; no scan through archived attempts is needed.
 func (s *Session) estimateContext(ctx context.Context, model Model, view Context) (int, error) {
 	a := view.anchor
-	if a == nil || !a.usage.Available || a.index >= len(view.Request.Messages) || a.generation.ContextDigest == "" ||
+	if a == nil || !a.usage.Available || a.usage.InputMissing || a.usage.OutputMissing ||
+		a.index >= len(view.Request.Messages) || a.generation.ContextDigest == "" ||
 		a.generation.ConfigurationID != view.ConfigurationID || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
 		(a.usage.InputTokens == 0 && a.usage.OutputTokens == 0) {
 		return estimate(ctx, model, view.Request)

@@ -114,8 +114,13 @@ type Usage struct {
 	// breakdowns, never additional input to be summed into context usage.
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
-	// Available distinguishes a provider's reported zero usage from no report.
-	Available         bool `json:"available,omitempty"`
+	// Available distinguishes a provider's reported zero usage from no report;
+	// individual counts may still be missing.
+	Available bool `json:"available,omitempty"`
+	// Missing flags are true only when the adapter knows the provider omitted
+	// that count. False preserves the meaning of existing records and callers.
+	InputMissing      bool `json:"input_missing,omitempty"`
+	OutputMissing     bool `json:"output_missing,omitempty"`
 	CachedInputTokens *int `json:"cached_input_tokens,omitempty"`
 	CacheWriteTokens  *int `json:"cache_write_tokens,omitempty"`
 	ReasoningTokens   *int `json:"reasoning_tokens,omitempty"`

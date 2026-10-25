@@ -111,7 +111,7 @@ config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary)
 
 普通输出按 `min(期望输出或模型最大输出, ContextWindow - 输入 - SafetyMargin)` 计算，`SafetyMargin` 默认 4096，不叠加到提前压缩阈值或 `MaxInputTokens` 上。没有至少一个 token 的可用输出空间时拒绝发送。`MaxInputTokens` 和字节上限仍独立检查。
 
-输入优先使用当前投影中最近有效普通生成的实报 `InputTokens + OutputTokens`，再加后续新增消息的估算；`InputTokens` 已包含缓存输入，缓存分项不重复相加。成功 assistant 的 `Generation` 记录明确关联 Attempt、冻结请求和上下文指纹，重开/Fork 可恢复，无需扫描归档尝试。压缩、配置/模型变化或回放修复改变前缀时，回退到整份内容估算。摘要用量、失败回复、未报告或全零用量不能作为基线；旧记录缺少关联信息时也回退，直到下一次成功普通生成。
+输入优先使用当前投影中最近有效普通生成的实报 `InputTokens + OutputTokens`，再加后续新增消息的估算；`InputTokens` 已包含缓存输入，缓存分项不重复相加。`Usage.Available` 只表示提供商报告过用量，适配器确认输入或输出计数缺失时分别设置 `InputMissing` / `OutputMissing`；只有 `Available` 为 true、两个缺失标记均为 false 的完整用量可作基线。旧记录和未设置新标记的调用方保持原有语义；单项明确报告为零仍是有效计数，不完整用量照常保存供审计；最新回复不完整时继续寻找更早的有效完整基线，其后的消息按尾段估算。成功 assistant 的 `Generation` 记录明确关联 Attempt、冻结请求和上下文指纹，重开/Fork 可恢复，无需扫描归档尝试。压缩、配置/模型变化或回放修复改变前缀时，回退到整份内容估算。摘要用量、失败回复、未报告、不完整或全零用量不能作为基线；旧记录缺少关联信息时也回退，直到下一次成功普通生成。
 
 `TokenEstimator` 必须接受完整请求、空请求和不带 System/Tools/Options 的消息尾段；后两者只用于估算，不发送给模型。可选的 `RequestValidator` 在最终输出长度确定后校验完整协议与参数，在输入和摘要提交之前失败。完整请求与尾段使用同一套内容估算，尾段减去空请求的固定开销。
 

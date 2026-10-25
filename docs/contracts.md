@@ -43,7 +43,7 @@ CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返�
 
 默认摘要使用 Goal、Constraints & Preferences、Progress（Done / In Progress / Blocked）、Key Decisions、Next Steps、Critical Context 结构。已有摘要作为首条源消息参与下一次压缩；更新指令要求保留仍有效的目标与约束，合并新进展和决策，更新完成状态、阻塞与下一步，并保留准确路径、标识符和错误信息。模型只生成交接摘要，不继续执行源对话中的任务，也不能把未经确认的操作写成已完成。自定义 Compaction.SystemPrompt 可覆盖默认格式。
 
-MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。缺失、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
+MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。Usage.Available 仅表示存在用量报告；适配器确认提供商遗漏输入或输出计数时，分别设置 InputMissing / OutputMissing（JSON 为 input_missing / output_missing，false 省略）。两个缺失标记默认 false，保持旧记录和现有调用方的语义；单项明确报告为零不表示缺失。不完整用量仍保存于消息与 Attempt 供审计，只有 Available 且两个缺失标记均为 false 的用量可充当基线。最新回复不完整时继续查找更早的完整基线，并将它之后的消息纳入尾段估算。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。未报告、不完整、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
 
 默认压缩条件为 Input > ContextWindow - 16384，近期保留目标 20000，摘要输出 min(floor(0.8 × ReserveTokens), 摘要模型最大输出)。按 ModelBudgets 可覆盖普通模型的 ReserveTokens / KeepRecentTokens。普通输出 min(期望输出或模型最大输出, ContextWindow - Input - 4096)，可用输出不足 1 时拒绝发送。SafetyMargin 只预留输出空间，不叠加到压缩阈值或独立的 MaxInputTokens 上；摘要仍独立检查完整请求与输出预算。单个工具结果不可交付时保存有界的交付失败结果与真实 Outcome；聚合压力在准备阶段处理，不改写成功工具的执行事实。
 
