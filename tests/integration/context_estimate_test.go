@@ -2,7 +2,9 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -134,20 +136,164 @@ func TestUsageAnchorInvalidatesForConfigurationModelAndCompaction(t *testing.T) 
 }
 
 func TestMissingAndZeroUsageUseContentEstimate(t *testing.T) {
-	for _, usage := range []core.Usage{{}, {InputTokens: 1234}, {Available: true}, {Available: true, InputTokens: -1, OutputTokens: 5}} {
-		m := model(func(context.Context, int, core.Request, func(core.ModelEvent)) (core.Reply, error) {
-			reply := answer("answer")
-			reply.Usage = usage
-			return reply, nil
+	for _, tc := range []struct {
+		name  string
+		usage core.Usage
+	}{
+		{"missing-report", core.Usage{}},
+		{"unavailable-report", core.Usage{InputTokens: 1234}},
+		{"reported-zero", core.Usage{Available: true}},
+		{"negative-input", core.Usage{Available: true, InputTokens: -1, OutputTokens: 5}},
+		{"missing-input", core.Usage{Available: true, InputMissing: true, OutputTokens: 75}},
+		{"missing-output", core.Usage{Available: true, InputTokens: 1000, OutputMissing: true}},
+		{"missing-both", core.Usage{Available: true, InputMissing: true, OutputMissing: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eachStore(t, func(t *testing.T, store core.Store) {
+				ctx := context.Background()
+				m := model(func(context.Context, int, core.Request, func(core.ModelEvent)) (core.Reply, error) {
+					reply := answer("answer")
+					reply.Usage = tc.usage
+					return reply, nil
+				})
+				m.estimator = contentEstimate
+				c := testConfig(m, store)
+				s := newSession(t, newSessions(t, c), core.SessionOptions{})
+				waitOK(t, start(t, s, "hello"))
+				check := func(session *core.Session) {
+					t.Helper()
+					view, err := session.InspectContext(ctx)
+					want, _ := contentEstimate(view.Request)
+					if err != nil || view.EstimatedInput != want {
+						t.Fatalf("input=%d want=%d err=%v", view.EstimatedInput, want, err)
+					}
+					entry, err := session.History().Get(ctx, session.Head())
+					if err != nil || entry.Generation == nil || !reflect.DeepEqual(entry.Usage, tc.usage) {
+						t.Fatalf("reply usage changed: %+v err=%v", entry, err)
+					}
+					attempt, err := session.Attempts().Get(ctx, entry.Generation.AttemptID)
+					if err != nil || attempt.Outcome == nil || !reflect.DeepEqual(attempt.Outcome.Usage, tc.usage) {
+						t.Fatalf("attempt usage changed: %+v err=%v", attempt, err)
+					}
+				}
+				check(s)
+				if err := s.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err := core.OpenSession(ctx, c, s.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reopened.Close(ctx)
+				check(reopened)
+			})
 		})
-		m.estimator = contentEstimate
-		s := newSession(t, newSessions(t, testConfig(m, memory.New())), core.SessionOptions{})
-		waitOK(t, start(t, s, "hello"))
-		view, err := s.InspectContext(context.Background())
-		want, _ := contentEstimate(view.Request)
-		if err != nil || view.EstimatedInput != want {
-			t.Fatalf("input=%d want=%d err=%v", view.EstimatedInput, want, err)
-		}
+	}
+}
+
+func TestReportedSingleZeroUsageCanAnchorContext(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		usage core.Usage
+		want  int
+	}{
+		{"zero-input", core.Usage{Available: true, OutputTokens: 75}, 75},
+		{"zero-output", core.Usage{Available: true, InputTokens: 1000}, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := model(func(context.Context, int, core.Request, func(core.ModelEvent)) (core.Reply, error) {
+				reply := answer("answer")
+				reply.Usage = tc.usage
+				return reply, nil
+			})
+			m.estimator = contentEstimate
+			s := newSession(t, newSessions(t, testConfig(m, memory.New())), core.SessionOptions{})
+			waitOK(t, start(t, s, "hello"))
+			view, err := s.InspectContext(context.Background())
+			if err != nil || view.EstimatedInput != tc.want {
+				t.Fatalf("input=%d want=%d err=%v", view.EstimatedInput, tc.want, err)
+			}
+		})
+	}
+}
+
+func TestIncompleteUsageKeepsEarlierAnchorAcrossReopenAndFork(t *testing.T) {
+	for _, missing := range []string{"input", "output"} {
+		t.Run(missing, func(t *testing.T) {
+			eachStore(t, func(t *testing.T, store core.Store) {
+				ctx := context.Background()
+				m := model(func(_ context.Context, n int, _ core.Request, _ func(core.ModelEvent)) (core.Reply, error) {
+					reply := answer("answer")
+					reply.Usage = core.Usage{Available: true, InputTokens: 1000, OutputTokens: 75}
+					if n > 1 {
+						reply.Usage = core.Usage{Available: true, InputMissing: missing == "input", OutputMissing: missing == "output", InputTokens: 2000, OutputTokens: 150}
+					}
+					return reply, nil
+				})
+				var rejectOld atomic.Bool
+				m.estimator = func(r core.Request) (int, error) {
+					if rejectOld.Load() && strings.Contains(requestText(r), "old-history") {
+						return 0, errors.New("old covered messages were estimated again")
+					}
+					return contentEstimate(r)
+				}
+				c := testConfig(m, store)
+				s := newSession(t, newSessions(t, c), core.SessionOptions{})
+				waitOK(t, start(t, s, strings.Repeat("old-history", 1000)))
+				rejectOld.Store(true)
+				waitOK(t, start(t, s, "new request"))
+				check := func(session *core.Session) {
+					t.Helper()
+					view, err := session.InspectContext(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tail, _ := contentEstimate(core.Request{Messages: view.Request.Messages[2:]})
+					want := 1075 + tail - 10
+					if view.EstimatedInput != want {
+						t.Fatalf("input=%d want earlier anchor plus tail=%d", view.EstimatedInput, want)
+					}
+				}
+				check(s)
+				for _, mode := range []core.ForkMode{core.ForkShared, core.ForkDetached} {
+					id := "shared-partial"
+					if mode == core.ForkDetached {
+						id = "detached-partial"
+					}
+					child, err := s.Fork(ctx, s.Head(), core.ForkOptions{ID: id, Mode: mode})
+					if err != nil {
+						t.Fatal(err)
+					}
+					check(child)
+					if err := child.Close(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := s.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err := core.OpenSession(ctx, c, s.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reopened.Close(ctx)
+				check(reopened)
+			})
+		})
+	}
+}
+
+func TestUsageMissingFlagsPreserveLegacyJSON(t *testing.T) {
+	var usage core.Usage
+	if err := json.Unmarshal([]byte(`{"available":true,"input_tokens":1000,"output_tokens":75}`), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if usage.InputMissing || usage.OutputMissing || !usage.Available || usage.InputTokens != 1000 || usage.OutputTokens != 75 {
+		t.Fatalf("legacy usage changed: %+v", usage)
+	}
+	raw, err := json.Marshal(usage)
+	if err != nil || strings.Contains(string(raw), "_missing") {
+		t.Fatalf("default flags changed the JSON contract: %s err=%v", raw, err)
 	}
 }
 

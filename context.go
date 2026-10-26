@@ -175,7 +175,8 @@ func project(path []Entry) (Context, error) {
 	for i := len(view.Sources) - 1; i >= 0; i-- {
 		entry := entries[view.Sources[i]]
 		if entry.Generation != nil && entry.Message != nil && entry.Message.Role == RoleAssistant && !entry.Message.Failed() &&
-			entry.Usage.Available && entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
+			entry.Usage.Available && !entry.Usage.InputMissing && !entry.Usage.OutputMissing &&
+			entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
 			view.anchor = &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
 			break
 		}
