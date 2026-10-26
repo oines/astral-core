@@ -17,7 +17,6 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -42,7 +41,9 @@ func targetOf(raw json.RawMessage) (string, error) {
 }
 
 func contextFor(id, dir string) astral.Message {
-	return astral.Message{Role: astral.RoleDeveloper, ContextKind: "environment", Content: astral.Text(fmt.Sprintf("Execution target: %s\nWorking directory: %s", id, dir))}
+	// User context stays in the message stream across native model protocols;
+	// some providers hoist developer messages into system instructions.
+	return astral.Message{Role: astral.RoleUser, ContextKind: "environment", Content: astral.Text(fmt.Sprintf("Execution target: %s\nWorking directory: %s", id, dir))}
 }
 
 // This wrapper belongs to the host. Core only persists the resulting reference.
@@ -125,7 +126,6 @@ func run(ctx context.Context) error {
 	var mu sync.RWMutex
 	selected := "target-a"
 	current := func() string { mu.RLock(); defer mu.RUnlock(); return selected }
-	var live *sessions.Session
 	// Target selection and its persistence are host policy. An exclusive batch
 	// confirms the switch before later calls bind their targets.
 	switcher := astral.ToolFunc{Spec: astral.ToolDefinition{Name: "switch_environment", Version: "1", Exclusive: true, Description: "Select an authorized execution target in a separate tool batch.", Parameters: json.RawMessage(`{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}`)}, Run: func(ctx context.Context, inv astral.Invocation, _ func(astral.ToolProgress)) (astral.ToolExecution, error) {
@@ -136,9 +136,6 @@ func run(ctx context.Context) error {
 		mu.Lock()
 		selected = target
 		mu.Unlock()
-		if _, err = live.InjectContext(ctx, []astral.Message{contextFor(target, filepath.Join(root, target))}); err != nil {
-			return astral.ToolExecution{Result: &astral.ToolResult{Outcome: astral.OutcomeSucceeded}}, err
-		}
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("Host target updated.")}}, nil
 	}}
 	var tools []astral.Tool
@@ -174,7 +171,22 @@ func run(ctx context.Context) error {
 		return demo.Calls(demo.Call("start", "exec_command", `{"cmd":"printf 'ready\\n'; IFS= read -r line; printf 'original cwd: '; pwd","tty":true,"login":false,"yield_time_ms":0}`)), nil
 	})
 	var processTarget, newCallTarget string
-	agent, err := sessions.New(sessions.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: tools, BeforeToolCall: func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
+	session, err := astral.NewSession(ctx, astral.Config{CollectContext: func(_ context.Context, boundary astral.ContextBoundary) ([]astral.Message, error) {
+		target := current()
+		latest := contextFor(target, filepath.Join(root, target))
+		if boundary.CompactionID == "" {
+			for i := len(boundary.Context.Request.Messages) - 1; i >= 0; i-- {
+				message := boundary.Context.Request.Messages[i]
+				if message.ContextKind == "environment" {
+					if message.Content[0].Text == latest.Content[0].Text {
+						return nil, nil
+					}
+					break
+				}
+			}
+		}
+		return []astral.Message{latest}, nil
+	}, EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: tools, BeforeToolCall: func(_ context.Context, inv astral.ToolContext) (astral.ToolDecision, error) {
 		if inv.Call.Name == "write_stdin" || inv.Call.ID == "current" {
 			target, err := targetOf(inv.Binding)
 			if err != nil {
@@ -187,24 +199,16 @@ func run(ctx context.Context) error {
 			}
 		}
 		return astral.ToolDecision{}, nil
-	}})
+	}}, astral.SessionOptions{})
 	if err != nil {
 		return err
 	}
-	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, sessions.SessionOptions{})
+	defer session.Close(context.Background())
+	run, err := session.Prompt(ctx, astral.Input{ID: "switch-target", Message: astral.User("Start a command, switch target, then finish the original command and run on the new target.")})
 	if err != nil {
 		return err
 	}
-	live = session
-	if _, err = session.InjectContext(ctx, []astral.Message{contextFor("target-a", filepath.Join(root, "target-a"))}); err != nil {
-		return err
-	}
-	run, err := session.Start(ctx, astral.User("Start a command, switch target, then finish the original command and run on the new target."))
-	if err != nil {
-		return err
-	}
-	if _, err = run.Wait(ctx); err != nil {
+	if _, err = run.Run.Wait(ctx); err != nil {
 		return err
 	}
 	selectedTarget := current()

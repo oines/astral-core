@@ -10,7 +10,6 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
-	sessions "github.com/oines/astral-core/session"
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -52,20 +51,16 @@ func run(ctx context.Context) error {
 		}
 		return demo.Calls(demo.Call("write", "write", `{"path":"hello.txt","content":"Hello\n"}`)), nil
 	})
-	agent, err := sessions.New(sessions.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: set.Tools()})
+	session, err := astral.NewSession(ctx, astral.Config{EstimateTokens: demo.EstimateTokens, Model: model, Store: memory.New(), Tools: set.Tools()}, astral.SessionOptions{})
 	if err != nil {
 		return err
 	}
-	defer agent.Close(context.Background())
-	session, err := agent.NewSession(ctx, sessions.SessionOptions{})
+	defer session.Close(context.Background())
+	run, err := session.Prompt(ctx, astral.Input{ID: "greeting", Message: astral.User("Create, edit and print a greeting.")})
 	if err != nil {
 		return err
 	}
-	run, err := session.Start(ctx, astral.User("Create, edit and print a greeting."))
-	if err != nil {
-		return err
-	}
-	if _, err = run.Wait(ctx); err != nil {
+	if _, err = run.Run.Wait(ctx); err != nil {
 		return err
 	}
 	view, err := session.InspectContext(ctx)

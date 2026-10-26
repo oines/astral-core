@@ -12,12 +12,16 @@ import (
 func TestPathAliasesAndPiFilenameVariants(t *testing.T) {
 	dir := t.TempDir()
 	fs := &fileSystem{cwd: dir, home: filepath.Join(dir, "home")}
+	fileURLPath := filepath.ToSlash(filepath.Join(dir, "file with space"))
+	if runtime.GOOS == "windows" {
+		fileURLPath = "/" + fileURLPath
+	}
 	for _, test := range []struct{ input, want string }{
 		{"@nested/file.txt", filepath.Join(dir, "nested/file.txt")},
 		{"~/file.txt", filepath.Join(dir, "home/file.txt")},
 		{"~", filepath.Join(dir, "home")},
 		{"with\u00a0space.txt", filepath.Join(dir, "with space.txt")},
-		{(&url.URL{Scheme: "file", Path: filepath.Join(dir, "file with space")}).String(), filepath.Join(dir, "file with space")},
+		{(&url.URL{Scheme: "file", Path: fileURLPath}).String(), filepath.Join(dir, "file with space")},
 	} {
 		got, err := fs.ResolvePath(context.Background(), test.input, false)
 		if err != nil || got.Path != test.want {

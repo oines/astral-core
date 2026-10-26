@@ -10,16 +10,16 @@ import (
 	"testing"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
 type contextEndpoint interface {
-	Start(context.Context, astral.Message, ...astral.InputOptions) (*astral.Run, error)
+	Prompt(context.Context, astral.Input) (astral.PromptResult, error)
 	Continue(context.Context) (*astral.Run, error)
-	Steer(context.Context, astral.Message, ...astral.InputOptions) (string, error)
-	FollowUp(context.Context, astral.Message, ...astral.InputOptions) (string, error)
-	InjectContext(context.Context, []astral.Message) (string, error)
+	Steer(context.Context, astral.Input) (astral.InputReceipt, error)
+	FollowUp(context.Context, astral.Input) (astral.InputReceipt, error)
+	InjectContext(context.Context, astral.Input) (astral.InputReceipt, error)
 	PeekQueuedInputs(context.Context) ([]astral.QueuedInput, error)
 	HasQueuedInputs(context.Context) (bool, error)
 	ClearSteering(context.Context) error
@@ -28,20 +28,17 @@ type contextEndpoint interface {
 	Subscribe(int) *astral.Subscription
 }
 
-func harness(t *testing.T, persistent bool, m *testModel, tools []astral.Tool, finish astral.FinishTurn) contextEndpoint {
+func harness(t *testing.T, persistent bool, m *testModel, tools []astral.Tool, _ any) contextEndpoint {
 	t.Helper()
+	var store astral.Store = memory.New()
 	if persistent {
-		c := testConfig(m, memory.New())
-		c.Tools = tools
-		c.FinishTurn = finish
-		return newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		var closeStore func()
+		store, closeStore = durableStore(t, "sqlite", t.TempDir())
+		t.Cleanup(closeStore)
 	}
-	a, err := astral.New(astral.Config{Model: m, Tools: tools, FinishTurn: finish, Retry: astral.RetryPolicy{MaxAttempts: 1}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { a.Close(context.Background()) })
-	return a
+	c := testConfig(m, store)
+	c.Tools = tools
+	return newSession(t, newSessions(t, c), astral.SessionOptions{})
 }
 func mediaContext(role astral.Role, label string) astral.Message {
 	return astral.Message{Role: role, ContextKind: label, Metadata: json.RawMessage(`{"source":"host","counter":900719925474099312345}`), Content: []astral.Content{
@@ -62,7 +59,7 @@ func hasMessage(messages []astral.Message, want astral.Message) bool {
 }
 
 func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		original := mediaContext(astral.RoleDeveloper, "environment")
 		attached := mediaContext(astral.RoleUser, "observation")
@@ -80,9 +77,9 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 		c.Compaction.KeepRecentTokens = 1
 		c.Compaction.ModelID = "summary"
 		c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-		s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		batch := []astral.Message{mediaContext(astral.RoleDeveloper, "environment")}
-		id, err := s.InjectContext(ctx, batch)
+		id, err := inject(s, ctx, batch)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -99,8 +96,8 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 			t.Fatalf("context was flattened, aliased or reclassified: %v", err)
 		}
 		boundary := s.Head()
-		for _, mode := range []sessions.ForkMode{sessions.ForkShared, sessions.ForkDetached} {
-			child, err := s.Fork(ctx, boundary, sessions.ForkOptions{ID: fmt.Sprintf("passive-child-%d", mode), Mode: mode})
+		for _, mode := range []astral.ForkMode{astral.ForkShared, astral.ForkDetached} {
+			child, err := s.Fork(ctx, boundary, astral.ForkOptions{ID: fmt.Sprintf("passive-child-%d", mode), Mode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -112,7 +109,7 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 				t.Fatal("fork treated context as prompt")
 			}
 		}
-		run, err := s.Start(ctx, astral.User("observe"), astral.InputOptions{Contexts: []astral.Message{attached}})
+		run, err := prompt(s, ctx, astral.User("observe"), inputOptions{Contexts: []astral.Message{attached}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,10 +120,10 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 		}
 		var version uint64
 		for _, e := range entries(s) {
-			if e.Kind == sessions.EntryContext && e.Message.ContextKind == "observation" {
+			if e.Kind == astral.EntryContext && e.Message.ContextKind == "observation" {
 				version = e.Version
 			}
-			if e.Kind == sessions.EntryMessage && e.Message.Role == astral.RoleUser && e.Version != version {
+			if e.Kind == astral.EntryMessage && e.Message.Role == astral.RoleUser && e.Version != version {
 				t.Fatal("attached context and prompt split across commits")
 			}
 		}
@@ -150,7 +147,7 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 		if v.Request.Messages[0].Role != astral.RoleUser || v.Request.Messages[0].ContextKind != "summary" {
 			t.Fatal("summary role was elevated")
 		}
-		archived, err := s.History().Scan(ctx, sessions.Query{Kind: sessions.EntryContext, Reference: id})
+		archived, err := s.History().Scan(ctx, astral.Query{Kind: astral.EntryContext, Reference: id})
 		if err != nil || len(archived.Entries) != 1 || !reflect.DeepEqual(*archived.Entries[0].Message, original) {
 			t.Fatal("context source ID or original media was lost")
 		}
@@ -194,28 +191,28 @@ func TestContextWaitsForWholeToolBatchAndDoesNotExtendRun(t *testing.T) {
 				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text("result")}}, nil
 			})
 			e := harness(t, persistent, m, []astral.Tool{work}, nil)
-			run, err := e.Start(ctx, astral.User("work"))
+			run, err := prompt(e, ctx, astral.User("work"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			signal(t, entered)
 			signal(t, entered)
-			if _, err := e.InjectContext(ctx, []astral.Message{observed}); err != nil {
+			if _, err := inject(e, ctx, []astral.Message{observed}); err != nil {
 				t.Fatal(err)
 			}
-			if s, ok := e.(*sessions.Session); ok {
-				if len(s.State().Branch.PendingCalls) != 2 || s.State().PendingInputs[sessions.InputContext] != 1 {
+			if s, ok := e.(*astral.Session); ok {
+				if len(s.State().Branch.PendingCalls) != 2 || s.State().PendingInputs[astral.InputContext] != 1 {
 					t.Fatal("injection changed execution facts")
 				}
 				for _, entry := range entries(s) {
-					if entry.Kind == sessions.EntryContext {
+					if entry.Kind == astral.EntryContext {
 						t.Fatal("context committed inside a tool batch")
 					}
 				}
 			}
 			close(release)
 			signal(t, generating)
-			if _, err := e.InjectContext(ctx, []astral.Message{tail}); err != nil {
+			if _, err := inject(e, ctx, []astral.Message{tail}); err != nil {
 				t.Fatal(err)
 			}
 			close(finish)
@@ -223,7 +220,7 @@ func TestContextWaitsForWholeToolBatchAndDoesNotExtendRun(t *testing.T) {
 			if result.LastMessage == nil || result.LastMessage.Content[0].Text != "done" || len(m.observed()) != 2 {
 				t.Fatal("context changed the final response or extended the run")
 			}
-			if s, ok := e.(*sessions.Session); ok {
+			if s, ok := e.(*astral.Session); ok {
 				v, err := s.InspectContext(ctx)
 				if err != nil || !hasMessage(v.Request.Messages, tail) || s.State().Branch.LastMessageID != result.LastMessageID {
 					t.Fatal("final passive flush changed LastMessage")
@@ -237,7 +234,7 @@ func TestContextWaitsForWholeToolBatchAndDoesNotExtendRun(t *testing.T) {
 }
 
 func TestAttachedContextSharesSteeringCommitAndRecovery(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		for _, mode := range []string{"failure", "lost-ack", "unconfirmed"} {
 			t.Run(mode, func(t *testing.T) {
 				ctx := context.Background()
@@ -246,11 +243,11 @@ func TestAttachedContextSharesSteeringCommitAndRecovery(t *testing.T) {
 					return answer("done"), nil
 				})
 				c := testConfig(m, fault)
-				a := newAgent(t, c)
-				s := newSession(t, a, sessions.SessionOptions{})
+				a := newSessions(t, c)
+				s := newSession(t, a, astral.SessionOptions{})
 				seedCompletedBoundary(t, s, store)
 				contexts := []astral.Message{mediaContext(astral.RoleDeveloper, "attached-a"), mediaContext(astral.RoleUser, "attached-b")}
-				id, err := s.Steer(ctx, astral.User("task"), astral.InputOptions{Contexts: contexts})
+				id, err := steer(s, ctx, astral.User("task"), inputOptions{Contexts: contexts})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -269,7 +266,7 @@ func TestAttachedContextSharesSteeringCommitAndRecovery(t *testing.T) {
 					t.Fatal(err)
 				}
 				c.Store = store
-				s, err = newAgent(t, c).OpenSession(ctx, s.ID())
+				s, err = newSessions(t, c).OpenSession(ctx, s.ID())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -287,13 +284,13 @@ func TestAttachedContextSharesSteeringCommitAndRecovery(t *testing.T) {
 				if !hasMessage(request.Messages, contexts[0]) || !hasMessage(request.Messages, contexts[1]) {
 					t.Fatal("recovery lost native attached contexts")
 				}
-				var group []sessions.Entry
+				var group []astral.Entry
 				for _, entry := range entries(s) {
-					if entry.InputID == id || entry.Kind == sessions.EntryInputConsumed && entry.Input.ID == id {
+					if entry.InputID == id || entry.Kind == astral.EntryInputConsumed && entry.Input.ID == id {
 						group = append(group, entry)
 					}
 				}
-				if len(group) != 4 || group[0].Kind != sessions.EntryContext || group[1].Kind != sessions.EntryContext || group[2].Kind != sessions.EntryMessage || group[3].Kind != sessions.EntryInputConsumed {
+				if len(group) != 4 || group[0].Kind != astral.EntryContext || group[1].Kind != astral.EntryContext || group[2].Kind != astral.EntryMessage || group[3].Kind != astral.EntryInputConsumed {
 					t.Fatal("partial or unordered input group")
 				}
 				for _, entry := range group {
@@ -326,16 +323,16 @@ func TestContextInjectionDuringCompactionStaysPassive(t *testing.T) {
 	c.Compaction.ModelID = "summary"
 	c.Compaction.KeepRecentTokens = 1
 	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	done := make(chan error, 1)
 	go func() { _, err := s.Compact(ctx, ""); done <- err }()
 	signal(t, entered)
 	late := mediaContext(astral.RoleUser, "late")
-	if _, err := s.InjectContext(ctx, []astral.Message{late}); err != nil {
+	if _, err := inject(s, ctx, []astral.Message{late}); err != nil {
 		t.Fatal(err)
 	}
-	if s.State().PendingInputs[sessions.InputContext] != 1 || len(normal.observed()) != 1 {
+	if s.State().PendingInputs[astral.InputContext] != 1 || len(normal.observed()) != 1 {
 		t.Fatal("maintenance injection was applied or drove inference")
 	}
 	close(release)
@@ -343,8 +340,12 @@ func TestContextInjectionDuringCompactionStaysPassive(t *testing.T) {
 		t.Fatal(err)
 	}
 	v, err := s.InspectContext(ctx)
-	if err != nil || !hasMessage(v.Request.Messages, late) || s.State().PendingInputs[sessions.InputContext] != 0 {
-		t.Fatalf("late context lost at compaction handoff: %v", err)
+	if err != nil || hasMessage(v.Request.Messages, late) || s.State().PendingInputs[astral.InputContext] != 1 {
+		t.Fatalf("late context crossed the frozen cutoff: %v", err)
+	}
+	waitOK(t, start(t, s, "next"))
+	if !hasMessage(normal.observed()[1].Messages, late) || s.State().PendingInputs[astral.InputContext] != 0 {
+		t.Fatal("next boundary lost late input")
 	}
 }
 
@@ -356,13 +357,13 @@ func TestContextBudgetDefersWithoutStartingCompaction(t *testing.T) {
 	c := testConfig(m, memory.New())
 	c.MaxContextBytes = 4096
 	c.Compaction.KeepRecentTokens = 1
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	for _, size := range []int{1000, 1000, 2200} {
-		if _, err := s.InjectContext(ctx, []astral.Message{astral.User(strings.Repeat("x", size))}); err != nil {
+		if _, err := inject(s, ctx, []astral.Message{astral.User(strings.Repeat("x", size))}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(m.observed()) != 0 || s.State().PendingInputs[sessions.InputContext] != 1 {
+	if len(m.observed()) != 0 || s.State().PendingInputs[astral.InputContext] != 1 {
 		t.Fatal("passive budget pressure caused inference or discarded the batch")
 	}
 	if _, err := s.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
@@ -371,7 +372,7 @@ func TestContextBudgetDefersWithoutStartingCompaction(t *testing.T) {
 	if _, err := s.Compact(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(m.observed()) != 1 || s.State().PendingInputs[sessions.InputContext] != 0 {
+	if len(m.observed()) != 1 || s.State().PendingInputs[astral.InputContext] != 0 {
 		t.Fatal("explicit compaction did not release the pending context")
 	}
 }
@@ -400,19 +401,19 @@ func TestCancelPreservesInputsAndClearingKeepsIndependentContext(t *testing.T) {
 				return answer("resumed"), nil
 			})
 			e := harness(t, persistent, m, nil, nil)
-			run, err := e.Start(ctx, astral.User("first"))
+			run, err := prompt(e, ctx, astral.User("first"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			signal(t, entered)
-			if _, err = e.Steer(ctx, astral.User("clear me"), astral.InputOptions{Contexts: []astral.Message{mediaContext(astral.RoleUser, "cleared")}}); err != nil {
+			if _, err = steer(e, ctx, astral.User("clear me"), inputOptions{Contexts: []astral.Message{mediaContext(astral.RoleUser, "cleared")}}); err != nil {
 				t.Fatal(err)
 			}
-			id, err := e.FollowUp(ctx, astral.User("follow"), astral.InputOptions{Contexts: []astral.Message{follow}})
+			id, err := followUp(e, ctx, astral.User("follow"), inputOptions{Contexts: []astral.Message{follow}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = e.InjectContext(ctx, []astral.Message{passive}); err != nil {
+			if _, err = inject(e, ctx, []astral.Message{passive}); err != nil {
 				t.Fatal(err)
 			}
 			if err = e.ClearSteering(ctx); err != nil {
@@ -424,7 +425,7 @@ func TestCancelPreservesInputsAndClearingKeepsIndependentContext(t *testing.T) {
 			}
 			run.Cancel()
 			result, err := wait(t, run)
-			if !errors.Is(err, context.Canceled) || result.LastMessage == nil || result.LastMessage.FinishReason != astral.FinishCancelled || result.LastMessage.Content[0].Text != "partial" {
+			if !errors.Is(err, context.Canceled) || result.LastMessage != nil || result.Status != "cancelled" {
 				t.Fatalf("cancelled snapshot missing: %+v %v", result, err)
 			}
 			if len(m.observed()) != 1 {
@@ -449,70 +450,50 @@ func TestCancelPreservesInputsAndClearingKeepsIndependentContext(t *testing.T) {
 }
 
 func TestPendingContextSurvivesColdReopenAfterCommitFailure(t *testing.T) {
-	for _, backend := range []string{"jsonl", "sqlite"} {
-		t.Run(backend, func(t *testing.T) {
-			ctx := context.Background()
-			dir := t.TempDir()
-			store, closeStore := durableStore(t, backend, dir)
-			fault := &steeringFaultStore{Store: store, mode: "failure"}
-			entered := make(chan struct{})
-			m := model(func(ctx context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
-				if n == 1 {
-					close(entered)
-					<-ctx.Done()
-					return astral.Reply{}, ctx.Err()
-				}
-				return answer("resumed"), nil
-			})
-			c := testConfig(m, fault)
-			a := newAgent(t, c)
-			s := newSession(t, a, sessions.SessionOptions{ID: "passive-recovery"})
-			run := start(t, s, "first")
-			signal(t, entered)
-			media := mediaContext(astral.RoleDeveloper, "recoverable")
-			if _, err := s.InjectContext(ctx, []astral.Message{media}); err != nil {
-				t.Fatal(err)
-			}
-			run.Cancel()
-			if _, err := wait(t, run); !errors.Is(err, context.Canceled) {
-				t.Fatal(err)
-			}
-			if s.State().PendingInputs[sessions.InputContext] != 1 {
-				t.Fatal("failed passive flush lost accepted content")
-			}
-			if err := a.Close(ctx); err != nil {
-				t.Fatal(err)
-			}
-			closeStore()
-			store, closeStore = durableStore(t, backend, dir)
-			defer closeStore()
-			c.Store = store
-			s, err := newAgent(t, c).OpenSession(ctx, "passive-recovery")
-			if err != nil {
-				t.Fatal(err)
-			}
-			before := s.State()
-			if _, err = s.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(before, s.State()) {
-				t.Fatal("invalid Continue consumed passive queue")
-			}
-			run, err = s.Start(ctx, astral.User("new task"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			waitOK(t, run)
-			request := m.observed()[1]
-			if !reflect.DeepEqual(request.Messages[len(request.Messages)-2], media) || request.Messages[len(request.Messages)-1].Content[0].Text != "new task" {
-				t.Fatal("cold replay reordered or flattened media")
-			}
-		})
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, closeStore := durableStore(t, "sqlite", dir)
+	fault := &faultStore{Store: store, kind: astral.EntryContext}
+	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
+		return answer("resumed"), nil
+	})
+	c := testConfig(m, fault)
+	a := newSessions(t, c)
+	s := newSession(t, a, astral.SessionOptions{ID: "passive-recovery"})
+	media := mediaContext(astral.RoleDeveloper, "recoverable")
+	if _, err := inject(s, ctx, []astral.Message{media}); err == nil {
+		t.Fatal("injected failure was hidden")
+	}
+	if s.State().PendingInputs[astral.InputContext] != 1 || len(m.observed()) != 0 {
+		t.Fatal("failed flush lost accepted context or called the model")
+	}
+	if err := a.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	closeStore()
+	store, closeStore = durableStore(t, "sqlite", dir)
+	defer closeStore()
+	c.Store = store
+	s, err := newSessions(t, c).OpenSession(ctx, "passive-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := s.State()
+	if _, err = s.Continue(ctx); !errors.Is(err, astral.ErrNotContinuable) {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, s.State()) {
+		t.Fatal("read-only reopen or invalid Continue consumed input")
+	}
+	waitOK(t, start(t, s, "new task"))
+	request := m.observed()[0]
+	if !reflect.DeepEqual(request.Messages[len(request.Messages)-2], media) || request.Messages[len(request.Messages)-1].Content[0].Text != "new task" {
+		t.Fatal("cold replay reordered or flattened media")
 	}
 }
 
 func TestClearAllDrivingInputsPreservesIndependentContext(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		entered, release := make(chan struct{}), make(chan struct{})
 		m := model(func(ctx context.Context, _ int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
@@ -524,16 +505,16 @@ func TestClearAllDrivingInputsPreservesIndependentContext(t *testing.T) {
 			}
 			return answer("done"), nil
 		})
-		s := newSession(t, newAgent(t, testConfig(m, store)), sessions.SessionOptions{})
+		s := newSession(t, newSessions(t, testConfig(m, store)), astral.SessionOptions{})
 		run := start(t, s, "work")
 		signal(t, entered)
-		for _, enqueue := range []func(context.Context, astral.Message, ...astral.InputOptions) (string, error){s.Steer, s.FollowUp} {
-			if _, err := enqueue(ctx, astral.User("discard"), astral.InputOptions{Contexts: []astral.Message{mediaContext(astral.RoleUser, "discard")}}); err != nil {
+		for _, enqueue := range []func(context.Context, astral.Message, ...inputOptions) (string, error){steerFor(s), followUpFor(s)} {
+			if _, err := enqueue(ctx, astral.User("discard"), inputOptions{Contexts: []astral.Message{mediaContext(astral.RoleUser, "discard")}}); err != nil {
 				t.Fatal(err)
 			}
 		}
 		independent := mediaContext(astral.RoleDeveloper, "keep")
-		if _, err := s.InjectContext(ctx, []astral.Message{independent}); err != nil {
+		if _, err := inject(s, ctx, []astral.Message{independent}); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.ClearQueuedInputs(ctx); err != nil {
@@ -543,8 +524,8 @@ func TestClearAllDrivingInputsPreservesIndependentContext(t *testing.T) {
 		if err := s.ClearQueuedInputs(ctx); err != nil || s.State().Version != version {
 			t.Fatal("empty clear was not idempotent")
 		}
-		pending, err := store.Pending(ctx, s.ID(), sessions.PendingQuery{})
-		if err != nil || len(pending.Records) != 1 || pending.Records[0].Entry.Input.Kind != sessions.InputContext {
+		pending, err := store.Pending(ctx, s.ID(), astral.PendingQuery{})
+		if err != nil || len(pending.Records) != 1 || pending.Records[0].Entry.Input.Kind != astral.InputContext {
 			t.Fatal("clear deleted independent context or retained driving input")
 		}
 		close(release)
@@ -555,10 +536,10 @@ func TestClearAllDrivingInputsPreservesIndependentContext(t *testing.T) {
 		}
 		clears := 0
 		for _, e := range entries(s) {
-			if e.Kind == sessions.EntryInputCleared {
+			if e.Kind == astral.EntryInputCleared {
 				clears++
 			}
-			if e.Kind == sessions.EntryContext && e.Message.ContextKind == "discard" {
+			if e.Kind == astral.EntryContext && e.Message.ContextKind == "discard" {
 				t.Fatal("cleared attached context was applied")
 			}
 		}
@@ -569,28 +550,28 @@ func TestClearAllDrivingInputsPreservesIndependentContext(t *testing.T) {
 }
 
 func TestPendingIndexAndCountsRejectDuplicateOrClearedConsumption(t *testing.T) {
-	eachStore(t, func(t *testing.T, store sessions.Store) {
+	eachStore(t, func(t *testing.T, store astral.Store) {
 		ctx := context.Background()
 		if err := appendStore(ctx, store, "session", 0, storeHeader()); err != nil {
 			t.Fatal(err)
 		}
 		m := astral.User("queued")
-		queued := func(id string) sessions.Entry {
-			return sessions.Entry{ID: "queued-" + id, Kind: sessions.EntryInputQueued, Input: &sessions.InputRecord{ID: id, Kind: sessions.InputSteer, Message: &m}}
+		queued := func(id string) astral.Entry {
+			return astral.Entry{ID: "queued-" + id, Kind: astral.EntryInputQueued, Input: &astral.InputRecord{ID: id, Kind: astral.InputSteer, Message: &m}}
 		}
-		consumed := func(id, entryID string) sessions.Entry {
-			return sessions.Entry{ID: entryID, Kind: sessions.EntryInputConsumed, Input: &sessions.InputRecord{ID: id, Kind: sessions.InputSteer}}
+		consumed := func(id, entryID string) astral.Entry {
+			return astral.Entry{ID: entryID, Kind: astral.EntryInputConsumed, Input: &astral.InputRecord{ID: id, Kind: astral.InputSteer}}
 		}
-		clear := sessions.Entry{ID: "clear", Kind: sessions.EntryInputCleared, Clear: &sessions.InputClear{Kinds: []sessions.InputKind{sessions.InputSteer}}}
-		if err := appendStore(ctx, store, "session", 1, []sessions.Entry{queued("a"), queued("b")}); err != nil {
+		clear := astral.Entry{ID: "clear", Kind: astral.EntryInputCleared, Clear: &astral.InputClear{Kinds: []astral.InputKind{astral.InputSteer}}}
+		if err := appendStore(ctx, store, "session", 1, []astral.Entry{queued("a"), queued("b")}); err != nil {
 			t.Fatal(err)
 		}
 		before, err := store.LoadState(ctx, "session")
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, drafts := range [][]sessions.Entry{{consumed("a", "one"), consumed("a", "two")}, {clear, queued("new"), consumed("a", "old")}} {
-			if err := appendStore(ctx, store, "session", before.Version, drafts); !errors.Is(err, sessions.ErrCorrupt) {
+		for _, drafts := range [][]astral.Entry{{consumed("a", "one"), consumed("a", "two")}, {clear, queued("new"), consumed("a", "old")}} {
+			if err := appendStore(ctx, store, "session", before.Version, drafts); !errors.Is(err, astral.ErrCorrupt) {
 				t.Fatalf("invalid consumption accepted: %v", err)
 			}
 			after, err := store.LoadState(ctx, "session")
@@ -598,21 +579,21 @@ func TestPendingIndexAndCountsRejectDuplicateOrClearedConsumption(t *testing.T) 
 				t.Fatal("rejected commit changed counts")
 			}
 		}
-		if err := appendStore(ctx, store, "session", before.Version, []sessions.Entry{clear, queued("new"), consumed("new", "consume-new")}); err != nil {
+		if err := appendStore(ctx, store, "session", before.Version, []astral.Entry{clear, queued("new"), consumed("new", "consume-new")}); err != nil {
 			t.Fatal(err)
 		}
 		state, err := store.LoadState(ctx, "session")
 		if err != nil || len(state.PendingInputs) != 0 {
 			t.Fatal("valid commit left wrong counts")
 		}
-		pending, err := store.Pending(ctx, "session", sessions.PendingQuery{})
+		pending, err := store.Pending(ctx, "session", astral.PendingQuery{})
 		if err != nil || len(pending.Records) != 0 {
 			t.Fatal("valid commit left wrong index")
 		}
 	})
 }
 
-func TestPassiveContextBudgetCannotFailAnActiveToolRun(t *testing.T) {
+func TestPassiveContextBudgetFailurePreservesAcceptedContextAndToolFacts(t *testing.T) {
 	ctx := context.Background()
 	entered, release := make(chan struct{}), make(chan struct{})
 	m := model(func(_ context.Context, n int, _ astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
@@ -632,15 +613,17 @@ func TestPassiveContextBudgetCannotFailAnActiveToolRun(t *testing.T) {
 		}
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(strings.Repeat("r", 900))}}, nil
 	})}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	run := start(t, s, strings.Repeat("u", 900))
 	signal(t, entered)
-	if _, err := s.InjectContext(ctx, []astral.Message{astral.User(strings.Repeat("p", 2500))}); err != nil {
+	if _, err := inject(s, ctx, []astral.Message{astral.User(strings.Repeat("p", 2500))}); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
-	waitOK(t, run)
-	if len(m.observed()) != 2 || s.State().PendingInputs[sessions.InputContext] != 1 {
-		t.Fatal("passive budget pressure changed execution or lost pending content")
+	if _, err := wait(t, run); !errors.Is(err, astral.ErrBudget) {
+		t.Fatalf("budget error = %v", err)
+	}
+	if len(m.observed()) != 1 || s.State().PendingInputs[astral.InputContext] != 1 || len(toolResults(s)) != 1 {
+		t.Fatal("budget failure lost input or durable tool result")
 	}
 }

@@ -116,7 +116,7 @@ type registeredTool struct {
 	schema     argumentValidator
 }
 
-func (a *Agent) toolFor(def ToolDefinition) (registeredTool, error) {
+func (a *Session) toolFor(def ToolDefinition) (registeredTool, error) {
 	t, ok := a.tools[def.Name]
 	if !ok || !sameJSON(t.definition, def) {
 		return registeredTool{}, fmt.Errorf("tool %q is missing or changed; explicitly reconfigure the session", def.Name)

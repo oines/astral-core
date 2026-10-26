@@ -15,7 +15,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/sqlite"
 )
 
@@ -43,7 +43,7 @@ func TestSQLiteColdStartupProbe(t *testing.T) {
 	m := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return answer("unused"), nil
 	})
-	manager, err := sessions.New(testConfig(m, st))
+	manager, err := newFactory(testConfig(m, st))
 	if err != nil {
 		t.Fatal(err)
 	}

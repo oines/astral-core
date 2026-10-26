@@ -10,6 +10,7 @@ import (
 
 	astral "github.com/oines/astral-core"
 	"github.com/oines/astral-core/examples/internal/demo"
+	"github.com/oines/astral-core/store/memory"
 )
 
 func main() {
@@ -37,20 +38,20 @@ func run(ctx context.Context) error {
 		}
 		return demo.Calls(demo.Call("lookup-1", "lookup_order", `{"id":"order-42"}`)), nil
 	})
-	agent, err := astral.New(astral.Config{Model: model, SystemPrompt: "Answer using the application's tools.", Tools: []astral.Tool{lookup}})
+	agent, err := astral.NewSession(ctx, astral.Config{Model: model, Store: memory.New(), EstimateTokens: demo.EstimateTokens, SystemPrompt: "Answer using the application's tools.", Tools: []astral.Tool{lookup}}, astral.SessionOptions{})
 	if err != nil {
 		return err
 	}
 	defer agent.Close(context.Background())
-	activity, err := agent.Start(ctx, astral.User("Where is order-42?"))
+	activity, err := agent.Prompt(ctx, astral.Input{ID: "order-question", Message: astral.User("Where is order-42?")})
 	if err != nil {
 		return err
 	}
-	result, err := activity.Wait(ctx)
+	result, err := activity.Run.Wait(ctx)
 	if err != nil {
 		return err
 	}
 	fmt.Println(result.LastMessage.Content[0].Text)
-	fmt.Println("standalone core: no store or token estimator")
+	fmt.Println("one Session with the in-memory store")
 	return nil
 }

@@ -71,8 +71,9 @@ func TestBoundedOutputRetainsHeadTailAndValidUTF8(t *testing.T) {
 		if len(b.head)+len(b.tail) > 64 || b.total != int64(len(text)) {
 			t.Fatal("buffer not bounded or count lost")
 		}
-		if limitCommandOutput(got, b.total, 0) != "" {
-			t.Fatal("explicit zero output budget ignored")
+		zero := limitCommandOutput(got, (b.total+3)/4, omitted, 0)
+		if !strings.Contains(zero, "tokens truncated") || !strings.Contains(zero, "bytes omitted") {
+			t.Fatal("zero output budget hid truncation or collection omissions")
 		}
 	}
 }

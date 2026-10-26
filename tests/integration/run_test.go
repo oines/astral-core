@@ -7,7 +7,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/store/memory"
 )
 
@@ -18,8 +18,8 @@ func TestChatPersistsAndDefaultsDoNotRewriteSessions(t *testing.T) {
 	})
 	c := testConfig(m, store)
 	c.SystemPrompt = "original rules"
-	a := newAgent(t, c)
-	s := newSession(t, a, sessions.SessionOptions{ID: "chat"})
+	a := newSessions(t, c)
+	s := newSession(t, a, astral.SessionOptions{ID: "chat"})
 	r := waitOK(t, start(t, s, "hello"))
 	if r.LastMessage == nil || r.LastMessage.Content[0].Text != "hello" {
 		t.Fatalf("result: %+v", r)
@@ -28,7 +28,7 @@ func TestChatPersistsAndDefaultsDoNotRewriteSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.SystemPrompt = "new defaults"
-	a2 := newAgent(t, c)
+	a2 := newSessions(t, c)
 	opened, err := a2.OpenSession(context.Background(), s.ID())
 	if err != nil {
 		t.Fatal(err)
@@ -65,15 +65,15 @@ func TestSteeringAndFollowupsAtSafeBoundaries(t *testing.T) {
 		}
 		return answer("answer"), nil
 	})
-	s := newSession(t, newAgent(t, testConfig(m, memory.New())), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, testConfig(m, memory.New())), astral.SessionOptions{})
 	r := start(t, s, "initial")
 	signal(t, entered)
 	for _, text := range []string{"steer one", "steer two"} {
-		if _, err := s.Steer(context.Background(), astral.User(text)); err != nil {
+		if _, err := steer(s, context.Background(), astral.User(text)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.FollowUp(context.Background(), astral.User("followup")); err != nil {
+	if _, err := followUp(s, context.Background(), astral.User("followup")); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -98,7 +98,7 @@ func TestSlowSubscriberDoesNotBlockRun(t *testing.T) {
 		}
 		return answer("done"), nil
 	})
-	s := newSession(t, newAgent(t, testConfig(m, memory.New())), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, testConfig(m, memory.New())), astral.SessionOptions{})
 	sub := s.Subscribe(1)
 	waitOK(t, start(t, s, "go"))
 	for range sub.C {
@@ -120,10 +120,10 @@ func TestOneActiveWriterAndCancelRetryWait(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Retry.MaxAttempts = 3
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
-	if _, err := s.Start(context.Background(), astral.User("other")); !errors.Is(err, astral.ErrBusy) {
+	if _, err := prompt(s, context.Background(), astral.User("other")); !errors.Is(err, astral.ErrBusy) {
 		t.Fatalf("concurrent start: %v", err)
 	}
 	r.Cancel()

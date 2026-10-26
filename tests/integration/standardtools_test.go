@@ -12,7 +12,7 @@ import (
 	"time"
 
 	astral "github.com/oines/astral-core"
-	sessions "github.com/oines/astral-core/session"
+
 	"github.com/oines/astral-core/standardtools"
 	"github.com/oines/astral-core/standardtools/local"
 	"github.com/oines/astral-core/store/memory"
@@ -33,7 +33,7 @@ func TestToolEndRunPreservesHostProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("optional local process backend requires Unix")
 	}
-	eachControlEngine(t, func(t *testing.T, st sessions.Store) {
+	eachControlEngine(t, func(t *testing.T, st astral.Store) {
 		backend, err := local.New(local.Options{CWD: t.TempDir(), Shell: "/bin/sh"})
 		if err != nil {
 			t.Fatal(err)
@@ -77,14 +77,14 @@ func TestToolEndRunPreservesHostProcess(t *testing.T) {
 			}
 		})
 		e, _ := controlEndpoint(t, st, astral.Config{Model: m, Tools: append(set.Tools(), stop)})
-		run, err := e.Start(context.Background(), astral.User("start and wait"))
+		run, err := prompt(e, context.Background(), astral.User("start and wait"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if result := waitOK(t, run); result.EndReason != "waiting" || len(m.observed()) != 2 {
 			t.Fatalf("control did not end the first activation: %+v", result)
 		}
-		run, err = e.Start(context.Background(), astral.User("resume the process"))
+		run, err = prompt(e, context.Background(), astral.User("resume the process"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,22 +121,22 @@ func TestEmptyBindingUsesLocalDefaults(t *testing.T) {
 			})
 			var run *astral.Run
 			if mode == "core" {
-				a, err := astral.New(astral.Config{Model: m, Tools: set.Tools()})
+				a, err := newMemorySession(astral.Config{Model: m, Tools: set.Tools()})
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer a.Close(context.Background())
-				run, err = a.Start(context.Background(), astral.User("pwd"))
+				run, err = prompt(a, context.Background(), astral.User("pwd"))
 				if err != nil {
 					t.Fatal(err)
 				}
 			} else {
 				c := testConfig(m, memory.New())
 				c.Tools = set.Tools()
-				options := sessions.SessionOptions{}
-				s := newSession(t, newAgent(t, c), options)
+				options := astral.SessionOptions{}
+				s := newSession(t, newSessions(t, c), options)
 				if mode == "context-only-session" {
-					if _, err := s.InjectContext(context.Background(), []astral.Message{astral.User("Host context without an execution binding.")}); err != nil {
+					if _, err := inject(s, context.Background(), []astral.Message{astral.User("Host context without an execution binding.")}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -202,7 +202,7 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 	c := testConfig(m, memory.New())
 	c.Tools = tools
 	var initial, poll hostBinding
-	c.BeforeToolCall = func(_ context.Context, inv sessions.ToolContext) (astral.ToolDecision, error) {
+	c.BeforeToolCall = func(_ context.Context, inv astral.ToolContext) (astral.ToolDecision, error) {
 		if inv.Call.Name == "exec_command" {
 			initial = bindingOf(inv.Binding)
 		}
@@ -211,7 +211,7 @@ func TestStandardToolsRouteProcessToOriginalBinding(t *testing.T) {
 		}
 		return astral.ToolDecision{}, nil
 	}
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "work"))
 	if initial.Target != "target-one" || poll != initial || current != "target-two" {
 		t.Fatalf("wrong target: initial=%+v poll=%+v current=%s", initial, poll, current)
@@ -260,7 +260,7 @@ func TestBackendCanReportUncertainRemoteEffects(t *testing.T) {
 	})
 	c := testConfig(m, memory.New())
 	c.Tools = set.Tools()
-	s := newSession(t, newAgent(t, c), sessions.SessionOptions{})
+	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	if _, err = wait(t, start(t, s, "go")); !errors.Is(err, astral.ErrOutcomeUnknown) {
 		t.Fatalf("unknown effect: %v", err)
 	}

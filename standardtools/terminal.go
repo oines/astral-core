@@ -277,8 +277,7 @@ func (s *Set) collect(ctx context.Context, p *terminal, wait time.Duration, toke
 		case <-p.notify:
 		}
 	}
-	text, _ := buffer.text()
-	text = limitCommandOutput(text, buffer.total, tokens)
+	text, omitted := buffer.text()
 	result := CommandResult{ChunkID: chunkID(), WallTimeSeconds: time.Since(start).Seconds(), OriginalTokenCount: (buffer.total + 3) / 4, Output: text}
 	outcome := astral.OutcomeSucceeded
 	problem := ""
@@ -304,5 +303,5 @@ func (s *Set) collect(ctx context.Context, p *terminal, wait time.Duration, toke
 		p.lastUsed = time.Now()
 		s.mu.Unlock()
 	}
-	return commandResult(result, outcome, problem)
+	return s.commandResult(result, tokens, omitted, outcome, problem)
 }

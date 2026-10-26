@@ -65,7 +65,7 @@ func New(backend Backend, options ...Options) (*Set, error) {
 	if o.MaxProcesses < 1 || o.MaxOutputTokens < 1 || o.MaxBufferedBytes < 64 || o.MaxPollWait < 5*time.Second {
 		return nil, fmt.Errorf("standardtools: invalid resource limits")
 	}
-	if err := o.Images.defaults(); err != nil {
+	if err := o.Images.Validate(); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())

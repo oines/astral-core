@@ -37,7 +37,7 @@ type CommandResult struct {
 	WallTimeSeconds    float64 `json:"wall_time_seconds"`
 	ExitCode           *int    `json:"exit_code,omitempty"`
 	SessionID          int     `json:"session_id,omitempty"`
-	OriginalTokenCount int64   `json:"original_token_count,omitempty"`
+	OriginalTokenCount int64   `json:"original_token_count"`
 	Output             string  `json:"output"`
 }
 
@@ -129,7 +129,7 @@ func (t backendTool) writeStdin(ctx context.Context, inv astral.Invocation, emit
 	return t.set.collect(ctx, p, wait, min(r.MaxOutputTokens, t.set.options.MaxOutputTokens), start, emit), nil
 }
 
-func commandResult(result CommandResult, outcome astral.Outcome, problem string) astral.ToolResult {
+func (s *Set) commandResult(result CommandResult, tokens int, omitted int64, outcome astral.Outcome, problem string) astral.ToolResult {
 	var header strings.Builder
 	fmt.Fprintf(&header, "Chunk ID: %s\nWall time: %.4f seconds\n", result.ChunkID, result.WallTimeSeconds)
 	if result.ExitCode != nil {
@@ -138,13 +138,31 @@ func commandResult(result CommandResult, outcome astral.Outcome, problem string)
 	if result.SessionID != 0 {
 		fmt.Fprintf(&header, "Process running with session ID %d\n", result.SessionID)
 	}
-	fmt.Fprintf(&header, "Original token count: %d\nOutput:\n%s", result.OriginalTokenCount, result.Output)
+	fmt.Fprintf(&header, "Original token count: %d\nOutput:\n", result.OriginalTokenCount)
+	suffix := ""
 	if problem != "" {
-		header.WriteString("\n" + problem)
+		suffix = "\n" + problem
+	}
+	// Match Codex's ordinary response: the host policy allows 20% extra for
+	// serialization, while a smaller per-call budget still limits the content.
+	maxInt := int(^uint(0) >> 1)
+	policyTokens := s.options.MaxOutputTokens
+	allowance := policyTokens / 5
+	if policyTokens%5 != 0 {
+		allowance++
+	}
+	serializationTokens := policyTokens + min(allowance, maxInt-policyTokens)
+	outputBudget := max(0, commandByteBudget(serializationTokens)-header.Len()-len(suffix))
+	raw := result.Output
+	result.Output = limitCommandOutput(raw, result.OriginalTokenCount, omitted, tokens)
+	for len(result.Output) > outputBudget && tokens > 0 {
+		tokens = max(0, tokens-(len(result.Output)-outputBudget+3)/4)
+		result.Output = limitCommandOutput(raw, result.OriginalTokenCount, omitted, tokens)
 	}
 	data, _ := json.Marshal(result)
-	failed := problem != "" || result.ExitCode != nil && *result.ExitCode != 0
-	return astral.ToolResult{Content: astral.Text(header.String()), Details: data, IsError: failed, Outcome: outcome}
+	// A nonzero process exit is a normal tool response in Codex. Process status
+	// belongs in exit_code; only failure to execute or collect is a tool error.
+	return astral.ToolResult{Content: astral.Text(header.String() + result.Output + suffix), Details: data, IsError: problem != "", Outcome: outcome}
 }
 
 func chunkID() string {
