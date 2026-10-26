@@ -104,10 +104,9 @@ func Open(path string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		var version int
-		err = check.QueryRow("SELECT version FROM format").Scan(&version)
+		version, checkErr := readFormatMarkers(context.Background(), check)
 		check.Close()
-		if err != nil || !core.SupportsFormat(version) {
+		if checkErr != nil || !core.SupportsFormat(int(version)) {
 			return nil, core.ErrUnsupportedFormat
 		}
 	}
@@ -129,6 +128,9 @@ func Open(path string) (*Store, error) {
 		tx, err := db.BeginTx(ctx, nil)
 		if err == nil {
 			_, err = tx.ExecContext(ctx, schema)
+			if err == nil {
+				err = initializeMigrationHistory(ctx, db, tx, currentMigrationPlan())
+			}
 			if err == nil {
 				err = tx.Commit()
 			} else {
