@@ -39,7 +39,7 @@ CGO_ENABLED=0 go test ./store/sqlite ./tests/integration
 
 跨 Astral、agent-core、astral-models 调整 API 时，在包含三个 checkout 的 Go workspace 中验证全部模块，重新生成 Astral OpenAPI / TypeScript SDK，并运行前端 typecheck、test、lint 和全新数据目录验收。发布独立模块前再更新下游版本约束。
 
-集成测试使用受控模型以及真实临时文件、SQLite、Shell / PTY，不需要模型账号。新格式拒绝旧数据，不进行迁移；测试不得复用用户的实际数据目录。
+集成测试使用受控模型以及真实临时文件、SQLite、Shell / PTY，不需要模型账号。正常运行拒绝旧格式；[离线迁移](migrations.md) 使用独立入口与冻结的历史转换定义。测试不得复用用户的实际数据目录。
 
 ## 验收覆盖
 
