@@ -236,8 +236,8 @@ func TestIncrementalFullReplayAndCheckpointAgree(t *testing.T) {
 }
 
 func TestCurrentFormatMarkersAgreeWithRuntimeState(t *testing.T) {
-	if astral.FormatVersion != 10 {
-		t.Fatalf("current format must be version 10, got %d", astral.FormatVersion)
+	if astral.FormatVersion != 11 {
+		t.Fatalf("current format must be version 11, got %d", astral.FormatVersion)
 	}
 	for _, backend := range []string{"sqlite"} {
 		t.Run(backend, func(t *testing.T) {

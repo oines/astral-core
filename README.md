@@ -4,9 +4,13 @@ An embeddable Go SDK for durable agent sessions.
 
 `astral-core` 把输入接收、模型调用、工具执行、审批、历史分支和恢复集中到一个 `Session`。Host 提供模型、Store、TokenEstimator 和工具，并管理业务资源与执行所有权。Memory 与 SQLite 使用同一个执行实现。
 
+同一 Go module 包含根包 Core、`models/`、`store/{memory,sqlite}` 和 `standardtools/`。Models 实现根包的模型契约；Core 不导入具体 Provider。宿主可以直接使用 Models 完成单次或流式生成，无需 Session、Store 和 rollout；需要持久会话、工具循环、compact 与恢复时再交给 Core。两条路径共用认证、请求准备、reasoning 和响应解析能力。
+
+Models 保留了 Twilight AI 派生代码的来源、原有版权声明和 Apache-2.0 许可证，见 [NOTICE.md](NOTICE.md)、[Models 说明](models/README.md) 与 [models/LICENSE](models/LICENSE)。其他来源与适配说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 快速开始
 
-需要 Go 1.24+。以下示例使用离线模型，运行时不需要模型账号：
+需要 Go 1.25.7+。以下示例使用离线模型，运行时不需要模型账号：
 
 ```sh
 go run ./examples/basic
@@ -57,6 +61,22 @@ if submission.Run != nil {
 
 `Model` 实现 `Spec` / `Stream`；`EstimateTokens` 计算目标模型请求的输入 Token。测试和临时会话可使用 `store/memory.New()`，依赖与执行契约相同。
 
+## 模型选择与冻结目标
+
+固定模型继续使用 `Config.Model` 与 `Config.Options`。需要动态选择的宿主提供 `Config.Selection`、`ResolveModel` 和 `RestoreModel`：
+
+- `ModelSelection.ID` 是解析器拥有的不透明引用，与解析出的 `ModelSpec.ID` 可以不同。`Options` 保存会话覆盖；`Reasoning == nil` 继承模型默认，`&ReasoningOptions{}` 显式使用接口默认，非空指针表达明确推理选择。非 nil 的 `Reasoning` 优先于 `Options.Reasoning`。
+- `ResolveModel(ctx, selection)` 为新请求取得当前配置，合并默认与覆盖，返回 `ResolvedModel{Model, Options, Snapshot}`。`Options` 是最终唯一的请求参数；`Snapshot` 保存实际解析目标所需的无密钥配置，不能仅保存会再次套用新默认规则的原始引用。
+- `RestoreModel(ctx, ModelSnapshot{Spec, Data})` 仅恢复已冻结目标，不重新解析当前选择或合并默认；凭据通过外部存取取得。返回规格必须与冻结规格一致。固定模型与冻结规格相同、且没有快照数据时，无需恢复回调。
+
+`Configuration.Selection` 是当前选择的唯一持久来源。`SelectModel` 只验证通用形状并记录，不构造模型；新选择整体替换旧覆盖。已冻结请求与普通网络重试不受影响，后续新请求再解析最新选择。准备开始至冻结完成，以及手动或自动 compact 期间，选择返回 `ErrBusy`；不排队切换。
+
+`ReadConfiguration(ctx, store, sessionID)` 只读取 RuntimeState 和配置节点，适合跨大量会话列出选择，不创建句柄、不加载活动上下文。
+
+`OpenSession` 不要求提供初始 Model 或解析旧模型。移除旧连接后仍能读取历史、换选与 Fork；首次继续才解析需要执行的目标。`ReadContext` 返回未经目标适配的有界活动历史，`InspectContext` 则解析、适配并估算当前目标。Fork 包含选中节点，继承该位置的 `Selection`，不继承父会话后来的覆盖。
+
+签名、密文和原生内容保存在消息中。`RequestPreparer` 只修改当前请求副本，按目标兼容性保留或省略原生内容，保留通用文本及完整工具关系；Core 不包含服务商判断。历史本身保持原样，新回复继续正常保存。
+
 ## 输入与生命周期
 
 | API | 行为 |
@@ -73,7 +93,9 @@ if submission.Run != nil {
 | `Cancel()` / `Run.Cancel()` | 取消执行并保留未消费输入 |
 | `Compact(ctx, instructions)` | 空闲时显式压缩，不消费驱动输入、不生成普通回答 |
 | `Snapshot()` / `Subscribe()` | 读取执行状态、尝试进度并订阅事件 |
-| `History()` / `InspectContext()` | 读取历史与有效上下文，不启动执行或收集环境 |
+| `History()` / `ReadContext()` | 分页历史与有界活动上下文，不解析模型、不收集环境 |
+| `InspectContext()` | 为当前目标准备并估算活动上下文，不调用模型 |
+| `SelectModel(ctx, ModelSelection)` | 原子替换下一请求的模型选择及覆盖；准备或 compact 期间返回 `ErrBusy` |
 | `Attempts().Get/Scan/Request` | 读取独立的模型尝试记录，或按需重建实际请求 |
 | `Fork(ctx, entryID, options)` | 在完整历史边界创建共享或独立 Rollout 的 Session |
 
@@ -121,11 +143,11 @@ config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary)
 
 提供商明确报告 `ModelError.ContextOverflow` 时，Core 在完整边界上最多再压缩并生成一次；不走原样 HTTP 重试。此次恢复不接收新队列输入，不重跑已完成的工具；第二次溢出直接停止。关闭自动压缩时也关闭该恢复。
 
-每次外部调用前保存独立的 `ModelAttempt`。`RequestInput` 固定 Rollout、祖先路径 Head、Configuration、模型规格、消息选择和必要的准备/修复差异；完整 Request 只在内存中组装，不按轮次复制图片、历史消息或 opaque reasoning。`Attempts().Request` 只读取固定边界内的有效上下文并核对内容摘要，不重新采集环境或调用模型。
+每次外部调用前保存独立的 `ModelAttempt`。`RequestInput` 固定 Rollout、祖先路径 Head、Configuration、模型规格、最终目标的无密钥快照、消息选择和必要的准备/修复差异；完整 Request 只在内存中组装，不按轮次复制图片、历史消息或 opaque reasoning。`Attempts().Request` 只读取固定边界内的有效上下文并核对内容摘要，不重新采集环境或调用模型。
 
 成功回复与 Attempt 完成通过一次提交确认，正文只存在于被采用的消息节点；Attempt 保存结果节点引用和用量。失败片段与未采用的摘要只存在于 Attempt，采用摘要时原子移入 Compaction 节点。失败、取消和 Length 回复不会触发工具，也不会进入后续普通请求或摘要。
 
-进程在输入提交后、回复提交前退出，重开保留未完成 Attempt。显式 Continue 创建关联到原尝试的新 Attempt，复用同一份冻结输入；已经确认的回复不会重新生成。远端请求可能已执行，不能保证网络调用恰好一次。正常失败或明确取消会结束这次生成，之后 Continue 可应用排队输入与新配置。
+进程在输入提交后、回复提交前退出，重开保留未完成 Attempt。显式 Continue 通过 RestoreModel 恢复冻结目标，创建关联到原尝试的新 Attempt，复用同一份冻结输入；已经确认的回复不会重新生成。远端请求可能已执行，不能保证网络调用恰好一次。正常失败或明确取消会结束这次生成，之后 Continue 可应用排队输入与新配置。
 
 事件和 Snapshot 提供 Run / Turn / Attempt ID、用途、当前次数、上限、下一次重试时间与安全错误代码。客户端按 Attempt 隔离临时输出；重连只恢复事件流和快照，不重发模型请求。
 
@@ -143,10 +165,10 @@ Assistant 的 `Content` 按原顺序保存 Reasoning、Text、ToolCall、多模�
 
 ## 存储与所有权
 
-当前 Core 格式为 **10**，正常运行只支持本格式。没有旧接口、旧格式读取或运行时自动升级；已有旧数据库返回 `ErrUnsupportedFormat`。SQLite 提供独立的 `InspectMigration` / `Migrate` 离线入口，由 Host 停服、备份后执行；Goose 按顺序补齐最新版内嵌的历史迁移。格式 10 是首个受支持的基线，之前未公开格式不转换。见 [离线迁移契约](docs/migrations.md)。SQLite 是持久运行后端，Memory 用于临时会话；Host 可实现同一 Store 契约接入其他后端。不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
+当前 Core 格式为 **11**，正常运行只支持本格式。没有旧接口、旧格式读取或运行时自动升级；已有旧数据库返回 `ErrUnsupportedFormat`。SQLite 提供独立的 `InspectMigration` / `Migrate` 离线入口，由 Host 停服、备份后执行；Goose 按顺序补齐最新版内嵌的历史迁移。当前基线为格式 11，格式 10 及更早版本不转换。见 [离线迁移契约](docs/migrations.md)。SQLite 是持久运行后端，Memory 用于临时会话；Host 可实现同一 Store 契约接入其他后端。不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
 
 历史树通过 ParentID 表达分支，Session 持有执行游标、待办和当前未完成 Attempt；三者具有独立身份。普通读取只分页加载所选祖先路径的有效上下文及必要引用，内存不随归档历史总长度增长。Shared Fork 共享祖先节点，Detached Fork 分页复制所选祖先路径后原子发布；两种 Fork 都不继承父 Session 的 Attempt，消息、摘要和用量元数据不依赖父执行记录才能读取。
 
 Host 对每个 Session ID 保留一个活动句柄，并保证进程间执行所有权。Store 的 CAS 不能撤销已发生的外部副作用。Close 取消并等待 Session 的执行、维护与 Fork，释放缓存；Model、Store 和工具环境仍由 Host 关闭。Fork 复制或共享历史，不复制工作文件或活动进程。
 
-更多实现约束见 [宿主契约](docs/contracts.md)，验证入口见 [开发与验证](docs/development.md)。[性能报告](docs/benchmarks.md) 保留早期版本的历史测量，不代表格式 10 的最新性能结果。
+更多实现约束见 [宿主契约](docs/contracts.md)，验证入口见 [开发与验证](docs/development.md)。[性能报告](docs/benchmarks.md) 保留早期版本的历史测量，不代表格式 11 的最新性能结果。

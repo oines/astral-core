@@ -22,6 +22,7 @@ type Session struct {
 	mu                 sync.Mutex
 	config             Config
 	modelID            string
+	preparing          bool
 	tools              map[string]registeredTool
 	id, rolloutID      string
 	state              RuntimeState
@@ -53,7 +54,11 @@ func NewSession(ctx context.Context, config Config, options SessionOptions) (*Se
 	if err != nil {
 		return nil, err
 	}
-	defaults := Configuration{SystemPrompt: config.SystemPrompt, ModelID: s.modelID, Options: s.config.Options}
+	if err := s.config.Selection.Validate(); err != nil {
+		s.stopLifetime()
+		return nil, err
+	}
+	defaults := Configuration{SystemPrompt: config.SystemPrompt, Selection: s.config.Selection}
 	for _, tool := range config.Tools {
 		defaults.Tools = append(defaults.Tools, clone(tool.Definition()))
 	}
@@ -95,11 +100,23 @@ func OpenSession(ctx context.Context, config Config, id string) (*Session, error
 }
 
 func configureSession(config Config, id string) (*Session, error) {
-	if id == "" || config.Model == nil || config.Store == nil || config.EstimateTokens == nil {
-		return nil, fmtInvalid("ID, Model, Store and EstimateTokens are required")
+	if id == "" || config.Store == nil || config.EstimateTokens == nil {
+		return nil, fmtInvalid("ID, Store and EstimateTokens are required")
 	}
-	if err := validateModelSpec(config.Model.Spec()); err != nil {
-		return nil, err
+	modelID := ""
+	if config.Model != nil {
+		if err := validateModelSpec(config.Model.Spec()); err != nil {
+			return nil, err
+		}
+		modelID = config.Model.Spec().ID
+	}
+	if config.Selection.ID == "" {
+		config.Selection = ModelSelection{ID: modelID, Options: config.Options}
+	}
+	if config.Selection.ID != "" {
+		if err := config.Selection.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	if err := config.Options.Validate(); err != nil {
 		return nil, err
@@ -150,6 +167,10 @@ func configureSession(config Config, id string) (*Session, error) {
 	}
 	config.Compaction.ModelBudgets = clone(config.Compaction.ModelBudgets)
 	var err error
+	config.Selection, err = copyJSON(config.Selection)
+	if err != nil {
+		return nil, err
+	}
 	config.Options, err = copyJSON(config.Options)
 	if err != nil {
 		return nil, err
@@ -159,7 +180,7 @@ func configureSession(config Config, id string) (*Session, error) {
 		return nil, err
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	s := &Session{id: id, config: config, modelID: config.Model.Spec().ID, tools: map[string]registeredTool{}, windowIndex: map[string]int{}, lifetime: lifetime, stopLifetime: cancel, changed: make(chan struct{})}
+	s := &Session{id: id, config: config, modelID: modelID, tools: map[string]registeredTool{}, windowIndex: map[string]int{}, lifetime: lifetime, stopLifetime: cancel, changed: make(chan struct{})}
 	for _, tool := range config.Tools {
 		if tool == nil {
 			cancel()

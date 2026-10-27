@@ -35,7 +35,9 @@ func TestToolControlForksAndCompaction(t *testing.T) {
 		c := testConfig(m, st)
 		c.Tools = []astral.Tool{stop}
 		c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
-		c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+		c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+			return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+		}
 		manager := newSessions(t, c)
 		parent := newSession(t, manager, astral.SessionOptions{ID: "parent"})
 		first := waitOK(t, start(t, parent, "control"))

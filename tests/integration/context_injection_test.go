@@ -76,7 +76,9 @@ func TestInjectedMultimodalContextIsPassiveAndDurable(t *testing.T) {
 		c := testConfig(normal, store)
 		c.Compaction.KeepRecentTokens = 1
 		c.Compaction.ModelID = "summary"
-		c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+		c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+			return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+		}
 		s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 		batch := []astral.Message{mediaContext(astral.RoleDeveloper, "environment")}
 		id, err := inject(s, ctx, batch)
@@ -322,7 +324,9 @@ func TestContextInjectionDuringCompactionStaysPassive(t *testing.T) {
 	c := testConfig(normal, memory.New())
 	c.Compaction.ModelID = "summary"
 	c.Compaction.KeepRecentTokens = 1
-	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	done := make(chan error, 1)

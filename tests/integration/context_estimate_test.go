@@ -101,7 +101,9 @@ func TestUsageAnchorInvalidatesForConfigurationModelAndCompaction(t *testing.T) 
 			other.spec.ID = "other"
 			other.estimator = contentEstimate
 			c := testConfig(m, memory.New())
-			c.ResolveModel = func(context.Context, string) (core.Model, error) { return other, nil }
+			c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+				return core.ResolvedModel{Model: other, Options: selection.Options}, nil
+			}
 			c.Compaction = core.CompactionPolicy{Disabled: true, SystemPrompt: "summary", KeepRecentTokens: 1}
 			s := newSession(t, newSessions(t, c), core.SessionOptions{})
 			waitOK(t, start(t, s, strings.Repeat("old", 1000)))
@@ -115,7 +117,7 @@ func TestUsageAnchorInvalidatesForConfigurationModelAndCompaction(t *testing.T) 
 			case "revision":
 				m.spec.Revision = "new-wire-contract"
 			case "model":
-				if err := s.SelectModel(ctx, "other"); err != nil {
+				if err := s.SelectModel(ctx, core.ModelSelection{ID: "other"}); err != nil {
 					t.Fatal(err)
 				}
 			case "compaction":
@@ -312,7 +314,9 @@ func TestPiThresholdSummaryAllowanceAndDynamicOutput(t *testing.T) {
 	c := testConfig(m, memory.New())
 	c.Budget = core.BudgetPolicy{} // Exercise production defaults.
 	c.Compaction = core.CompactionPolicy{ModelID: "summary"}
-	c.ResolveModel = func(context.Context, string) (core.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+		return core.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	s := newSession(t, newSessions(t, c), core.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	if got := m.observed()[0].MaxOutputTokens; got != 80000 {

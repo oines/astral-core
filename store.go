@@ -9,7 +9,7 @@ import (
 	"math"
 )
 
-const FormatVersion = 10
+const FormatVersion = 11
 
 func SupportsFormat(version int) bool { return version == FormatVersion }
 

@@ -44,7 +44,7 @@ func TestModelSelectionFreezesNextRequestOptionsDuringRun(t *testing.T) {
 	run := start(t, s, "first")
 	<-entered
 	options := astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "selected"}}
-	if err := s.SelectModel(context.Background(), m.spec.ID, options); err != nil {
+	if err := s.SelectModel(context.Background(), astral.ModelSelection{ID: m.spec.ID, Options: options}); err != nil {
 		close(release)
 		t.Fatal(err)
 	}
@@ -69,7 +69,9 @@ func TestCompactionUsesIndependentFrozenOptionsAndReasoningReply(t *testing.T) {
 	summary.spec.ID, summary.spec.Revision = "summary", "summary-v2"
 	config := testConfig(normal, memory.New())
 	config.Options.Reasoning.Effort = "normal-effort"
-	config.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+	config.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	config.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1,
 		Options: astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "high"}}}
 	s := newSession(t, newSessions(t, config), astral.SessionOptions{})
@@ -82,7 +84,7 @@ func TestCompactionUsesIndependentFrozenOptionsAndReasoningReply(t *testing.T) {
 	if record.Summary != "compressed history" || record.ModelRevision != "summary-v2" || record.Options.Reasoning.Effort != "high" {
 		t.Fatalf("missing summary provenance: %+v", record)
 	}
-	if s.Configuration().Options.Reasoning.Effort != "normal-effort" {
+	if s.Configuration().Selection.Options.Reasoning.Effort != "normal-effort" {
 		t.Fatal("summary options replaced the normal generation selection")
 	}
 }
@@ -138,11 +140,11 @@ func TestPersistentGenerationOptionsSurviveConfigurationAndReopen(t *testing.T) 
 			t.Fatalf("defaults were not frozen: %+v", got)
 		}
 		selected := s.Configuration()
-		selected.Options.Reasoning.Effort = "vendor-ultra"
+		selected.Selection.Options.Reasoning.Effort = "vendor-ultra"
 		if err := s.Configure(context.Background(), selected); err != nil {
 			t.Fatal(err)
 		}
-		mutateOptions(selected.Options)
+		mutateOptions(selected.Selection.Options)
 		id := s.ID()
 		if err := manager.Close(context.Background()); err != nil {
 			t.Fatal(err)
@@ -187,4 +189,86 @@ func TestModelInputLimitIsCheckedIndependentlyOfContextWindow(t *testing.T) {
 			t.Fatalf("input budget was not enforced: %v", err)
 		}
 	})
+}
+
+func TestIndependentCompactionUsesResolvedDefaultsAndExplicitOverrides(t *testing.T) {
+	temperature, topP := 0.25, 0.75
+	want := astral.GenerationOptions{Temperature: &temperature, TopP: &topP, Reasoning: astral.ReasoningOptions{Effort: "summary-model-default"}}
+	normal := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
+		return answer("normal answer"), nil
+	})
+	summary := model(func(_ context.Context, _ int, request astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+		if !reflect.DeepEqual(request.Options, want) {
+			t.Fatalf("independent summary lost resolved defaults or explicit overrides: got %+v want %+v", request.Options, want)
+		}
+		return answer("resolved summary"), nil
+	})
+	summary.spec.ID = "summary"
+	config := testConfig(normal, memory.New())
+	config.Options = astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "normal-only"}, ToolChoice: astral.ToolChoice{Mode: "required"}, ResponseFormat: &astral.ResponseFormat{Type: "json_object"}}
+	config.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, SystemPrompt: "summary prompt", Options: astral.GenerationOptions{TopP: &topP}}
+	var resolutions int
+	config.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		resolutions++
+		if selection.ID != "summary" || !reflect.DeepEqual(selection.Options, config.Compaction.Options) {
+			t.Fatalf("summary did not resolve its own overrides: %+v", selection)
+		}
+		resolved := selection.Options
+		resolved.Temperature = &temperature
+		resolved.Reasoning = astral.ReasoningOptions{Effort: "summary-model-default"}
+		return astral.ResolvedModel{Model: summary, Options: resolved}, nil
+	}
+	session := newSession(t, newSessions(t, config), astral.SessionOptions{})
+	waitOK(t, start(t, session, "first"))
+	waitOK(t, start(t, session, "second"))
+	record, err := session.Compact(context.Background(), "")
+	if err != nil || record.Summary != "resolved summary" || !reflect.DeepEqual(record.Options, want) || resolutions != 1 {
+		t.Fatalf("summary provenance lost final options: %+v resolutions=%d err=%v", record, resolutions, err)
+	}
+	for _, attempt := range allAttempts(t, session) {
+		if attempt.Purpose != "compaction" {
+			continue
+		}
+		frozen, err := session.Attempts().Request(context.Background(), attempt.ID)
+		if err != nil || !reflect.DeepEqual(frozen.Options, want) {
+			t.Fatalf("summary freeze lost resolved options: %+v %v", frozen.Options, err)
+		}
+	}
+}
+
+func TestDefaultCompactionKeepsOptionsIndependentFromGeneration(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "API defaults", true: "explicit compaction overrides"}[explicit], func(t *testing.T) {
+			want := astral.GenerationOptions{}
+			if explicit {
+				want.Reasoning.Effort = "summary-only"
+			}
+			m := model(func(_ context.Context, _ int, request astral.Request, _ func(astral.ModelEvent)) (astral.Reply, error) {
+				if request.SystemPrompt == "summary prompt" {
+					if !reflect.DeepEqual(request.Options, want) {
+						t.Fatalf("ordinary generation options leaked into summary: %+v", request.Options)
+					}
+					return answer("independent summary"), nil
+				}
+				if request.Options.Reasoning.Effort != "normal-only" || request.Options.ToolChoice.Mode != "required" || request.Options.ResponseFormat == nil {
+					t.Fatal("ordinary generation lost its own options")
+				}
+				return answer("normal answer"), nil
+			})
+			config := testConfig(m, memory.New())
+			config.Options = astral.GenerationOptions{Reasoning: astral.ReasoningOptions{Effort: "normal-only"}, ToolChoice: astral.ToolChoice{Mode: "required"}, ResponseFormat: &astral.ResponseFormat{Type: "json_object"}}
+			config.Compaction = astral.CompactionPolicy{KeepRecentTokens: 1, SystemPrompt: "summary prompt", Options: want}
+			config.ResolveModel = func(context.Context, astral.ModelSelection) (astral.ResolvedModel, error) {
+				t.Fatal("default compaction re-resolved its already selected target")
+				return astral.ResolvedModel{}, nil
+			}
+			session := newSession(t, newSessions(t, config), astral.SessionOptions{})
+			waitOK(t, start(t, session, "first"))
+			waitOK(t, start(t, session, "second"))
+			record, err := session.Compact(context.Background(), "")
+			if err != nil || !reflect.DeepEqual(record.Options, want) {
+				t.Fatalf("default summary did not retain independent options: %+v %v", record, err)
+			}
+		})
+	}
 }

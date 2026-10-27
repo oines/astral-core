@@ -20,6 +20,7 @@ type RequestInput struct {
 	HeadID          string          `json:"head_id"`
 	ConfigurationID string          `json:"configuration_id"`
 	Model           ModelSpec       `json:"model"`
+	Snapshot        json.RawMessage `json:"snapshot,omitempty"`
 	Selection       *[]int          `json:"selection,omitempty"`
 	Changes         []RequestChange `json:"changes,omitempty"`
 	Digest          string          `json:"digest"`

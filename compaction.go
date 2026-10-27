@@ -40,6 +40,10 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	for i := len(groups) - 1; i >= 0; i-- {
 		keepStart = groups[i].start
 		request := Request{ModelID: normalModel.Spec().ID, ModelRevision: normalModel.Spec().Revision, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.config.Budget.OutputTokens, normalModel.Spec())}
+		request, err := PrepareRequest(ctx, normalModel, request)
+		if err != nil {
+			return CompactionRecord{}, err
+		}
 		count, err := estimate(ctx, normalModel, request)
 		if err != nil {
 			return CompactionRecord{}, err
@@ -92,14 +96,16 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	if err = validateProtocol(selected); err != nil {
 		return CompactionRecord{}, err
 	}
-	summaryModelID := s.config.Compaction.ModelID
-	if summaryModelID == "" {
-		summaryModelID = normalModel.Spec().ID
+	summaryModel := normalModel
+	summaryOptions := s.config.Compaction.Options
+	if id := s.config.Compaction.ModelID; id != "" {
+		summaryModel, err = s.resolveModel(ctx, ModelSelection{ID: id, Options: s.config.Compaction.Options})
+		if err != nil {
+			return CompactionRecord{}, err
+		}
+		summaryOptions = resolvedOptions(summaryModel)
 	}
-	summaryModel, err := s.model(ctx, summaryModelID)
-	if err != nil {
-		return CompactionRecord{}, err
-	}
+	summaryModelID := summaryModel.Spec().ID
 	output := s.config.Compaction.OutputTokens
 	if output == 0 {
 		reserve := s.compactionBudget(normalModel).ReserveTokens
@@ -107,7 +113,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		output = max(1, reserve/5*4+reserve%5*4/5)
 	}
 	output = outputReservation(output, summaryModel.Spec())
-	baseRequest := Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: s.config.Compaction.Options}
+	baseRequest := Request{ModelID: summaryModelID, ModelRevision: summaryModel.Spec().Revision, SystemPrompt: s.config.Compaction.SystemPrompt, MaxOutputTokens: output, Options: summaryOptions}
 	build := func(messages []Message) (Request, error) {
 		candidate := baseRequest
 		candidate.Messages = summaryMessages(messages, instructions)

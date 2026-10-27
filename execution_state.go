@@ -79,7 +79,7 @@ func (s *Session) executionSnapshot() ExecutionState {
 }
 func (s *Session) executionStateLocked() ExecutionState {
 	c := s.configurationLocked()
-	out := ExecutionState{ID: s.id, Configuration: Configuration{ModelID: c.ModelID, SystemPrompt: c.SystemPrompt, Tools: c.Tools, Options: c.Options}, Calls: map[string]CallState{}}
+	out := ExecutionState{ID: s.id, Configuration: c, Calls: map[string]CallState{}}
 	out.HasQueuedInputs = s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] > 0
 	if s.state.LastRun != nil {
 		out.LastRunStatus = s.state.LastRun.Status

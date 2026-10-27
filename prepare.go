@@ -24,6 +24,22 @@ type preparedStep struct {
 var errQueueRevised = errors.New("selected queue input was revised")
 
 func (s *Session) prepareStep(ctx context.Context, options prepareOptions) (preparedStep, CompactionRecord, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return preparedStep{}, CompactionRecord{}, ErrClosed
+	}
+	if s.preparing {
+		s.mu.Unlock()
+		return preparedStep{}, CompactionRecord{}, ErrBusy
+	}
+	s.preparing = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.preparing = false
+		s.mu.Unlock()
+	}()
 	if options.generation && !options.compact {
 		s.mu.Lock()
 		pending := s.state.CurrentAttemptID
@@ -66,13 +82,15 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	model, err := s.model(ctx, old.Request.ModelID)
+	model, err := s.resolveModel(ctx, old.Selection)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	if err = s.validateConfiguration(ctx, Configuration{SystemPrompt: old.Request.SystemPrompt, ModelID: old.Request.ModelID, Tools: old.Request.Tools, Options: old.Request.Options}); err != nil {
+	if err = s.validateConfiguration(ctx, Configuration{SystemPrompt: old.Request.SystemPrompt, Selection: old.Selection, Tools: old.Request.Tools}); err != nil {
 		return preparedStep{}, summary, err
 	}
+	old.Request.ModelID, old.Request.ModelRevision = model.Spec().ID, model.Spec().Revision
+	old.Request.Options = resolvedOptions(model)
 	driving := false
 	for _, record := range selected {
 		driving = driving || record.Entry.Input.Kind != InputContext
@@ -81,6 +99,8 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	// after a summary. No draft becomes history until the final check passes.
 	build := func(base Context, compactionID string) (Context, []Entry, error) {
 		view := cloneContext(base)
+		view.Request.ModelID, view.Request.ModelRevision = model.Spec().ID, model.Spec().Revision
+		view.Request.Options = resolvedOptions(model)
 		var entries []Entry
 		add := func(entry Entry) {
 			if entry.ID == "" {
@@ -228,7 +248,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	var attempt *ModelAttempt
 	if options.generation {
-		input, err := FreezeRequest(s.rolloutID, base, candidate.Request, model.Spec())
+		input, err := freezeModelRequest(s.rolloutID, base, candidate.Request, model)
 		if err != nil {
 			return preparedStep{}, summary, err
 		}
@@ -252,6 +272,17 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 	request, err := PrepareRequest(ctx, model, view.Request)
 	if err != nil {
 		return view, err
+	}
+	if !sameJSON(view.Request.Messages, request.Messages) {
+		selection := selectRequestMessages(view.Request.Messages, request.Messages)
+		sources := make([]string, len(selection))
+		for i, at := range selection {
+			if at >= 0 && at < len(view.Sources) {
+				sources[i] = view.Sources[at]
+			}
+		}
+		view.Sources = sources
+		view.anchor = nil
 	}
 	view.Request = request
 	if err = validateProtocol(request.Messages); err != nil {

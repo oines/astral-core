@@ -28,11 +28,14 @@ func (s *Session) boundResult(ctx context.Context, inv Invocation, result ToolRe
 	if len(encoded) > s.config.MaxContextBytes/2 || windowBytes+len(encoded) > 2*s.config.MaxContextBytes-2048 {
 		return deliveryFailure(result, "result_too_large", "The output exceeds the context byte budget."), nil
 	}
-	model, err := s.model(ctx, configuration.ModelID)
+	model, err := s.resolveModel(ctx, configuration.Selection)
 	if err != nil {
-		return deliveryFailure(result, "result_delivery_failed", err.Error()), err
+		// A later selection can be unavailable while an already authorized tool
+		// finishes. Keep its bounded execution result; resolving the next request
+		// reports that model error without destroying the tool's output.
+		return result, nil
 	}
-	request := Request{ModelID: model.Spec().ID, ModelRevision: model.Spec().Revision, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: configuration.Options, MaxOutputTokens: outputReservation(s.config.Budget.OutputTokens, model.Spec())}
+	request := Request{ModelID: model.Spec().ID, ModelRevision: model.Spec().Revision, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: resolvedOptions(model), MaxOutputTokens: outputReservation(s.config.Budget.OutputTokens, model.Spec())}
 	// Keep all declarations/calls and valid placeholder results; old conversation
 	// messages are deliberately excluded when deciding whether one result alone
 	// is impossible to deliver. Aggregate pressure is handled by compaction.
@@ -49,9 +52,8 @@ func (s *Session) boundResult(ctx context.Context, inv Invocation, result ToolRe
 	if errors.Is(err, ErrBudget) {
 		return deliveryFailure(result, "result_too_large", "The output exceeds the model's delivery budget."), nil
 	}
-	if err != nil {
-		return deliveryFailure(result, "result_delivery_failed", err.Error()), err
-	}
+	// Only a measured single-result budget failure justifies shortening output.
+	// Protocol/configuration errors belong to the next request's preparation.
 	return result, nil
 }
 

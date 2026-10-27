@@ -106,11 +106,13 @@ func TestModelSelectionTakesEffectOnNextRequest(t *testing.T) {
 	second.spec.ID = "second"
 	c := testConfig(first, memory.New())
 	c.Tools = []astral.Tool{echoTool(nil)}
-	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return second, nil }
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: second, Options: selection.Options}, nil
+	}
 	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	r := start(t, s, "go")
 	signal(t, entered)
-	if err := s.SelectModel(context.Background(), "second"); err != nil {
+	if err := s.SelectModel(context.Background(), astral.ModelSelection{ID: "second"}); err != nil {
 		t.Fatal(err)
 	}
 	close(release)

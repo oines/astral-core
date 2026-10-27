@@ -37,7 +37,9 @@ func TestGenerationAndSummaryRetriesUseFrozenRequestsAndExcludeFailures(t *testi
 		c := testConfig(normal, store)
 		c.Retry = core.RetryPolicy{MaxAttempts: 3, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
 		c.Compaction = core.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100}
-		c.ResolveModel = func(context.Context, string) (core.Model, error) { return summary, nil }
+		c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+			return core.ResolvedModel{Model: summary, Options: selection.Options}, nil
+		}
 		c.CollectContext = func(_ context.Context, b core.ContextBoundary) ([]core.Message, error) {
 			collects.Add(1)
 			if b.Reason == "created" || b.CompactionID != "" {
@@ -135,7 +137,9 @@ func TestRetryExhaustionPermanentErrorsAndTimeoutsShareOneBudget(t *testing.T) {
 						})
 						c.Model = seed
 						c.Compaction = core.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1}
-						c.ResolveModel = func(context.Context, string) (core.Model, error) { return target, nil }
+						c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+							return core.ResolvedModel{Model: target, Options: selection.Options}, nil
+						}
 					}
 					s := newSession(t, newSessions(t, c), core.SessionOptions{})
 					if purpose == "compaction" {

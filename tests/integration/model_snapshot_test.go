@@ -154,7 +154,7 @@ func TestModelSnapshotCommitFailurePreventsDependentEffects(t *testing.T) {
 }
 
 func TestPreviousHistoryFormatsAreRejected(t *testing.T) {
-	for _, version := range []int{6, 7, 8, 9} {
+	for _, version := range []int{6, 7, 8, 9, 10} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			eachStore(t, func(t *testing.T, store astral.Store) {
 				header := storeHeader()

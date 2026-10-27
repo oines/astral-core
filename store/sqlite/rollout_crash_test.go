@@ -18,7 +18,7 @@ import (
 
 func rolloutCrashFixture(t *testing.T, st *Store) astral.ForkRequest {
 	t.Helper()
-	entries := []astral.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: astral.FormatVersion, SessionID: "parent", RolloutID: "root-rollout"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{ModelID: "test"}}}
+	entries := []astral.Entry{{ID: "created", SessionID: "parent", Version: 1, Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: astral.FormatVersion, SessionID: "parent", RolloutID: "root-rollout"}}, {ID: "config", SessionID: "parent", Version: 1, Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{Selection: astral.ModelSelection{ID: "test"}}}}
 	parent := "config"
 	for i := 0; i < 700; i++ {
 		id := fmt.Sprintf("node-%d", i)

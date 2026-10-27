@@ -20,6 +20,7 @@ astral-core/
 ├── session_history.go                # 分页历史与 Shared/Detached Fork
 ├── events.go                         # 事件和原子运行快照
 ├── internal/streamcheck/              # 每次 Attempt 的内容索引校验
+├── models/                            # 直接模型调用、Provider 适配与集成资料
 ├── store/memory/, store/sqlite/       # 同一 Session 的两种后端
 ├── standardtools/                    # 文件、命令、进程与本地 Backend
 ├── tests/integration/                # 公开 API、真实存储与崩溃测试
@@ -37,7 +38,7 @@ go vet ./...
 CGO_ENABLED=0 go test ./store/sqlite ./tests/integration
 ```
 
-跨 Astral、agent-core、astral-models 调整 API 时，在包含三个 checkout 的 Go workspace 中验证全部模块，重新生成 Astral OpenAPI / TypeScript SDK，并运行前端 typecheck、test、lint 和全新数据目录验收。发布独立模块前再更新下游版本约束。
+跨 Astral 与 astral-core（包含 `models/`）调整 API 时，可以用包含两个 checkout 的 Go workspace 联调，重新生成 Astral OpenAPI / TypeScript SDK，并运行前端 typecheck、test、lint 和全新数据目录验收。发布前必须先保存并公开 Core commit，再将 Astral 固定到对应模块版本，并用 `GOWORK=off` 验证；本地 workspace 替换不能作为发行依赖。
 
 集成测试使用受控模型以及真实临时文件、SQLite、Shell / PTY，不需要模型账号。正常运行拒绝旧格式；[离线迁移](migrations.md) 使用独立入口与冻结的历史转换定义。测试不得复用用户的实际数据目录。
 
@@ -50,6 +51,7 @@ CGO_ENABLED=0 go test ./store/sqlite ./tests/integration
 | `retry_contract_test.go` | 普通生成与摘要冻结请求、三次总预算、永久错误/超时、Retry-After 与取消、事件和模型隔离 |
 | `context_injection_test.go` / `steering_test.go` | 多模态、FIFO、完整投递组、被动上下文、清除、预算及两后端一致性 |
 | `model_recovery_test.go` / `model_snapshot_test.go` | 受限协议修复、实际请求审计、冻结附件、不重复工具、只支持新格式 |
+| `selection_resolution_test.go` / `model_budget_boundary_test.go` | 冷历史与 Fork 不解析模型、冻结目标恢复、准备期间拒绝切换、直接调用与 Loop 的预算边界 |
 | `attempt_crash_test.go` / `attempt_store_test.go` | 输入/回复原子边界的真实强杀、回执丢失、冻结续接、失败回滚、跨分支隔离 |
 | `delete_test.go` | 私有 Rollout 永久删除、幂等、Detached 副本独立、拒绝误删共享历史 |
 | `request_input_test.go` | 消息裁剪与 reasoning 删除保留图片引用、结构差异重建、opaque JSON 整数精度 |

@@ -350,7 +350,9 @@ func TestInterleavedContentSurvivesPersistenceCompactionAndFork(t *testing.T) {
 				return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(inv.Call.ID)}}, nil
 			})}
 			c.Compaction = astral.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
-			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+			c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+				return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+			}
 			a := newSessions(t, c)
 			parent := newSession(t, a, astral.SessionOptions{ID: "ordered-parent"})
 			waitOK(t, start(t, parent, "work"))
@@ -518,7 +520,9 @@ func TestCompactionRejectsInvalidStreamReferences(t *testing.T) {
 	summary.spec.ID = "summary"
 	c := testConfig(m, memory.New())
 	c.Compaction = astral.CompactionPolicy{Disabled: true, ModelID: summary.spec.ID, KeepRecentTokens: 1}
-	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	waitOK(t, start(t, s, "second"))
