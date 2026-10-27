@@ -53,7 +53,9 @@ func TestPreparedBoundaryCommitsSummaryEnvironmentAndInputTogether(t *testing.T)
 					if outcome == "default_retention" {
 						c.Compaction.KeepRecentTokens = 0
 					}
-					c.ResolveModel = func(context.Context, string) (core.Model, error) { return summary, nil }
+					c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+						return core.ResolvedModel{Model: summary, Options: selection.Options}, nil
+					}
 					c.CollectContext = func(ctx context.Context, b core.ContextBoundary) ([]core.Message, error) {
 						collecting.Add(1)
 						if b.CompactionID == "" {

@@ -2,6 +2,7 @@ package astral
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 )
 
@@ -11,18 +12,23 @@ type Config struct {
 	MaxContextBytes int
 	EstimateTokens  TokenEstimator
 	Model           Model
+	Selection       ModelSelection
 	Store           Store
 	SystemPrompt    string
 	Options         GenerationOptions
 	Tools           []Tool
-	ResolveModel    func(context.Context, string) (Model, error)
-	BeforeToolCall  BeforeToolCall
-	AfterToolCall   AfterToolCall
-	CollectContext  CollectContext
-	Retry           RetryPolicy
-	Budget          BudgetPolicy
-	Compaction      CompactionPolicy
-	MaxTurns        int
+	// ResolveModel resolves a fresh selection, including mutable model defaults.
+	ResolveModel func(context.Context, ModelSelection) (ResolvedModel, error)
+	// RestoreModel reconstructs a previously frozen target without applying
+	// current defaults. Credentials remain external to the snapshot.
+	RestoreModel   func(context.Context, ModelSnapshot) (Model, error)
+	BeforeToolCall BeforeToolCall
+	AfterToolCall  AfterToolCall
+	CollectContext CollectContext
+	Retry          RetryPolicy
+	Budget         BudgetPolicy
+	Compaction     CompactionPolicy
+	MaxTurns       int
 	// MaxParallelTools defaults to 8. A sequential declaration still serializes
 	// the whole batch, regardless of this limit.
 	MaxParallelTools int
@@ -40,12 +46,52 @@ type ContextBoundary struct {
 }
 type CollectContext func(context.Context, ContextBoundary) ([]Message, error)
 
+// ModelSelection is the caller's persistent choice, independent of a resolved
+// model revision. ID is an opaque reference owned by the resolver. Reasoning nil
+// inherits model defaults; a non-nil empty value explicitly uses API defaults.
+// Options carries other per-session generation overrides. Reasoning, when set,
+// overrides Options.Reasoning as well as the model's default reasoning.
+type ModelSelection struct {
+	ID        string            `json:"id"`
+	Options   GenerationOptions `json:"options,omitempty"`
+	Reasoning *ReasoningOptions `json:"reasoning,omitempty"`
+}
+
+func (selection ModelSelection) Validate() error {
+	if selection.ID == "" {
+		return fmtInvalid("model selection requires an ID")
+	}
+	if err := selection.Options.Validate(); err != nil {
+		return err
+	}
+	if selection.Reasoning != nil {
+		return (GenerationOptions{Reasoning: *selection.Reasoning}).Validate()
+	}
+	return nil
+}
+
+// ModelSnapshot is the exact resolved target of a frozen call. Data is opaque
+// adapter configuration, never credentials. Core only persists and restores it.
+type ModelSnapshot struct {
+	Spec ModelSpec       `json:"spec"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+// ResolvedModel is a fresh target and its fully merged generation options.
+// Snapshot must contain everything a resolver needs to restore this exact target
+// after a process restart, excluding credential values.
+type ResolvedModel struct {
+	Model    Model
+	Options  GenerationOptions
+	Snapshot json.RawMessage
+}
+
 // Configuration is the immutable effective configuration recorded in a branch.
+// Selection is the only durable source of the current model choice.
 type Configuration struct {
-	SystemPrompt string            `json:"system_prompt"`
-	ModelID      string            `json:"model_id"`
-	Tools        []ToolDefinition  `json:"tools,omitempty"`
-	Options      GenerationOptions `json:"options,omitempty"`
+	SystemPrompt string           `json:"system_prompt"`
+	Selection    ModelSelection   `json:"selection"`
+	Tools        []ToolDefinition `json:"tools,omitempty"`
 }
 
 type BudgetPolicy struct {
@@ -69,6 +115,8 @@ type CompactionPolicy struct {
 	KeepRecentTokens int
 	// Options is independent of normal generation (for example, a required
 	// tool choice or structured reply format must not constrain the summary).
+	// With ModelID, these overrides are merged by ResolveModel with that
+	// independent model's defaults. Otherwise only these options are used.
 	Options GenerationOptions
 }
 
@@ -91,10 +139,7 @@ func (s *Session) compactionBudget(model Model) CompactionBudget {
 }
 
 func (a *Session) validateConfiguration(ctx context.Context, c Configuration) error {
-	if err := c.Options.Validate(); err != nil {
-		return err
-	}
-	if _, err := a.model(ctx, c.ModelID); err != nil {
+	if err := c.Selection.Validate(); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -143,29 +188,19 @@ func (s *Session) Configure(ctx context.Context, configuration Configuration) er
 	return err
 }
 
-// SelectModel is safe during an active run. Already prepared requests retain
-// their model; the next request resolves the newly committed configuration.
-// When supplied, options atomically replaces the generation selection with the
-// model. Omission preserves it; an explicit zero value restores API defaults.
-func (s *Session) SelectModel(ctx context.Context, id string, options ...GenerationOptions) error {
+// SelectModel atomically records the next model choice without constructing a
+// model. Already frozen requests keep their target. A new selection replaces all
+// old per-session overrides; callers explicitly supply any overrides to retain.
+// Selection is unavailable while preparing a request or performing compaction.
+func (s *Session) SelectModel(ctx context.Context, selection ModelSelection) error {
 	if err := s.checkOpen(); err != nil {
 		return err
 	}
-	if len(options) > 1 {
-		return fmtInvalid("at most one generation options value is allowed")
+	if err := selection.Validate(); err != nil {
+		return err
 	}
-	var selected GenerationOptions
-	if len(options) == 1 {
-		if err := options[0].Validate(); err != nil {
-			return err
-		}
-		var err error
-		selected, err = copyJSON(options[0])
-		if err != nil {
-			return err
-		}
-	}
-	if _, err := s.model(ctx, id); err != nil {
+	owned, err := copyJSON(selection)
+	if err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -173,15 +208,12 @@ func (s *Session) SelectModel(ctx context.Context, id string, options ...Generat
 	if s.closed {
 		return ErrClosed
 	}
-	if s.maintenance {
+	if s.maintenance || s.preparing {
 		return ErrBusy
 	}
 	configuration := s.configurationLocked()
-	configuration.ModelID = id
-	if len(options) == 1 {
-		configuration.Options = selected
-	}
-	_, err := s.appendLocked(ctx, Entry{Kind: EntryConfiguration, Configuration: &configuration})
+	configuration.Selection = owned
+	_, err = s.appendLocked(ctx, Entry{Kind: EntryConfiguration, Configuration: &configuration})
 	return err
 }
 
@@ -198,3 +230,31 @@ func effectiveConfiguration(path []Entry) (Configuration, string, error) {
 // an empty request or a partial message tail, with no system prompt or tools.
 // Those requests are for measurement only and are never sent to a provider.
 type TokenEstimator func(context.Context, Model, Request) (int, error)
+
+// ReadConfiguration reads one committed configuration without opening a Session
+// or loading its active context. It performs one state lookup and one immutable
+// history-node lookup, suitable for listing selections across many sessions.
+// Concurrent changes may produce the configuration at the state lookup boundary.
+func ReadConfiguration(ctx context.Context, store Store, sessionID string) (Configuration, error) {
+	if sessionID == "" || store == nil {
+		return Configuration{}, fmtInvalid("configuration lookup requires a Store and Session ID")
+	}
+	state, err := store.LoadState(ctx, sessionID)
+	if err != nil {
+		return Configuration{}, err
+	}
+	if !SupportsFormat(state.FormatVersion) {
+		return Configuration{}, ErrUnsupportedFormat
+	}
+	if state.RolloutID == "" || state.Branch.ConfigurationID == "" {
+		return Configuration{}, fmt.Errorf("%w: missing effective configuration reference", ErrCorrupt)
+	}
+	record, err := store.Get(ctx, state.RolloutID, state.Branch.ConfigurationID)
+	if err != nil {
+		return Configuration{}, err
+	}
+	if record.Entry.Kind != EntryConfiguration || record.Entry.ID != state.Branch.ConfigurationID || record.Entry.Configuration == nil || record.Entry.Configuration.Selection.Validate() != nil {
+		return Configuration{}, fmt.Errorf("%w: invalid effective configuration node", ErrCorrupt)
+	}
+	return copyJSON(*record.Entry.Configuration)
+}

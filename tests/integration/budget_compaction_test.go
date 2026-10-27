@@ -116,7 +116,9 @@ func TestAutomaticCompactionUsesCompleteBatchAndRechecksBudget(t *testing.T) {
 			c := testConfig(m, memory.New())
 			c.Tools = []astral.Tool{echoTool(nil)}
 			c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, OutputTokens: 100, ReserveTokens: 100}
-			c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+			c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+				return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+			}
 			s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 			waitOK(t, start(t, s, strings.Repeat("a", 400)))
 			_, err := wait(t, start(t, s, strings.Repeat("b", 400)))
@@ -159,7 +161,9 @@ func largeHistory(t *testing.T, normal *testModel, summary *testModel, large str
 		return astral.ToolExecution{Result: &astral.ToolResult{Content: astral.Text(large)}}, nil
 	})}
 	c.Compaction = astral.CompactionPolicy{ModelID: summary.spec.ID, KeepRecentTokens: 1, OutputTokens: 128}
-	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	options := astral.SessionOptions{}
 	s := newSession(t, newSessions(t, c), options)
 	if withEnvironment {
@@ -338,7 +342,9 @@ func TestUntrimmableSummaryInputFailsWithoutChangingHistory(t *testing.T) {
 	summary.spec = astral.ModelSpec{ID: "small", ContextWindow: 1000, MaxOutputTokens: 100}
 	c := testConfig(normal, memory.New())
 	c.Compaction = astral.CompactionPolicy{ModelID: "small", KeepRecentTokens: 1, OutputTokens: 100}
-	c.ResolveModel = func(context.Context, string) (astral.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, strings.Repeat("user input", 10000)))
 	before := historyOf(s)

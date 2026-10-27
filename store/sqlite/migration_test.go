@@ -57,7 +57,7 @@ func TestMigrationNewDatabaseAndReadOnlyInspection(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := InspectMigration(ctx, path)
-	if err != nil || status != (MigrationStatus{Current: 10, Target: 10}) {
+	if err != nil || status != (MigrationStatus{Current: 11, Target: 11}) {
 		t.Fatalf("new database: %+v %v", status, err)
 	}
 	after, err := os.ReadFile(path)
@@ -73,7 +73,7 @@ func TestMigrationNewDatabaseAndReadOnlyInspection(t *testing.T) {
 	}
 	missing := filepath.Join(t.TempDir(), "uncreated", "core.db")
 	status, err = InspectMigration(ctx, missing)
-	if err != nil || status != (MigrationStatus{Target: 10, Missing: true}) {
+	if err != nil || status != (MigrationStatus{Target: 11, Missing: true}) {
 		t.Fatalf("missing database: %+v %v", status, err)
 	}
 	if err = Migrate(ctx, missing); err != nil {
@@ -96,7 +96,7 @@ func TestMigrationAdoptsOnlySupportedBaselineAndIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := InspectMigration(ctx, path)
-	if err != nil || status != (MigrationStatus{Current: 10, Target: 10, NeedsMigration: true}) {
+	if err != nil || status != (MigrationStatus{Current: 11, Target: 11, NeedsMigration: true}) {
 		t.Fatalf("baseline inspection: %+v %v", status, err)
 	}
 	after, err := os.ReadFile(path)
@@ -109,7 +109,7 @@ func TestMigrationAdoptsOnlySupportedBaselineAndIsIdempotent(t *testing.T) {
 		}
 	}
 	status, err = InspectMigration(ctx, path)
-	if err != nil || status.NeedsMigration || status.Current != 10 {
+	if err != nil || status.NeedsMigration || status.Current != 11 {
 		t.Fatalf("adopted baseline: %+v %v", status, err)
 	}
 	st, err := Open(path)
@@ -126,18 +126,18 @@ func TestMigrationAdoptsOnlySupportedBaselineAndIsIdempotent(t *testing.T) {
 func testMigrationPlan(failLast bool) migrationPlan {
 	return migrationPlan{
 		files: fstest.MapFS{
-			"00010_baseline.sql": {Data: []byte("-- +goose Up\nSELECT 1;\n")},
-			"00011_order.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE migration_order(step INTEGER);\nINSERT INTO migration_order VALUES(11);\n")},
+			"00011_baseline.sql": {Data: []byte("-- +goose Up\nSELECT 1;\n")},
+			"00012_order.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE migration_order(step INTEGER);\nINSERT INTO migration_order VALUES(12);\n")},
 		},
-		goMigrations: []*goose.Migration{goose.NewGoMigration(12, &goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
+		goMigrations: []*goose.Migration{goose.NewGoMigration(13, &goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
 			var steps int
-			if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM migration_order WHERE step=11").Scan(&steps); err != nil {
+			if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM migration_order WHERE step=12").Scan(&steps); err != nil {
 				return err
 			}
 			if steps != 1 {
 				return errors.New("Go migration did not see the preceding SQL migration")
 			}
-			if _, err := tx.ExecContext(ctx, "INSERT INTO migration_order VALUES(12)"); err != nil {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO migration_order VALUES(13)"); err != nil {
 				return err
 			}
 			if failLast {
@@ -145,7 +145,7 @@ func testMigrationPlan(failLast bool) migrationPlan {
 			}
 			return nil
 		}}, nil)},
-		target: 12,
+		target: 13,
 	}
 }
 
@@ -175,7 +175,7 @@ func TestMigrationRunsAllMissingSQLAndGoStepsInOrder(t *testing.T) {
 	path, db := migrationFixture(t)
 	plan := testMigrationPlan(false)
 	status, err := inspectMigration(ctx, db, plan)
-	if err != nil || status.Current != 10 || status.Target != 12 || !status.NeedsMigration {
+	if err != nil || status.Current != 11 || status.Target != 13 || !status.NeedsMigration {
 		t.Fatalf("before: %+v %v", status, err)
 	}
 	for range 2 {
@@ -183,11 +183,11 @@ func TestMigrationRunsAllMissingSQLAndGoStepsInOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{11, 12}) {
+	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{12, 13}) {
 		t.Fatalf("migration order or duplicate application: %v", steps)
 	}
 	status, err = inspectMigration(ctx, db, plan)
-	if err != nil || status.Current != 12 || status.NeedsMigration {
+	if err != nil || status.Current != 13 || status.NeedsMigration {
 		t.Fatalf("after: %+v %v", status, err)
 	}
 	if err = db.Close(); err != nil {
@@ -209,16 +209,16 @@ func TestMigrationFailureRollsBackDataMarkersAndLedgerThenResumes(t *testing.T) 
 		t.Fatalf("expected injected failure, got %v", err)
 	}
 	status, err := inspectMigration(ctx, db, plan)
-	if err != nil || status.Current != 11 || !status.NeedsMigration {
+	if err != nil || status.Current != 12 || !status.NeedsMigration {
 		t.Fatalf("failed step advanced markers or ledger: %+v %v", status, err)
 	}
-	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{11}) {
+	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{12}) {
 		t.Fatalf("failed step did not roll back: %v", steps)
 	}
 	if err = migrateDatabase(ctx, db, testMigrationPlan(false)); err != nil {
 		t.Fatal(err)
 	}
-	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{11, 12}) {
+	if steps := migrationSteps(t, db); !reflect.DeepEqual(steps, []int{12, 13}) {
 		t.Fatalf("resume repeated or skipped a step: %v", steps)
 	}
 }
@@ -226,9 +226,10 @@ func TestMigrationFailureRollsBackDataMarkersAndLedgerThenResumes(t *testing.T) 
 func TestMigrationRejectsUnknownAndInconsistentFormatsBeforeWriting(t *testing.T) {
 	for _, mutation := range []string{
 		"UPDATE format SET version=9; PRAGMA user_version=9;",
-		"UPDATE format SET version=11; PRAGMA user_version=11;",
+		"UPDATE format SET version=10; PRAGMA user_version=10;",
+		"UPDATE format SET version=12; PRAGMA user_version=12;",
 		"PRAGMA user_version=0;",
-		"INSERT INTO format VALUES(10);",
+		"INSERT INTO format VALUES(11);",
 	} {
 		t.Run(mutation, func(t *testing.T) {
 			path, db := migrationFixture(t)
@@ -263,9 +264,9 @@ func TestMigrationRejectsUnknownAndInconsistentFormatsBeforeWriting(t *testing.T
 func TestMigrationRejectsLedgerGapsAndUnregisteredSteps(t *testing.T) {
 	ctx := context.Background()
 	for _, mutation := range []string{
-		"INSERT INTO goose_db_version(version_id,is_applied) VALUES(11,1);",
+		"INSERT INTO goose_db_version(version_id,is_applied) VALUES(12,1);",
 		"DELETE FROM goose_db_version WHERE version_id=0;",
-		"UPDATE goose_db_version SET is_applied=0 WHERE version_id=10;",
+		"UPDATE goose_db_version SET is_applied=0 WHERE version_id=11;",
 		"DELETE FROM goose_db_version;",
 	} {
 		t.Run(mutation, func(t *testing.T) {
@@ -278,7 +279,7 @@ func TestMigrationRejectsLedgerGapsAndUnregisteredSteps(t *testing.T) {
 	}
 	_, db := migrationFixture(t)
 	plan := testMigrationPlan(false)
-	delete(plan.files.(fstest.MapFS), "00011_order.sql")
+	delete(plan.files.(fstest.MapFS), "00012_order.sql")
 	if err := migrateDatabase(ctx, db, plan); err == nil || !strings.Contains(err.Error(), "not sequential") {
 		t.Fatalf("binary with missing migration was accepted: %v", err)
 	}
@@ -301,7 +302,7 @@ func TestMigrationRejectsNonDatabaseAndHonorsCancellation(t *testing.T) {
 
 func TestMigrationInspectionSeesUncheckpointedWAL(t *testing.T) {
 	path, db := migrationFixture(t)
-	execMigrationSQL(t, db, "PRAGMA wal_autocheckpoint=0; UPDATE format SET version=11; PRAGMA user_version=11;")
+	execMigrationSQL(t, db, "PRAGMA wal_autocheckpoint=0; UPDATE format SET version=12; PRAGMA user_version=12;")
 	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() == 0 {
 		t.Fatalf("fixture did not retain a WAL: %v", err)
 	}
@@ -314,7 +315,7 @@ func TestMigrationInspectionSeesUncheckpointedWAL(t *testing.T) {
 		before[suffix] = data
 	}
 	status, err := InspectMigration(context.Background(), path)
-	if !errors.Is(err, core.ErrUnsupportedFormat) || status.Current != 11 {
+	if !errors.Is(err, core.ErrUnsupportedFormat) || status.Current != 12 {
 		t.Fatalf("inspection ignored the WAL: %+v %v", status, err)
 	}
 	for suffix, data := range before {
@@ -331,7 +332,7 @@ func TestMigrationRejectsNonTransactionalAndEnvironmentDependentSteps(t *testing
 		t.Run(annotation, func(t *testing.T) {
 			_, db := migrationFixture(t)
 			plan := testMigrationPlan(false)
-			plan.files.(fstest.MapFS)["00011_order.sql"].Data = []byte("-- +goose " + annotation + "\n-- +goose Up\nCREATE TABLE migration_order(step INTEGER);\n")
+			plan.files.(fstest.MapFS)["00012_order.sql"].Data = []byte("-- +goose " + annotation + "\n-- +goose Up\nCREATE TABLE migration_order(step INTEGER);\n")
 			if err := migrateDatabase(ctx, db, plan); err == nil {
 				t.Fatal("unsafe SQL migration accepted")
 			}
@@ -343,7 +344,7 @@ func TestMigrationRejectsNonTransactionalAndEnvironmentDependentSteps(t *testing
 	}
 	_, db := migrationFixture(t)
 	plan := testMigrationPlan(false)
-	plan.goMigrations = []*goose.Migration{goose.NewGoMigration(12, &goose.GoFunc{RunDB: func(context.Context, *sql.DB) error {
+	plan.goMigrations = []*goose.Migration{goose.NewGoMigration(13, &goose.GoFunc{RunDB: func(context.Context, *sql.DB) error {
 		t.Fatal("nontransactional Go migration executed")
 		return nil
 	}}, nil)}

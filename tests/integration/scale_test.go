@@ -42,7 +42,7 @@ func seedLongHistory(tb testing.TB, st astral.Store, n int) astral.RuntimeState 
 		}
 	}
 	header := storeHeader()
-	header[1].Configuration.ModelID = "test"
+	header[1].Configuration.Selection.ID = "test"
 	commit(header)
 	for start := 0; start < n; start += 256 {
 		end := min(start+256, n)

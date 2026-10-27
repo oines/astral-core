@@ -91,7 +91,9 @@ func TestEnvironmentGrowthParticipatesInInitialCompactionDecision(t *testing.T) 
 	summary.spec.ID = "summary"
 	c := testConfig(m, memory.New())
 	c.Compaction = core.CompactionPolicy{ModelID: "summary", ReserveTokens: 100, KeepRecentTokens: 1, OutputTokens: 100}
-	c.ResolveModel = func(context.Context, string) (core.Model, error) { return summary, nil }
+	c.ResolveModel = func(_ context.Context, selection core.ModelSelection) (core.ResolvedModel, error) {
+		return core.ResolvedModel{Model: summary, Options: selection.Options}, nil
+	}
 	c.CollectContext = func(_ context.Context, boundary core.ContextBoundary) ([]core.Message, error) {
 		if !environmentGrew.Load() {
 			return nil, nil

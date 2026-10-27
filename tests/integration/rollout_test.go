@@ -556,7 +556,7 @@ func TestDetachedCopiesLargeArchivedRecordWithSmallActiveContext(t *testing.T) {
 	eachStore(t, func(t *testing.T, st astral.Store) {
 		ctx := context.Background()
 		header := storeHeader()
-		header[1].Configuration.ModelID = "test"
+		header[1].Configuration.Selection.ID = "test"
 		if err := appendStore(ctx, st, "session", 0, header); err != nil {
 			t.Fatal(err)
 		}

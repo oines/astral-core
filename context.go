@@ -9,14 +9,22 @@ import (
 // messages contain only the active window and its provenance.
 type Context struct {
 	anchor          *contextUsageAnchor
-	HeadID          string   `json:"head_id"`
-	ConfigurationID string   `json:"configuration_id"`
-	Request         Request  `json:"request"`
-	Sources         []string `json:"sources"`
-	EstimatedInput  int      `json:"estimated_input"`
+	HeadID          string         `json:"head_id"`
+	ConfigurationID string         `json:"configuration_id"`
+	Selection       ModelSelection `json:"selection"`
+	Request         Request        `json:"request"`
+	Sources         []string       `json:"sources"`
+	EstimatedInput  int            `json:"estimated_input"`
 }
 
-func (s *Session) InspectContext(ctx context.Context) (Context, error) {
+// ReadContext returns the bounded active history projection without resolving a
+// model, collecting environment context or estimating tokens. It can be used to
+// inspect history or construct an independent model request after a connection
+// has been removed. No complete rollout is read into memory.
+func (s *Session) ReadContext(ctx context.Context) (Context, error) {
+	if err := ctx.Err(); err != nil {
+		return Context{}, err
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -24,16 +32,22 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 	}
 	path := clone(s.pathLocked())
 	s.mu.Unlock()
-	view, err := project(path)
+	return project(path)
+}
+
+// InspectContext prepares and estimates the current model's view without
+// invoking it. ReadContext is the model-independent history API.
+func (s *Session) InspectContext(ctx context.Context) (Context, error) {
+	view, err := s.ReadContext(ctx)
 	if err != nil {
 		return Context{}, err
 	}
-	model, err := s.model(ctx, view.Request.ModelID)
+	model, err := s.resolveModel(ctx, view.Selection)
 	if err != nil {
 		return Context{}, err
 	}
-	view, err = s.measureContext(ctx, model, view)
-	return view, err
+	view.Request.Options = resolvedOptions(model)
+	return s.measureContext(ctx, model, view)
 }
 
 func resultKey(assistantID, callID string) string { return assistantID + "\x00" + callID }
@@ -47,7 +61,10 @@ func project(path []Entry) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	view := Context{ConfigurationID: configurationID, Request: Request{ModelID: configuration.ModelID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: configuration.Options}}
+	view := Context{ConfigurationID: configurationID, Selection: configuration.Selection, Request: Request{ModelID: configuration.Selection.ID, SystemPrompt: configuration.SystemPrompt, Tools: configuration.Tools, Options: configuration.Selection.Options}}
+	if configuration.Selection.Reasoning != nil {
+		view.Request.Options.Reasoning = *configuration.Selection.Reasoning
+	}
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
 	}

@@ -5,7 +5,7 @@ Core 的 SQLite 数据格式版本独立于 Host 的应用版本。正常 `sqlit
 ```go
 status, err := sqlite.InspectMigration(ctx, path)
 // status.Current / Target 为 Core 数据格式版本；Missing 表示尚无数据库。
-// NeedsMigration 也包括给合法格式 10 登记首次迁移账本。
+// NeedsMigration 也包括给合法格式 11 登记首次迁移账本。
 err = sqlite.Migrate(ctx, path)
 ```
 
@@ -13,7 +13,7 @@ err = sqlite.Migrate(ctx, path)
 
 `InspectMigration` 不创建目标文件、父目录、迁移账本或原数据库的 SQLite 辅助文件。已完成 checkpoint 的库直接只读检查；存在非空 WAL 时，临时复制数据库和 WAL 后检查，防止忽略已提交的 WAL 或为检查修改原目录。临时副本在返回前删除，因此崩溃残留 WAL 的检查需要额外临时磁盘空间。此入口要求数据库内容在检查期间保持不变。
 
-当前格式 10 是首个受支持的基线。合法的现有格式 10 只登记 Goose 账本，不改变 Session、历史、投影或 Attempt。早于 10 的未公开格式、未来格式、`format` 表不是恰好一行、`PRAGMA user_version` 不一致、损坏或非顺序账本都拒绝迁移。缺失数据库保持缺失，新数据库直接原子创建最新 schema 和完整账本。
+当前格式 11 是首个受支持的基线。合法的现有格式 11 只登记 Goose 账本，不改变 Session、历史、投影或 Attempt。格式 10 及更早版本、未来格式、`format` 表不是恰好一行、`PRAGMA user_version` 不一致、损坏或非顺序账本都拒绝迁移。缺失数据库保持缺失，新数据库直接原子创建最新 schema 和完整账本。
 
 最新版二进制内嵌 `store/sqlite/migrations/*.sql`，并显式注册 Go 迁移，不使用 Goose 全局注册。Goose 依次执行所有缺失步骤，不下载中间应用版本、不允许乱序或降级。每个迁移的数据变更、两个格式标记和账本记录处于同一个事务；失败步骤全部回滚，后续步骤不运行。之前已完成步骤保持提交，Host 可以恢复整套升级前备份，也可以在排除失败原因后重试。
 

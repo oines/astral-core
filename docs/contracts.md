@@ -2,7 +2,7 @@
 
 ## Session 与所有权
 
-根包 `astral` 提供 `NewSession(ctx, Config, SessionOptions)` 和 `OpenSession(ctx, Config, id)`。Model、Store、EstimateTokens 必填；Memory 与 SQLite 共用同一执行循环。Host 负责同一 ID 的唯一活动句柄与跨进程所有权。Store 乐观 CAS 拒绝冲突写入，但不能撤销已经执行的外部动作。
+根包 `astral` 提供 `NewSession(ctx, Config, SessionOptions)` 和 `OpenSession(ctx, Config, id)`。Store、EstimateTokens 必填。新 Session 需要 Config.Model 或有效 Config.Selection；冷 OpenSession 不需要初始模型；Memory 与 SQLite 共用同一执行循环。Host 负责同一 ID 的唯一活动句柄与跨进程所有权。Store 乐观 CAS 拒绝冲突写入，但不能撤销已经执行的外部动作。
 
 一个 Session 同时拥有一个 Run 或维护操作。冲突返回 ErrBusy。Fork 在固定、已提交的完整历史边界工作，不改变 Parent 的执行状态。OpenSession 只恢复已提交事实，不扫描环境、重放流、重启模型或恢复退避计时。
 
@@ -35,7 +35,7 @@ Input.Contexts 与 Message 整体接收、整体应用。Steer 优先，默认�
 5. 按“摘要与保留历史 → 被动 Context → 最新环境 → 驱动组”形成候选，检查完整协议、Token 和字节预算。
 6. 重新加锁验证分支 Head 和输入仍处于 pending，原子提交摘要、Context、输入与消费事实，随后调用模型。
 
-队列或尝试审计引起的版本增加可以使用最新版本提交；分支或配置变化返回 ErrConflict，被清除的输入不能应用。Model / Computer I/O 不持有 Session 锁或数据库事务。上下文采集、最终预算或提交失败不会改变旧有效上下文；未提交摘要在重启后可以重算。提交成功而回执丢失，通过稳定 Commit ID 确认。
+队列或尝试审计引起的版本增加可以使用最新版本提交；准备至冻结期间拒绝 SelectModel；其他分支变化返回 ErrConflict，被清除的输入不能应用。Model / Computer I/O 不持有 Session 锁或数据库事务。上下文采集、最终预算或提交失败不会改变旧有效上下文；未提交摘要在重启后可以重算。提交成功而回执丢失，通过稳定 Commit ID 确认。
 
 CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返回独立消息。Host 负责发现、权限、指纹及相对当前分支的去重。新 CompactionID 要重新收集完整快照；Core 不把它当作持久待完成任务。动态环境应使用 RoleUser 普通 Context，SystemPrompt 仅放稳定规则。回调不能修改 Core 或执行业务副作用。
 
@@ -45,11 +45,15 @@ CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返�
 
 MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。Usage.Available 仅表示存在用量报告；适配器确认提供商遗漏输入或输出计数时，分别设置 InputMissing / OutputMissing（JSON 为 input_missing / output_missing，false 省略）。两个缺失标记默认 false，保持旧记录和现有调用方的语义；单项明确报告为零不表示缺失。不完整用量仍保存于消息与 Attempt 供审计，只有 Available 且两个缺失标记均为 false 的用量可充当基线。最新回复不完整时继续查找更早的完整基线，并将它之后的消息纳入尾段估算。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。未报告、不完整、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
 
-默认压缩条件为 Input > ContextWindow - 16384，近期保留目标 20000，摘要输出 min(floor(0.8 × ReserveTokens), 摘要模型最大输出)。按 ModelBudgets 可覆盖普通模型的 ReserveTokens / KeepRecentTokens。普通输出 min(期望输出或模型最大输出, ContextWindow - Input - 4096)，可用输出不足 1 时拒绝发送。SafetyMargin 只预留输出空间，不叠加到压缩阈值或独立的 MaxInputTokens 上；摘要仍独立检查完整请求与输出预算。单个工具结果不可交付时保存有界的交付失败结果与真实 Outcome；聚合压力在准备阶段处理，不改写成功工具的执行事实。
+默认压缩条件为 Input > ContextWindow - 16384，近期保留目标 20000，摘要输出 min(floor(0.8 × ReserveTokens), 摘要模型最大输出)。按 ModelBudgets 可覆盖普通模型的 ReserveTokens / KeepRecentTokens。普通输出 min(期望输出或模型最大输出, ContextWindow - Input - 4096)，可用输出不足 1 时拒绝发送。SafetyMargin 只预留输出空间，不叠加到压缩阈值或独立的 MaxInputTokens 上；摘要仍独立检查完整请求与输出预算。单个工具结果明确超出字节或 Token 预算时保存有界的交付失败结果与真实 Outcome；若后选模型不可用或配置错误，保留已完成工具输出，由下一请求准备报告模型错误。聚合压力在准备阶段处理，不改写成功工具的执行事实。
 
 ## 模型协议、重试与审计
 
-Model 提供 Spec / Stream；ResolveModel 必须返回匹配 ID。RequestPreparer 在预算检查前完成无副作用的请求适配，可能被多次调用；不得在 Stream 内追加实时环境或重新读取可变附件。冻结图片与稳定引用由 Host 负责。RequestValidator 单独校验完整请求，在动态输出长度确定后、候选提交前运行；部分尾段的估算不要求完整工具协议。
+Model 提供 Spec / Stream。Configuration.Selection 是唯一持久模型选择，ID 为解析器拥有的不透明引用；不要求等于最终 ModelSpec.ID。ModelSelection.Options 保存通用覆盖，非 nil Reasoning 覆盖 Options.Reasoning 和模型默认；nil 继承模型默认，指向空结构的指针明确使用 API 默认。ResolveModel 为新请求合并当前默认与覆盖，返回 ResolvedModel{Model, Options, Snapshot}；Options 是最终唯一请求参数。RestoreModel 根据冻结 ModelSnapshot{Spec, Data} 还原原目标，不套用当前默认或预置；返回规格必须完全匹配。Snapshot 保存最终无密钥配置，凭据值不得进入历史。固定 Config.Model 保留简单用法。Models 的直接调用允许未知窗口或最大输出保持 0；Core 的 Loop 必须具备正数 ContextWindow 和 MaxOutputTokens，固定模型在 Session 配置时校验，动态模型在新请求解析后校验。冷打开和只读历史不解析模型，因此不要求旧目标具备当前可执行预算。
+
+SelectModel 验证通用形状并原子替换整个选择，不构造模型，不保留旧选择的覆盖。准备至冻结完成及整个 compact 期间返回 ErrBusy。冻结后允许选择下一请求的目标。Configure 仍只允许空闲时修改完整配置。ReadConfiguration 只 LoadState 并 Get 当前配置节点，不打开 Session、不扫描活动上下文，供批量查询选择使用。冷 OpenSession、ReadContext 与 Fork 不解析模型，旧模型失效不能阻止这些操作；InspectContext 才解析、准备与估算当前目标。
+
+RequestPreparer 在预算检查前完成无副作用的目标兼容投影，只改变请求副本中的消息与宿主上下文，不改变配置。原生包装不兼容时适配器保留通用文本、工具调用及结果关系，仅省略不可回传的私有内容；原始历史与新回复的正常持久化不受影响。Core 按投影重映射来源，内容变化时丢弃旧用量基线。准备可能被多次调用；不得在 Stream 内追加实时环境或重新读取可变附件。冻结图片与稳定引用由 Host 负责。RequestValidator 单独校验完整请求，在动态输出长度确定后、候选提交前运行；部分尾段的估算不要求完整工具协议。
 
 普通生成与摘要调用同一个模型入口，默认参数如下：
 
@@ -66,17 +70,17 @@ ModelRequestRecoverer 仅处理 Provider 明确拒绝的回放数据。最多一
 
 提供商明确标记 ModelError.ContextOverflow 时，跳出原样网络重试，在完整边界最多压缩并重新生成一次。恢复期间不消费新队列输入，不重跑工具；保留完整工具批次，即使估算器低估也必须切出可压缩的旧组。再次溢出或压缩失败停止；Disabled 禁止自动溢出恢复。
 
-ModelAttempt 独立于历史树，归属于 Session。RequestInput 固定 RolloutID、HeadID、ConfigurationID、ModelSpec、消息下标选择和 JSON 结构差异，并保存重建结果的语义摘要。它引用历史正文，不保存每轮完整 Request。ReadContext/RebuildRequest 只加载所选祖先链上的有效窗口，不执行准备回调、环境采集、估算或模型 I/O；重建必须验证配置引用和内容摘要。
+ModelAttempt 独立于历史树，归属于 Session。RequestInput 固定 RolloutID、HeadID、ConfigurationID、ModelSpec、无密钥目标 Snapshot、消息下标选择和 JSON 结构差异，并保存重建结果的语义摘要。它引用历史正文，不保存每轮完整 Request。ReadContext/RebuildRequest 只加载所选祖先链上的有效窗口，不执行准备回调、环境采集、估算或模型 I/O；重建必须验证配置引用和内容摘要。
 
 首个普通 Attempt 与选中的输入、环境、摘要采用、消费队列记录原子提交。成功回复与 Attempt 完成原子提交：正文仅保存于 EntryMessage，Outcome.EntryID 指向该节点，Outcome.Reply 为空。失败或尚未采用的摘要输出保留在 Outcome.Reply；摘要采用与 Compaction 节点原子提交并清除临时正文。审计保存失败阻止依赖动作，不把 Store 错误当作模型暂时错误。仅完整、校验通过的 Stop / ToolCalls 回复进入对话；Generation 自带 AttemptID、ConfigurationID、冻结 ModelSpec 和覆盖上下文指纹，不依赖父 Session 的审计记录。指纹不含动态输出上限。失败、取消、Length 片段既不合并到成功回复，也不触发工具。
 
-RuntimeState.CurrentAttemptID 固定尚未确认回复的普通生成。进程崩溃后显式 Continue 将无终态的旧尝试标为 interrupted，创建 RetryOf 关联的新 Attempt，并重建同一冻结输入；期间到达的输入仍留在队列。远端执行结果可能未知，不承诺外部请求恰好一次。明确取消或正常失败的 Run 会清除此指针，后续激活重新准备。已确认的助手/工具结果不重复执行。
+RuntimeState.CurrentAttemptID 固定尚未确认回复的普通生成。进程崩溃后显式 Continue 将无终态的旧尝试标为 interrupted，创建 RetryOf 关联的新 Attempt，通过 RestoreModel 还原同一目标并重建同一冻结输入；期间到达的输入仍留在队列。远端执行结果可能未知，不承诺外部请求恰好一次。明确取消或正常失败的 Run 会清除此指针，后续激活重新准备。已确认的助手/工具结果不重复执行。
 
 Message.Content 是唯一有序内容来源，按原始顺序包含 Reasoning、Text、ToolCall、多模态及扩展块。message.ToolCalls() 仅派生调用列表。工具 ID 在同一消息内唯一，参数是完整 JSON。未知 Content 类型保留，由适配器明确支持或拒绝；签名、加密数据、Metadata 和大整数保持原样。
 
 text_delta / reasoning_delta / tool_call_delta 的 content_index 必须引用最终 Content 数组中的对应类型，ToolCallID 也必须匹配。每次尝试独立校验，SDK 不从增量拼接完整回复。工具只在完整回复已确认后派发。
 
-Request.Options 保留未指定与显式零值/false 的差别，Reasoning.Effort 使用 Provider 原生值。Core 校验结构，Models 验证协议能力。Compaction.Options 独立于普通生成。SelectModel 不截断已经冻结的请求；准备尚未提交时改变配置会导致旧准备返回冲突，下一次 Continue 使用新配置。
+Request.Options 保留未指定与显式零值/false 的差别，Reasoning.Effort 使用 Provider 原生值。Core 校验结构，Models 验证协议能力。Compaction.Options 独立于普通生成。默认复用当前模型时，摘要只使用 Compaction.Options，不继承普通请求的 reasoning、tool_choice 或 response_format；指定独立 Compaction.ModelID 时，通过该模型的 ResolveModel 合并其默认值与 Compaction.Options，并使用最终解析参数。SelectModel 不截断已经冻结的请求；准备与 compact 期间明确返回 ErrBusy；下一请求解析新选择。
 
 ## 工具事实、审批与控制
 
@@ -97,7 +101,7 @@ MayEndRun 要求唯一 ToolCall，允许 Reasoning、不允许普通正文。返
 
 根包 Store 提供 LoadState、Get、Scan、GetAttempt、ScanAttempts、Pending、Commit、LookupCommit、LookupInput 和 Fork。Get / Scan 按 RolloutID 读取；Attempt、状态、队列、提交与输入回执按 SessionID 读取。所有返回值是隔离副本。Attempt 分页游标按创建时的 Session Version 前进，不随结果完成改变；支持用途过滤和正反向扫描。
 
-格式 **10** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
+格式 **11** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
 
 可选维护接口 SessionDeleter.DeleteSession 由 Memory 和 SQLite 实现。Host 必须先停止并关闭目标 Session、阻止新的执行，再调用原子、幂等的永久删除；它清除私有 Rollout 的历史、Attempt、输入、队列与提交回执。多个 Session 共享同一 Rollout 时返回 ErrConflict，保留全部数据。Detached Fork 拥有独立副本，不受来源删除影响。删除业务元数据、索引和恢复未完成维护由 Host 负责，不调用模型或工具。
 
@@ -107,7 +111,7 @@ Commit 包含稳定 ID、ExpectedVersion、Entries 和 Attempts 变更。Store �
 
 SQLite 使用纯 Go 驱动、WAL、synchronous=FULL、busy_timeout=5000 和 BEGIN IMMEDIATE。输入正文按索引读取，RuntimeState 只保留当前批次、审批、待办数量、分支引用和最近 Run。普通提交不扫描历史。Session 缓存有效窗口与必要引用，不持有完整历史树。Stats.RowsRead 是返回到适配器的行数，不等于数据库内部扫描量。
 
-Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可变祖先，Detached 分页复制所选路径并在完成后发布。稳定子 Session ID 与 ForkRequest 摘要用于重试确认；重试返回新句柄，Host 负责唯一活动实例。子会话继承历史配置与完整结果，不继承 Parent 的 Attempt、队列、运行中授权或审批。复制的 Generation 仅为来源与用量元数据，不要求父 Attempt 存在。关闭 Parent 不关闭 Child，Fork 不回滚文件或复制活动进程。清理规则见 Store 的引用与 Rollout 状态 API。
+Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可变祖先，Detached 分页复制所选路径并在完成后发布。稳定子 Session ID 与 ForkRequest 摘要用于重试确认；重试返回新句柄，Host 负责唯一活动实例。子会话继承所选位置的历史配置、Selection 与完整结果，不采用父会话的当前选择，不继承 Parent 的 Attempt、队列、运行中授权或审批。复制的 Generation 仅为来源与用量元数据，不要求父 Attempt 存在。关闭 Parent 不关闭 Child，Fork 不回滚文件或复制活动进程。清理规则见 Store 的引用与 Rollout 状态 API。
 
 ## 事件与断线恢复
 

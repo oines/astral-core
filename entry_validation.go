@@ -24,7 +24,7 @@ func validateEnvelope(e Entry) error {
 	case EntryCreated:
 		valid = e.Created != nil && SupportsFormat(e.Created.FormatVersion) && e.Created.SessionID != "" && e.Created.RolloutID != ""
 	case EntryConfiguration:
-		valid = e.Configuration != nil && e.Configuration.ModelID != "" && e.Configuration.Options.Validate() == nil
+		valid = e.Configuration != nil && e.Configuration.Selection.Validate() == nil
 	case EntryContext:
 		valid = e.Message != nil && e.Message.ValidateContext() == nil
 	case EntryMessage:

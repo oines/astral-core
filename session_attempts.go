@@ -68,7 +68,7 @@ func (s *Session) resumeGeneration(ctx context.Context, id string, options prepa
 	if err != nil {
 		return preparedStep{}, err
 	}
-	model, err := s.model(ctx, request.ModelID)
+	model, err := s.restoreModel(ctx, ModelSnapshot{Spec: previous.Input.Model, Data: previous.Input.Snapshot})
 	if err != nil {
 		return preparedStep{}, err
 	}

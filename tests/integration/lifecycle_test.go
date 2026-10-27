@@ -221,7 +221,7 @@ func TestAfterHookCannotRewriteExecutionOutcome(t *testing.T) {
 	}
 }
 
-func TestModelSelectionDuringCompactionAppliesToNextGeneration(t *testing.T) {
+func TestModelSelectionDuringCompactionIsBusyUntilFrozen(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	normal := model(func(context.Context, int, astral.Request, func(astral.ModelEvent)) (astral.Reply, error) {
 		return answer("old model answer"), nil
@@ -246,33 +246,33 @@ func TestModelSelectionDuringCompactionAppliesToNextGeneration(t *testing.T) {
 	c := testConfig(normal, memory.New())
 	c.Budget = astral.BudgetPolicy{SafetyMargin: 1}
 	c.Compaction = astral.CompactionPolicy{ModelID: "summary", KeepRecentTokens: 1, ReserveTokens: 750}
-	c.ResolveModel = func(_ context.Context, id string) (astral.Model, error) {
-		if id == "summary" {
-			return summary, nil
+	c.ResolveModel = func(_ context.Context, selection astral.ModelSelection) (astral.ResolvedModel, error) {
+		if selection.ID == "summary" {
+			return astral.ResolvedModel{Model: summary, Options: selection.Options}, nil
 		}
-		return next, nil
+		return astral.ResolvedModel{Model: next, Options: selection.Options}, nil
 	}
 	s := newSession(t, newSessions(t, c), astral.SessionOptions{})
 	waitOK(t, start(t, s, "first"))
 	r := start(t, s, "second")
 	signal(t, entered)
-	if err := s.SelectModel(context.Background(), "next"); err != nil {
-		t.Fatal(err)
+	if err := s.SelectModel(context.Background(), astral.ModelSelection{ID: "next"}); !errors.Is(err, astral.ErrBusy) {
+		t.Fatalf("selection during compaction: %v", err)
+	}
+	if s.Configuration().Selection.ID != normal.spec.ID {
+		t.Fatal("busy selection changed the committed configuration")
 	}
 	close(release)
-	if _, err := wait(t, r); !errors.Is(err, astral.ErrConflict) {
-		t.Fatalf("changed configuration committed the stale draft: %v", err)
+	waitOK(t, r)
+	if len(normal.observed()) != 2 || len(next.observed()) != 0 {
+		t.Fatal("compaction did not retain its original target")
 	}
-	if len(next.observed()) != 0 || s.State().PendingInputs[astral.InputSteer] != 1 {
-		t.Fatal("conflicted preparation consumed input")
-	}
-	r, err := s.Continue(context.Background())
-	if err != nil {
+	if err := s.SelectModel(context.Background(), astral.ModelSelection{ID: "next"}); err != nil {
 		t.Fatal(err)
 	}
-	result := waitOK(t, r)
-	if len(normal.observed()) != 1 || len(next.observed()) != 1 || result.LastMessage.Content[0].Text != "new model answer" {
-		t.Fatal("model selected during compaction was ignored")
+	result := waitOK(t, start(t, s, "third"))
+	if len(next.observed()) != 1 || result.LastMessage.Content[0].Text != "new model answer" {
+		t.Fatal("selection after compaction did not apply")
 	}
 }
 

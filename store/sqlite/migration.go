@@ -18,13 +18,13 @@ import (
 	"github.com/pressly/goose/v3/database"
 )
 
-const firstMigrationFormat int64 = 10
+const firstMigrationFormat int64 = 11
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
 // MigrationStatus describes the durable Core format, rather than an application
-// release number. NeedsMigration also covers adopting the format-10 baseline
+// release number. NeedsMigration also covers adopting the format-11 baseline
 // into Goose's ledger without changing the data format.
 type MigrationStatus struct {
 	Current        int64 `json:"current"`

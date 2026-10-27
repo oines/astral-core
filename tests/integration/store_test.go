@@ -18,7 +18,7 @@ import (
 func storeHeader() []astral.Entry {
 	return []astral.Entry{
 		{ID: "created", Kind: astral.EntryCreated, Created: &astral.CreationRecord{FormatVersion: astral.FormatVersion, SessionID: "session", RolloutID: "session"}},
-		{ID: "config", Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{ModelID: "model"}},
+		{ID: "config", Kind: astral.EntryConfiguration, Configuration: &astral.Configuration{Selection: astral.ModelSelection{ID: "model"}}},
 	}
 }
 func storeMessage(id, parent string) astral.Entry {
@@ -49,20 +49,20 @@ func TestStoreConformance(t *testing.T) {
 			if err := appendStore(ctx, s, "session", 0, batch); err != nil {
 				t.Fatal(err)
 			}
-			batch[1].Configuration.ModelID = "mutated"
+			batch[1].Configuration.Selection.ID = "mutated"
 			r, err := readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r.Version != 1 || len(r.Entries) != 2 || r.Entries[1].Configuration.ModelID != "model" {
+			if r.Version != 1 || len(r.Entries) != 2 || r.Entries[1].Configuration.Selection.ID != "model" {
 				t.Fatalf("append isolation: %+v", r)
 			}
-			r.Entries[1].Configuration.ModelID = "mutated read"
+			r.Entries[1].Configuration.Selection.ID = "mutated read"
 			original, err := readStore(ctx, s, "session")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if original.Entries[1].Configuration.ModelID != "model" {
+			if original.Entries[1].Configuration.Selection.ID != "model" {
 				t.Fatal("read alias")
 			}
 			if err = appendStore(ctx, s, "session", 0, []astral.Entry{storeMessage("conflict", "config")}); !errors.Is(err, astral.ErrConflict) {

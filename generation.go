@@ -45,7 +45,7 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 		input = call.attempt.Input
 	} else {
 		var err error
-		input, err = FreezeRequest(s.rolloutID, call.base, frozen, model.Spec())
+		input, err = freezeModelRequest(s.rolloutID, call.base, frozen, model)
 		if err != nil {
 			return modelResult{}, err
 		}
@@ -154,7 +154,7 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 					return modelResult{}, protocolErr
 				}
 				frozen, repaired, retryable = candidate, true, true
-				input, repairErr = FreezeRequest(s.rolloutID, call.base, frozen, current.Input.Model)
+				input, repairErr = freezeModelRequest(s.rolloutID, call.base, frozen, model)
 				if repairErr != nil {
 					return modelResult{}, repairErr
 				}
