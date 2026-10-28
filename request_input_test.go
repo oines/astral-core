@@ -37,35 +37,6 @@ func TestFrozenRequestKeepsOpaqueContentByReference(t *testing.T) {
 	}
 }
 
-func TestFrozenRequestOwnershipRequiresUnchangedCompleteContent(t *testing.T) {
-	original := Message{Role: RoleUser, ContextKind: "im.observation", Content: Text("original observation"), Metadata: json.RawMessage(`{"event":"original"}`)}
-	base := Context{HeadID: "head", ConfigurationID: "config", Sources: []string{"original-entry"}, Request: Request{ModelID: "model", Messages: []Message{original}}}
-	for _, test := range []struct {
-		name    string
-		message Message
-		source  string
-	}{
-		{"replacement", Message{Role: RoleUser, ContextKind: original.ContextKind, Content: Text("entirely unrelated"), Metadata: json.RawMessage(`{"event":"replacement"}`)}, ""},
-		{"metadata-only", Message{Role: original.Role, ContextKind: original.ContextKind, Content: original.Content, Metadata: json.RawMessage(`{"provider":"prepared"}`)}, "original-entry"},
-		{"merge", Message{Role: original.Role, ContextKind: original.ContextKind, Content: append(append([]Content(nil), original.Content...), Text("another message")...)}, ""},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			actual := clone(base.Request)
-			actual.Messages = []Message{test.message}
-			input, err := FreezeRequest("rollout", base, actual, ModelSpec{ID: "model"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(input.Sources) != 1 || input.Sources[0] != test.source {
-				t.Fatalf("unproven ownership: %v want %q", input.Sources, test.source)
-			}
-			if rebuilt, err := input.Apply(base.Request); err != nil || !reflect.DeepEqual(rebuilt, actual) {
-				t.Fatalf("ownership policy changed reconstruction: %v", err)
-			}
-		})
-	}
-}
-
 func TestRequestChangesRoundTripStructuralEdits(t *testing.T) {
 	random := rand.New(rand.NewSource(7))
 	var value func(int) any

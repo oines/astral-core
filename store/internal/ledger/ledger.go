@@ -20,8 +20,6 @@ type Data struct {
 	Pending      map[string]core.Record
 	Receipts     map[string]core.Receipt
 	Inputs       map[string]core.InputReceipt
-	InputSources map[string]string
-	Uncovered    map[string]uint64
 	Attempts     map[string]core.ModelAttempt
 	AttemptOrder []string
 }
@@ -49,7 +47,7 @@ type Change struct {
 
 func New() *Store { return &Store{Sessions: map[string]*Data{}, Rollouts: map[string]*Rollout{}} }
 func NewData() *Data {
-	return &Data{Pending: map[string]core.Record{}, Receipts: map[string]core.Receipt{}, Inputs: map[string]core.InputReceipt{}, InputSources: map[string]string{}, Uncovered: map[string]uint64{}, Attempts: map[string]core.ModelAttempt{}}
+	return &Data{Pending: map[string]core.Record{}, Receipts: map[string]core.Receipt{}, Inputs: map[string]core.InputReceipt{}, Attempts: map[string]core.ModelAttempt{}}
 }
 func NewRollout(id string) *Rollout {
 	return &Rollout{ID: id, Status: "active", Records: map[string]core.Record{}, Children: map[string][]string{}, References: map[string][]string{}}
@@ -103,12 +101,7 @@ func (d *Data) AddPending(r core.Record) {
 	if e.InputID != "" && (e.Kind == core.EntryMessage || e.Kind == core.EntryContext) {
 		receipt := d.Inputs[e.InputID]
 		if receipt.EntryID == "" || e.Kind == core.EntryMessage {
-			delete(d.InputSources, receipt.EntryID)
 			receipt.EntryID = e.ID
-			d.InputSources[e.ID] = e.InputID
-			if receipt.Generation == nil {
-				d.Uncovered[e.InputID] = e.Sequence
-			}
 		}
 		d.Inputs[e.InputID] = receipt
 	}
@@ -120,7 +113,7 @@ func (d *Data) AddPending(r core.Record) {
 		d.Pending["input:"+e.Input.ID] = r
 	case core.EntryInputQueued:
 		d.Pending["input:"+e.Input.ID] = r
-		d.Inputs[e.Input.ID] = core.InputReceipt{InputRecord: *e.Input, AcceptedAt: e.Time, AcceptedRunID: e.RunID, State: core.InputPending}
+		d.Inputs[e.Input.ID] = core.InputReceipt{InputRecord: *e.Input, AcceptedAt: e.Time, State: core.InputPending}
 	case core.EntryInputCleared:
 		if e.Input != nil {
 			receipt := d.Inputs[e.Input.ID]
@@ -356,20 +349,6 @@ func (st *Store) PrepareConfirmed(id string, c core.Commit, receipt core.Receipt
 			if !exists || head.Projection == nil || !head.Projection.Complete() || head.Projection.ConfigurationID != attempt.Input.ConfigurationID {
 				return Change{}, core.ErrCorrupt
 			}
-			for _, source := range attempt.Input.Sources {
-				if source == "" {
-					continue
-				}
-				sourceRecord, exists := r.Records[source]
-				for _, record := range records {
-					if record.Entry.ID == source {
-						sourceRecord, exists = record, true
-					}
-				}
-				if !exists || sourceRecord.Projection == nil || sourceRecord.Entry.Sequence > head.Entry.Sequence {
-					return Change{}, core.ErrCorrupt
-				}
-			}
 		}
 		attempts = append(attempts, attempt)
 	}
@@ -395,47 +374,11 @@ func (st *Store) Apply(change Change) {
 	for _, attempt := range change.Attempts {
 		if _, exists := d.Attempts[attempt.ID]; !exists {
 			d.AttemptOrder = append(d.AttemptOrder, attempt.ID)
-			if attempt.Purpose == "generation" {
-				d.coverGeneration(r, attempt)
-			}
 		}
 		d.Attempts[attempt.ID] = attempt
 	}
 	d.State = change.State
 	d.Receipts[change.Receipt.CommitID] = change.Receipt
-}
-
-func (d *Data) coverGeneration(r *Rollout, attempt core.ModelAttempt) {
-	covered := func(id string) {
-		receipt, ok := d.Inputs[id]
-		if !ok || receipt.Generation != nil {
-			return
-		}
-		receipt.Generation = &core.InputGeneration{AttemptID: attempt.ID, RunID: attempt.RunID, TurnID: attempt.TurnID}
-		d.Inputs[id] = receipt
-		delete(d.Uncovered, id)
-	}
-	var through uint64
-	for _, source := range attempt.Input.Sources {
-		if source == "" {
-			continue
-		}
-		if id := d.InputSources[source]; id != "" {
-			covered(id)
-		}
-		if record := r.Records[source]; record.Entry.Compaction != nil {
-			if boundary, ok := r.Records[record.Entry.Compaction.ThroughID]; ok {
-				through = max(through, boundary.Entry.Sequence)
-			}
-		}
-	}
-	if through > 0 {
-		for id, sequence := range d.Uncovered {
-			if sequence <= through {
-				covered(id)
-			}
-		}
-	}
 }
 func (st *Store) Commit(ctx context.Context, id string, c core.Commit) (core.Receipt, error) {
 	if err := ctx.Err(); err != nil {

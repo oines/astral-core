@@ -86,9 +86,7 @@ if submission.Run != nil {
 | `FollowUp(ctx, Input)` | 只入队，在当前任务自然结束时应用 |
 | `Continue(ctx)` | 显式处理队列或恢复未完成执行；无工作返回 `ErrNotContinuable` |
 | `InjectContext(ctx, Input)` | 接收被动上下文；空闲时应用并按预算自动摘要，不启动主模型循环 |
-| `LookupInput(ctx, id)` | 按索引读取冻结载荷、首次接收时间、接收时的 Run、`pending/applied/cleared` 状态与主请求认领记录 |
-| `IsIdle()` | 判断是否没有正在执行、维护、待恢复请求、未完成工具批次或驱动队列；仅作为调度提示 |
-| `SteerIfIdle(ctx, Input, expectedUnseen)` | 同一临界区确认空闲且指定被动输入都已应用、尚未进入主请求，再入队一次驱动 |
+| `LookupInput(ctx, id)` | 按索引读取冻结载荷、首次接收时间与 `pending/applied/cleared` 状态 |
 | `UpdateQueuedInput(ctx, id, kind, message)` | 修改尚未消费的驱动输入；空 kind 或 nil message 保留该部分 |
 | `MoveQueuedInput(ctx, id, beforeID)` | 将驱动输入移到另一条之前；空 beforeID 表示队尾 |
 | `ClearQueuedInput(ctx, id)` | 删除一条尚未消费的驱动输入 |
@@ -102,10 +100,6 @@ if submission.Run != nil {
 | `Fork(ctx, entryID, options)` | 在完整历史边界创建共享或独立 Rollout 的 Session |
 
 所有输入都要求稳定 ID，包括第一条 Prompt。相同 ID、相同 Digest 返回既有回执；不同 Digest 返回冲突。Host 可提供原始业务提交的 Digest，并在重新生成时间戳或读取附件前先查询回执。重试不替换已保存载荷。
-
-`InputReceipt.Generation` 与 `InputApplied` 不同：只有输入的代表历史节点实际进入普通 generation 的冻结请求（或被该请求包含的已提交摘要代表）时，才在同一事务记录首次 `AttemptID/RunID/TurnID`。单独注入、读取上下文、维护或摘要模型请求不认领。请求适配省略的节点不会认领。该记录确认请求归属，不保证远端 Provider 已接收、生成成功或助手已采取行动；失败与重试不转让首次归属。`AcceptedRunID` 则是首次接收时的活动 Run，空闲接收为空，不随后续认领改变。Fork 继承历史，不复制父 Session 的输入索引与执行认领。
-
-Host 可以让工作中的 Agent 自然读取观察，仅在空闲后对未认领的观察决定是否激活。`SteerIfIdle` 要求非空 `expectedUnseen`，每项均为本 Session 已应用且未认领的被动输入；任一已认领返回 `InputCovered`，尚待应用或会话不空闲返回 `InputBusy`，均不写队列。Host 可先重放 `InjectContext` 刷入待应用观察，再重算未认领集合。接收返回 `InputAccepted`；相同稳定 ID 重试优先返回 `InputExisting`，即使执行已开始，也不会重复入队。接收本身不启动 Run，仍由 Host 显式 `Continue`。取消与失败后的自动重启策略属于 Host。
 
 队列编辑和重排复用输入 ID、首次接收时间和接收 Digest；Contexts 保持冻结。重排与载荷更新在同一提交中完成，以新队列记录的顺序为准。如果上下文准备期间选中的队列记录被更新，准备过程会根据新记录重新开始，不提交旧内容或旧顺序。已消费输入不能通过迟到的 UI 操作重新入队。Host 编辑文字时保留原消息中的附件块，无需重新读取附件来源。
 
