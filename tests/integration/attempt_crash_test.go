@@ -135,6 +135,16 @@ func TestAttemptSIGKILLPreservesAtomicInputAndCanonicalReply(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				for _, source := range a.Input.Sources {
+					entry, lookupErr := st.Get(ctx, a.Input.RolloutID, source)
+					if lookupErr != nil || entry.Entry.InputID == "" {
+						continue
+					}
+					receipt, lookupErr := st.LookupInput(ctx, "attempt-crash", entry.Entry.InputID)
+					if lookupErr != nil || receipt.Generation == nil || receipt.Generation.AttemptID == "" {
+						t.Fatalf("SIGKILL lost atomic generation ownership: %+v %v", receipt, lookupErr)
+					}
+				}
 				frozen, err = core.RebuildRequest(ctx, st, a.Input, core.DefaultContextBytes)
 				if err != nil {
 					t.Fatal(err)
@@ -203,7 +213,7 @@ func TestAttemptSIGKILLPreservesAtomicInputAndCanonicalReply(t *testing.T) {
 					t.Fatal("recovered reply adopted a newer tool configuration")
 				}
 				receipt, lookupErr := s.LookupInput(ctx, "late-context")
-				if lookupErr != nil || receipt.State != core.InputApplied {
+				if lookupErr != nil || receipt.State != core.InputApplied || receipt.Generation != nil {
 					t.Fatalf("late passive input was not applied after generation: %v", lookupErr)
 				}
 			}

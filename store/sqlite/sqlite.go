@@ -60,8 +60,9 @@ CREATE TABLE pending(rollout_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT
 CREATE INDEX pending_order ON pending(session_id,kind,input_kind,seq);
 CREATE INDEX pending_owner ON pending(session_id,kind,owner);
 CREATE INDEX pending_rollout ON pending(rollout_id);
-CREATE TABLE inputs(session_id TEXT NOT NULL,id TEXT NOT NULL,kind TEXT NOT NULL,digest TEXT NOT NULL,accepted_at TEXT NOT NULL,payload BLOB NOT NULL,state TEXT NOT NULL,entry_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(session_id,id));
+CREATE TABLE inputs(session_id TEXT NOT NULL,id TEXT NOT NULL,kind TEXT NOT NULL,digest TEXT NOT NULL,accepted_at TEXT NOT NULL,accepted_run_id TEXT NOT NULL DEFAULT '',payload BLOB NOT NULL,state TEXT NOT NULL,entry_id TEXT NOT NULL DEFAULT '',entry_seq INTEGER NOT NULL DEFAULT 0,generation BLOB,PRIMARY KEY(session_id,id));
 CREATE INDEX input_status ON inputs(session_id,kind,state);
+CREATE INDEX input_uncovered ON inputs(session_id,entry_seq) WHERE generation IS NULL;
 CREATE TABLE attempts(session_id TEXT NOT NULL,id TEXT NOT NULL,rollout_id TEXT NOT NULL,version INTEGER NOT NULL,purpose TEXT NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(session_id,id),UNIQUE(session_id,version));
 CREATE INDEX attempt_purpose ON attempts(session_id,purpose,version);
 CREATE INDEX attempt_rollout ON attempts(rollout_id);
@@ -575,7 +576,7 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []core.Record, p
 			continue
 		}
 		if e.InputID != "" && (e.Kind == core.EntryMessage || e.Kind == core.EntryContext) {
-			if _, err = tx.ExecContext(ctx, "UPDATE inputs SET entry_id=? WHERE session_id=? AND id=? AND (entry_id='' OR ?)", e.ID, e.SessionID, e.InputID, e.Kind == core.EntryMessage); err != nil {
+			if _, err = tx.ExecContext(ctx, "UPDATE inputs SET entry_id=?,entry_seq=? WHERE session_id=? AND id=? AND (entry_id='' OR ?)", e.ID, e.Sequence, e.SessionID, e.InputID, e.Kind == core.EntryMessage); err != nil {
 				return err
 			}
 		}
@@ -588,7 +589,7 @@ func insert(ctx context.Context, tx *sql.Tx, id string, records []core.Record, p
 			if e.Kind == core.EntryInputRequeued {
 				_, err = tx.ExecContext(ctx, "UPDATE inputs SET kind=?,payload=?,state=? WHERE session_id=? AND id=?", string(e.Input.Kind), frozen, string(core.InputPending), e.SessionID, e.Input.ID)
 			} else {
-				_, err = tx.ExecContext(ctx, "INSERT INTO inputs(session_id,id,kind,digest,accepted_at,payload,state) VALUES(?,?,?,?,?,?,?)", e.SessionID, e.Input.ID, string(e.Input.Kind), e.Input.Digest, e.Time.Format(time.RFC3339Nano), frozen, string(core.InputPending))
+				_, err = tx.ExecContext(ctx, "INSERT INTO inputs(session_id,id,kind,digest,accepted_at,accepted_run_id,payload,state) VALUES(?,?,?,?,?,?,?,?)", e.SessionID, e.Input.ID, string(e.Input.Kind), e.Input.Digest, e.Time.Format(time.RFC3339Nano), e.RunID, frozen, string(core.InputPending))
 			}
 			if err != nil {
 				return err
@@ -904,8 +905,9 @@ var _ core.Store = (*Store)(nil)
 func (st *Store) LookupInput(ctx context.Context, id, key string) (core.InputReceipt, error) {
 	var receipt core.InputReceipt
 	var raw []byte
+	var generation []byte
 	var accepted string
-	err := st.db.QueryRowContext(ctx, "SELECT i.payload,i.accepted_at,i.state,i.entry_id FROM inputs i JOIN sessions ss ON ss.id=i.session_id JOIN rollouts r ON r.id=ss.rollout_id WHERE i.session_id=? AND i.id=? AND ss.ready=1 AND r.status='active'", id, key).Scan(&raw, &accepted, &receipt.State, &receipt.EntryID)
+	err := st.db.QueryRowContext(ctx, "SELECT i.payload,i.accepted_at,i.accepted_run_id,i.state,i.entry_id,i.generation FROM inputs i JOIN sessions ss ON ss.id=i.session_id JOIN rollouts r ON r.id=ss.rollout_id WHERE i.session_id=? AND i.id=? AND ss.ready=1 AND r.status='active'", id, key).Scan(&raw, &accepted, &receipt.AcceptedRunID, &receipt.State, &receipt.EntryID, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return receipt, core.ErrNotFound
 	}
@@ -914,6 +916,9 @@ func (st *Store) LookupInput(ctx context.Context, id, key string) (core.InputRec
 	}
 	st.rows.Add(1)
 	if err = json.Unmarshal(raw, &receipt.InputRecord); err != nil {
+		return receipt, core.ErrCorrupt
+	}
+	if generation != nil && json.Unmarshal(generation, &receipt.Generation) != nil {
 		return receipt, core.ErrCorrupt
 	}
 	receipt.AcceptedAt, err = time.Parse(time.RFC3339Nano, accepted)

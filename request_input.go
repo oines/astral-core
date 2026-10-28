@@ -21,9 +21,13 @@ type RequestInput struct {
 	ConfigurationID string          `json:"configuration_id"`
 	Model           ModelSpec       `json:"model"`
 	Snapshot        json.RawMessage `json:"snapshot,omitempty"`
-	Selection       *[]int          `json:"selection,omitempty"`
-	Changes         []RequestChange `json:"changes,omitempty"`
-	Digest          string          `json:"digest"`
+	// Sources aligns with the actual request's messages. Empty positions are
+	// model-prepared messages without a history source. Compaction entries stand
+	// for the inputs represented by that summary, rather than its model call.
+	Sources   []string        `json:"sources,omitempty"`
+	Selection *[]int          `json:"selection,omitempty"`
+	Changes   []RequestChange `json:"changes,omitempty"`
+	Digest    string          `json:"digest"`
 }
 
 // RequestChange is a structural edit of the projected Request JSON. Paths are
@@ -43,6 +47,7 @@ func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 		return input, fmtInvalid("request input needs an immutable context boundary and model")
 	}
 	selection := selectRequestMessages(base.Request.Messages, request.Messages)
+	input.Sources = provenRequestSources(base, request.Messages)
 	identity := len(selection) == len(base.Request.Messages)
 	for i, source := range selection {
 		identity = identity && source == i
@@ -66,6 +71,43 @@ func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 		return input, ErrInvalid
 	}
 	return input, nil
+}
+
+// Reconstruction may reuse the nearest same-role message as a compact editing
+// recipe. Ownership requires stronger evidence: the exact message, or its full
+// unchanged content and identity, must have one unambiguous history source.
+func provenRequestSources(base Context, messages []Message) []string {
+	messageKey := func(message Message) string {
+		return canonicalDigest(struct {
+			Role                          Role
+			Name, ToolCallID, ContextKind string
+			Content                       []Content
+		}{message.Role, message.Name, message.ToolCallID, message.ContextKind, message.Content})
+	}
+	exact, content := map[string]string{}, map[string]string{}
+	add := func(index map[string]string, key, source string) {
+		if old, exists := index[key]; exists && old != source {
+			index[key] = ""
+		} else if !exists {
+			index[key] = source
+		}
+	}
+	for i, message := range base.Request.Messages {
+		if i >= len(base.Sources) || base.Sources[i] == "" {
+			continue
+		}
+		add(exact, canonicalDigest(message), base.Sources[i])
+		add(content, messageKey(message), base.Sources[i])
+	}
+	sources := make([]string, len(messages))
+	for i, message := range messages {
+		if source, exists := exact[canonicalDigest(message)]; exists {
+			sources[i] = source
+		} else {
+			sources[i] = content[messageKey(message)]
+		}
+	}
+	return sources
 }
 
 func selectRequestMessages(base, actual []Message) []int {

@@ -41,7 +41,7 @@ type migrationPlan struct {
 
 func currentMigrationPlan() migrationPlan {
 	files, _ := fs.Sub(migrationFiles, "migrations")
-	return migrationPlan{files: files, target: core.FormatVersion}
+	return migrationPlan{files: files, goMigrations: []*goose.Migration{goose.NewGoMigration(12, &goose.GoFunc{RunTx: migrateInputGeneration}, nil)}, target: core.FormatVersion}
 }
 
 // InspectMigration reads an existing database without initializing a schema,

@@ -37,9 +37,36 @@ const (
 
 type InputReceipt struct {
 	InputRecord
-	AcceptedAt time.Time  `json:"accepted_at"`
-	State      InputState `json:"state"`
-	EntryID    string     `json:"entry_id,omitempty"`
+	AcceptedAt    time.Time        `json:"accepted_at"`
+	AcceptedRunID string           `json:"accepted_run_id,omitempty"`
+	State         InputState       `json:"state"`
+	EntryID       string           `json:"entry_id,omitempty"`
+	Generation    *InputGeneration `json:"generation,omitempty"`
+}
+
+// InputGeneration identifies the first frozen ordinary generation request to
+// which an input contributed, directly or through a committed summary. Applied
+// context and summarizer requests alone never acquire this acknowledgement.
+// This records request ownership, not successful delivery to a remote provider
+// or a promise that the assistant acted on the input.
+type InputGeneration struct {
+	AttemptID string `json:"attempt_id"`
+	RunID     string `json:"run_id,omitempty"`
+	TurnID    string `json:"turn_id,omitempty"`
+}
+
+type InputAdmissionStatus string
+
+const (
+	InputAccepted InputAdmissionStatus = "accepted"
+	InputExisting InputAdmissionStatus = "existing"
+	InputBusy     InputAdmissionStatus = "busy"
+	InputCovered  InputAdmissionStatus = "covered"
+)
+
+type InputAdmission struct {
+	Status  InputAdmissionStatus `json:"status"`
+	Receipt InputReceipt         `json:"receipt,omitempty"`
 }
 type QueuedInput struct {
 	ID       string    `json:"id"`
@@ -145,11 +172,15 @@ func (s *Session) enqueue(ctx context.Context, kind InputKind, input Input) (Inp
 	if err := s.admitInput(q); err != nil {
 		return InputReceipt{}, false, err
 	}
-	entries, err := s.appendLocked(ctx, Entry{Kind: EntryInputQueued, Input: &q})
+	runID := ""
+	if s.active != nil {
+		runID = s.active.id
+	}
+	entries, err := s.appendLocked(ctx, Entry{Kind: EntryInputQueued, RunID: runID, Input: &q})
 	if err != nil {
 		return InputReceipt{}, false, err
 	}
-	return InputReceipt{InputRecord: *entries[0].Input, AcceptedAt: entries[0].Time, State: InputPending}, true, nil
+	return InputReceipt{InputRecord: *entries[0].Input, AcceptedAt: entries[0].Time, AcceptedRunID: runID, State: InputPending}, true, nil
 }
 func (s *Session) Steer(ctx context.Context, input Input) (InputReceipt, error) {
 	receipt, _, err := s.enqueue(ctx, InputSteer, input)
@@ -158,6 +189,72 @@ func (s *Session) Steer(ctx context.Context, input Input) (InputReceipt, error) 
 func (s *Session) FollowUp(ctx context.Context, input Input) (InputReceipt, error) {
 	receipt, _, err := s.enqueue(ctx, InputFollowUp, input)
 	return receipt, err
+}
+
+// IsIdle reports whether an independent activation can be admitted. Pending
+// passive context is allowed, but active work, maintenance, frozen unfinished
+// generations, tool batches and queued driving inputs all reserve the session.
+// This is a scheduling hint; SteerIfIdle is the atomic admission operation.
+func (s *Session) IsIdle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.closed && s.idleLocked()
+}
+
+func (s *Session) idleLocked() bool {
+	return !s.busyLocked() && !s.preparing && s.state.CurrentAttemptID == "" &&
+		s.state.Branch.Complete() && s.state.PendingInputs[InputSteer]+s.state.PendingInputs[InputFollowUp] == 0
+}
+
+// SteerIfIdle atomically admits a driving input only while every named passive
+// input still lacks generation ownership. The stable input ID is checked first:
+// a retry of an accepted submission returns existing even after its activation
+// has started. Busy and covered do not write history or reserve the input ID.
+func (s *Session) SteerIfIdle(ctx context.Context, input Input, expectedUnseen []string) (InputAdmission, error) {
+	if err := ctx.Err(); err != nil {
+		return InputAdmission{}, err
+	}
+	q, err := inputRecord(InputSteer, input)
+	if err != nil {
+		return InputAdmission{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return InputAdmission{}, ErrClosed
+	}
+	if old, exists, err := s.existingInputLocked(ctx, q); err != nil || exists {
+		return InputAdmission{Status: InputExisting, Receipt: old}, err
+	}
+	if len(expectedUnseen) == 0 {
+		return InputAdmission{}, fmtInvalid("conditional steering needs passive input IDs")
+	}
+	covered, pending := false, false
+	for _, id := range expectedUnseen {
+		receipt, err := s.config.Store.LookupInput(ctx, s.id, id)
+		if err != nil {
+			return InputAdmission{}, err
+		}
+		if receipt.Kind != InputContext || receipt.State == InputCleared {
+			return InputAdmission{}, fmtInvalid("conditional steering needs live passive inputs")
+		}
+		covered = covered || receipt.Generation != nil
+		pending = pending || receipt.State != InputApplied
+	}
+	if covered {
+		return InputAdmission{Status: InputCovered}, nil
+	}
+	if pending || !s.idleLocked() {
+		return InputAdmission{Status: InputBusy}, nil
+	}
+	if err := s.admitInput(q); err != nil {
+		return InputAdmission{}, err
+	}
+	entries, err := s.appendLocked(ctx, Entry{Kind: EntryInputQueued, Input: &q})
+	if err != nil {
+		return InputAdmission{}, err
+	}
+	return InputAdmission{Status: InputAccepted, Receipt: InputReceipt{InputRecord: *entries[0].Input, AcceptedAt: entries[0].Time, State: InputPending}}, nil
 }
 func (s *Session) InjectContext(ctx context.Context, input Input) (InputReceipt, error) {
 	receipt, _, err := s.enqueue(ctx, InputContext, input)
