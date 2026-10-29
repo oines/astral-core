@@ -45,6 +45,8 @@ CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返�
 
 MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。Usage.Available 仅表示存在用量报告；适配器确认提供商遗漏输入或输出计数时，分别设置 InputMissing / OutputMissing（JSON 为 input_missing / output_missing，false 省略）。两个缺失标记默认 false，保持旧记录和现有调用方的语义；单项明确报告为零不表示缺失。不完整用量仍保存于消息与 Attempt 供审计，只有 Available 且两个缺失标记均为 false 的用量可充当基线。最新回复不完整时继续查找更早的完整基线，并将它之后的消息纳入尾段估算。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。未报告、不完整、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
 
+摘要仅在普通模型与摘要模型规格及目标快照相同、普通请求准备后的选中历史未转换、基线覆盖前缀指纹有效时复用真实用量。基线从选中历史内寻找，不引用保留尾段的较新回复。完整预算为真实 InputTokens + OutputTokens、基线之后所有实际选入摘要的消息估算、完整的新摘要提示词/选项/指令开销；旧请求固定开销保守保留，不做粗估减法。旁观消息即使长期没有普通生成也持续计入增量。摘要准备或工具文本缩短改变覆盖前缀时回退为完整内容估算。摘要输入、摘要输出、独立输入上限、协议和字节预算仍全部检查；摘要成功后重新检查摘要、保留历史及待加入输入的完整候选，旧基线失效，摘要 usage 不成为新窗口基线。
+
 默认压缩条件为 Input > ContextWindow - 16384，近期保留目标 20000，摘要输出 min(floor(0.8 × ReserveTokens), 摘要模型最大输出)。按 ModelBudgets 可覆盖普通模型的 ReserveTokens / KeepRecentTokens。普通输出 min(期望输出或模型最大输出, ContextWindow - Input - 4096)，可用输出不足 1 时拒绝发送。SafetyMargin 只预留输出空间，不叠加到压缩阈值或独立的 MaxInputTokens 上；摘要仍独立检查完整请求与输出预算。单个工具结果明确超出字节或 Token 预算时保存有界的交付失败结果与真实 Outcome；若后选模型不可用或配置错误，保留已完成工具输出，由下一请求准备报告模型错误。聚合压力在准备阶段处理，不改写成功工具的执行事实。
 
 ## 模型协议、重试与审计
