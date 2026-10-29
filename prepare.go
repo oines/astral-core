@@ -320,14 +320,21 @@ func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Co
 }
 
 func (s *Session) checkRequestBudget(ctx context.Context, model Model, request Request) (int, error) {
-	tokens, err := checkBudget(ctx, model, request, s.config.Budget.SafetyMargin)
+	tokens, err := estimate(ctx, model, request)
 	if err != nil {
 		return tokens, err
 	}
-	if err := ValidateRequest(ctx, model, request); err != nil {
-		return tokens, err
+	return tokens, s.checkEstimatedRequestBudget(ctx, model, request, tokens)
+}
+
+func (s *Session) checkEstimatedRequestBudget(ctx context.Context, model Model, request Request, tokens int) error {
+	if err := checkTokenBudget(tokens, model.Spec(), request.MaxOutputTokens, s.config.Budget.SafetyMargin); err != nil {
+		return err
 	}
-	return tokens, s.checkRequestBytes(request)
+	if err := ValidateRequest(ctx, model, request); err != nil {
+		return err
+	}
+	return s.checkRequestBytes(request)
 }
 
 func (s *Session) checkRequestBytes(request Request) error {

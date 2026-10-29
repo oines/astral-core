@@ -84,10 +84,12 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	}
 	// Select every message covered by the complete history boundary.
 	var selected []Message
+	var selectedSources []string
 	for i, message := range view.Request.Messages {
 		source := view.Sources[i]
 		if source == summaryID || indices[source] <= through {
 			selected = append(selected, message)
+			selectedSources = append(selectedSources, source)
 		}
 	}
 	if len(selected) == 0 {
@@ -105,6 +107,27 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		}
 		summaryOptions = resolvedOptions(summaryModel)
 	}
+	// A newer ordinary reply may be in the retained tail. Only usage whose
+	// complete prefix is selected for this summary can anchor its estimate.
+	source := view
+	source.Request.Messages = selected
+	source.Sources = selectedSources
+	source.anchor = nil
+	if normalModel.Spec() == summaryModel.Spec() && sameJSON(normalModel.(estimatedModel).snapshot, summaryModel.(estimatedModel).snapshot) {
+		source.anchor = contextUsageAnchorFor(path, selectedSources)
+		if source.anchor != nil {
+			source.Request.ModelID, source.Request.ModelRevision = normalModel.Spec().ID, normalModel.Spec().Revision
+			source.Request.MaxOutputTokens = outputReservation(s.config.Budget.OutputTokens, normalModel.Spec())
+			source.Request.Options = resolvedOptions(normalModel)
+			source.Request, err = PrepareRequest(ctx, normalModel, source.Request)
+			if err != nil {
+				return CompactionRecord{}, err
+			}
+			if !sameJSON(source.Request.Messages, selected) {
+				source.anchor = nil
+			}
+		}
+	}
 	summaryModelID := summaryModel.Spec().ID
 	output := s.config.Compaction.OutputTokens
 	if output == 0 {
@@ -119,11 +142,18 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		candidate.Messages = summaryMessages(messages, instructions)
 		return PrepareRequest(ctx, summaryModel, candidate)
 	}
+	check := func(request Request) (int, error) {
+		tokens, err := estimateCompaction(ctx, summaryModel, source, request)
+		if err != nil {
+			return 0, err
+		}
+		return tokens, s.checkEstimatedRequestBudget(ctx, summaryModel, request, tokens)
+	}
 	request, err := build(selected)
 	if err != nil {
 		return CompactionRecord{}, err
 	}
-	inputTokens, fitErr := s.checkRequestBudget(ctx, summaryModel, request)
+	inputTokens, fitErr := check(request)
 	// First try the entire input. Only copies of tool-result text are reduced,
 	// and only if the independent summarizer's window actually requires it.
 	if errors.Is(fitErr, ErrBudget) {
@@ -156,7 +186,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 			if err != nil {
 				return CompactionRecord{}, err
 			}
-			inputTokens, fitErr = s.checkRequestBudget(ctx, summaryModel, request)
+			inputTokens, fitErr = check(request)
 		}
 	}
 	if fitErr != nil {

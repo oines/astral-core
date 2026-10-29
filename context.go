@@ -174,31 +174,30 @@ func project(path []Entry) (Context, error) {
 		return Context{}, err
 	}
 	view = clone(view)
+	view.anchor = contextUsageAnchorFor(path, view.Sources)
+	return view, nil
+}
+
+func contextUsageAnchorFor(path []Entry, sources []string) *contextUsageAnchor {
 	// Only a successful assistant created after the current compaction/config
 	// may anchor this projection. Summarizer usage never appears here.
-	entries := make(map[string]Entry, len(visible))
-	afterCompaction := checkpoint == nil
-	for _, entry := range visible {
+	entries := make(map[string]Entry, len(sources))
+	for _, entry := range path {
 		if entry.Kind == EntryCompaction {
-			if checkpoint != nil && entry.ID == checkpoint.ID {
-				afterCompaction = true
-			}
+			clear(entries)
 			continue
 		}
-		if afterCompaction {
-			entries[entry.ID] = entry
-		}
+		entries[entry.ID] = entry
 	}
-	for i := len(view.Sources) - 1; i >= 0; i-- {
-		entry := entries[view.Sources[i]]
+	for i := len(sources) - 1; i >= 0; i-- {
+		entry := entries[sources[i]]
 		if entry.Generation != nil && entry.Message != nil && entry.Message.Role == RoleAssistant && !entry.Message.Failed() &&
 			entry.Usage.Available && !entry.Usage.InputMissing && !entry.Usage.OutputMissing &&
 			entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
-			view.anchor = &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
-			break
+			return &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
 		}
 	}
-	return view, nil
+	return nil
 }
 
 // Results may commit out of order within a batch, but a later message must
