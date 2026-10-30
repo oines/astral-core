@@ -20,6 +20,9 @@ import (
 
 const firstMigrationFormat int64 = 11
 
+// SchemaVersion versions the SQLite representation independently of Core messages.
+const SchemaVersion int64 = 12
+
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
@@ -27,6 +30,8 @@ var migrationFiles embed.FS
 // release number. NeedsMigration also covers adopting the format-11 baseline
 // into Goose's ledger without changing the data format.
 type MigrationStatus struct {
+	SchemaCurrent  int64 `json:"schema_current"`
+	SchemaTarget   int64 `json:"schema_target"`
 	Current        int64 `json:"current"`
 	Target         int64 `json:"target"`
 	NeedsMigration bool  `json:"needs_migration"`
@@ -37,11 +42,19 @@ type migrationPlan struct {
 	files        fs.FS
 	goMigrations []*goose.Migration
 	target       int64
+	formats      map[int64]int64 // explicit logical format for schema-only steps
+}
+
+func (p migrationPlan) format(schema int64) int64 {
+	if value, ok := p.formats[schema]; ok {
+		return value
+	}
+	return schema
 }
 
 func currentMigrationPlan() migrationPlan {
 	files, _ := fs.Sub(migrationFiles, "migrations")
-	return migrationPlan{files: files, target: core.FormatVersion}
+	return migrationPlan{files: files, target: SchemaVersion, formats: map[int64]int64{12: 11}, goMigrations: []*goose.Migration{goose.NewGoMigration(12, &goose.GoFunc{RunTx: migratePayloads12}, nil)}}
 }
 
 // InspectMigration reads an existing database without initializing a schema,
@@ -61,7 +74,7 @@ func InspectMigration(ctx context.Context, path string) (MigrationStatus, error)
 		return MigrationStatus{}, err
 	}
 	if missing {
-		return MigrationStatus{Target: plan.target, Missing: true}, nil
+		return MigrationStatus{Target: plan.format(plan.target), SchemaTarget: plan.target, Missing: true}, nil
 	}
 	source, immutable, cleanup, err := inspectionSource(ctx, abs)
 	if err != nil {
@@ -207,7 +220,7 @@ func newMigrationProvider(db *sql.DB, plan migrationPlan) (*goose.Provider, erro
 		return nil, err
 	}
 	p, err := goose.NewProvider(goose.DialectCustom, db, plan.files,
-		goose.WithStore(migrationStore{Store: store}),
+		goose.WithStore(migrationStore{Store: store, plan: plan}),
 		goose.WithDisableGlobalRegistry(true),
 		goose.WithGoMigrations(plan.goMigrations...),
 	)
@@ -246,36 +259,36 @@ func newMigrationProvider(db *sql.DB, plan migrationPlan) (*goose.Provider, erro
 	return p, nil
 }
 
-func readFormatMarkers(ctx context.Context, db database.DBTxConn) (int64, error) {
+func readMarkers(ctx context.Context, db database.DBTxConn) (int64, int64, error) {
 	var count int
 	var format sql.NullInt64
-	if err := db.QueryRowContext(ctx, "SELECT count(*), min(version) FROM format").Scan(&count, &format); err != nil {
+	var schema int64
+	if err := db.QueryRowContext(ctx, "SELECT count(*),min(version) FROM format").Scan(&count, &format); err != nil {
 		if ctx.Err() != nil {
-			return 0, ctx.Err()
+			return 0, 0, ctx.Err()
 		}
-		return 0, fmt.Errorf("core format marker: %w: %v", core.ErrUnsupportedFormat, err)
+		return 0, 0, fmt.Errorf("core format marker: %w: %v", core.ErrUnsupportedFormat, err)
 	}
-	var userVersion int64
-	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion); err != nil {
-		return 0, err
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&schema); err != nil {
+		return 0, 0, err
 	}
-	if count != 1 || !format.Valid || format.Int64 != userVersion {
-		return 0, fmt.Errorf("core format markers disagree: %w", core.ErrUnsupportedFormat)
+	if count != 1 || !format.Valid {
+		return 0, 0, core.ErrUnsupportedFormat
 	}
-	return format.Int64, nil
+	return format.Int64, schema, nil
 }
 
 func inspectMigration(ctx context.Context, db *sql.DB, plan migrationPlan) (MigrationStatus, error) {
-	status := MigrationStatus{Target: plan.target}
+	status := MigrationStatus{Target: plan.format(plan.target), SchemaTarget: plan.target}
 	if _, err := newMigrationProvider(db, plan); err != nil {
 		return status, err
 	}
-	format, err := readFormatMarkers(ctx, db)
+	format, schema, err := readMarkers(ctx, db)
 	if err != nil {
 		return status, err
 	}
-	status.Current = format
-	if format < firstMigrationFormat || format > plan.target {
+	status.Current, status.SchemaCurrent = format, schema
+	if schema < firstMigrationFormat || schema > plan.target || format != plan.format(schema) {
 		return status, fmt.Errorf("core format %d cannot migrate to %d: %w", format, plan.target, core.ErrUnsupportedFormat)
 	}
 	var hasLedger bool
@@ -283,7 +296,7 @@ func inspectMigration(ctx context.Context, db *sql.DB, plan migrationPlan) (Migr
 		return status, err
 	}
 	if !hasLedger {
-		if format != firstMigrationFormat {
+		if schema != firstMigrationFormat {
 			return status, fmt.Errorf("core format %d has no migration ledger: %w", format, core.ErrCorrupt)
 		}
 		status.NeedsMigration = true
@@ -305,7 +318,7 @@ func inspectMigration(ctx context.Context, db *sql.DB, plan migrationPlan) (Migr
 		if previous == 0 {
 			expected = firstMigrationFormat
 		}
-		if !applied || version != expected || version > format {
+		if !applied || version != expected || version > schema {
 			return status, fmt.Errorf("core migration ledger is not an applied prefix at %d: %w", version, core.ErrCorrupt)
 		}
 		previous = version
@@ -313,7 +326,7 @@ func inspectMigration(ctx context.Context, db *sql.DB, plan migrationPlan) (Migr
 	if err := rows.Err(); err != nil {
 		return status, err
 	}
-	if previous != format && !(previous == 0 && format == firstMigrationFormat) {
+	if previous != schema && !(previous == 0 && schema == firstMigrationFormat) {
 		return status, fmt.Errorf("core format %d and migration ledger %d disagree: %w", format, previous, core.ErrCorrupt)
 	}
 	status.NeedsMigration = previous < plan.target
@@ -370,14 +383,17 @@ func initializeMigrationHistory(ctx context.Context, db *sql.DB, tx *sql.Tx, pla
 // Goose inserts the ledger entry using the same transaction as the migration.
 // Keeping the two Core format markers here prevents a migration author from
 // committing converted data with an old marker or advancing only one marker.
-type migrationStore struct{ database.Store }
+type migrationStore struct {
+	database.Store
+	plan migrationPlan
+}
 
 func (s migrationStore) Insert(ctx context.Context, db database.DBTxConn, req database.InsertRequest) error {
 	if req.Version != 0 {
 		if _, ok := db.(*sql.Tx); !ok {
 			return errors.New("core migration requires a transaction")
 		}
-		format, err := readFormatMarkers(ctx, db)
+		format, schema, err := readMarkers(ctx, db)
 		if err != nil {
 			return err
 		}
@@ -385,10 +401,10 @@ func (s migrationStore) Insert(ctx context.Context, db database.DBTxConn, req da
 		if req.Version == firstMigrationFormat {
 			expected = firstMigrationFormat
 		}
-		if format != expected {
+		if schema != expected || format != s.plan.format(schema) {
 			return fmt.Errorf("core migration %d starts from format %d: %w", req.Version, format, core.ErrUnsupportedFormat)
 		}
-		if _, err = db.ExecContext(ctx, fmt.Sprintf("UPDATE format SET version=%d; PRAGMA user_version=%d;", req.Version, req.Version)); err != nil {
+		if _, err = db.ExecContext(ctx, fmt.Sprintf("UPDATE format SET version=%d; PRAGMA user_version=%d;", s.plan.format(req.Version), req.Version)); err != nil {
 			return err
 		}
 	}

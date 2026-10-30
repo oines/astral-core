@@ -14,6 +14,7 @@ import (
 	astral "github.com/oines/astral-core"
 
 	"github.com/oines/astral-core/store/memory"
+	"github.com/oines/astral-core/store/sqlite"
 )
 
 func eachStore(t *testing.T, fn func(*testing.T, astral.Store)) {
@@ -264,7 +265,7 @@ func TestCurrentFormatMarkersAgreeWithRuntimeState(t *testing.T) {
 			if err := db.QueryRow("SELECT version FROM format").Scan(&format); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != astral.FormatVersion || userVersion != astral.FormatVersion {
+			if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil || format != astral.FormatVersion || int64(userVersion) != sqlite.SchemaVersion {
 				t.Fatalf("SQLite markers: format=%d user_version=%d %v", format, userVersion, err)
 			}
 		})
