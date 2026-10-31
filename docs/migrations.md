@@ -37,4 +37,8 @@ Goose 不提供跨数据库恢复。Host 必须备份数据库、WAL、密钥及
 
 ## 空间维护
 
-删除无引用载荷会产生 SQLite 空闲页，不承诺立即缩小文件。`sqlite.Vacuum(ctx, path)` 是独立离线入口：要求当前 schema、完整备份、所有权锁、关闭其他连接，并由调用者预检数据卷与 SQLite 临时卷空间。它在事务外执行 VACUUM，前后检查并完成 `wal_checkpoint(TRUNCATE)`，再做完整性检查。不自动删除备份、不转换旧库、不改变逻辑历史。
+删除无引用载荷会产生 SQLite 空闲页，删除操作本身不承诺立即缩小文件。运行中的 Host 可以调用 SQLite 后端的 `store.Reclaim(ctx)`：它等待当前写入与读取快照结束，临时阻塞同一 Store 的新读写，通过专用维护连接执行完整 VACUUM，前后完成 `wal_checkpoint(TRUNCATE)`，然后恢复读写。它不关闭在用 Store、不更改 schema 或 `auto_vacuum`，也不改变逻辑历史、正文引用和共享归属；通用 `core.Store` 接口没有新增要求。
+
+Host 应合并重复维护请求、安排调用时机，并在调用前检查数据卷和 SQLite 临时卷可用空间。等待和执行可以由 `ctx` 取消。其他 Store handle 或进程持有的读取/写入可能阻止回收，此时返回可由 `errors.Is(err, core.ErrBusy)` 识别的错误，Host 可以稍后重试；失败或取消后原 Store 继续可用。最后一次 checkpoint 失败时，VACUUM 可能已经完成，但 WAL 尚未截断；不能将错误解释为数据删除失败，也不能承诺尚未测量的释放字节。只有成功完成并重新测量文件后，才能判断实际缩小量。
+
+`sqlite.Vacuum(ctx, path)` 仍是独立离线入口：要求当前 schema、完整备份、所有权锁、关闭其他连接，并由调用者预检数据卷与 SQLite 临时卷空间。它在事务外执行 VACUUM，前后检查并完成 `wal_checkpoint(TRUNCATE)`，再做完整性检查。两个入口都不自动删除备份、不转换旧库；全量 VACUUM 仍可能使用较多临时磁盘空间。

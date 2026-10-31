@@ -32,6 +32,9 @@ type Store struct {
 	rows    atomic.Uint64
 	commits atomic.Uint64
 }
+
+const maxReadConnections = 4
+
 type Statistics struct {
 	RowsRead uint64
 	Commits  uint64
@@ -153,8 +156,8 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	st.readDB.SetMaxOpenConns(4)
-	st.readDB.SetMaxIdleConns(4)
+	st.readDB.SetMaxOpenConns(maxReadConnections)
+	st.readDB.SetMaxIdleConns(maxReadConnections)
 	return st, nil
 }
 func decodeState(raw []byte, id string) (core.RuntimeState, error) {
