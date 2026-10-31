@@ -167,7 +167,7 @@ Assistant 的 `Content` 按原顺序保存 Reasoning、Text、ToolCall、多模�
 
 ## 存储与所有权
 
-当前 Core 格式为 **11**，正常运行只支持本格式。没有旧接口、旧格式读取或运行时自动升级；已有旧数据库返回 `ErrUnsupportedFormat`。SQLite 提供独立的 `InspectMigration` / `Migrate` 离线入口，由 Host 停服、备份后执行；Goose 按顺序补齐最新版内嵌的历史迁移。当前基线为格式 11，格式 10 及更早版本不转换。见 [离线迁移契约](docs/migrations.md)。SQLite 是持久运行后端，Memory 用于临时会话；Host 可实现同一 Store 契约接入其他后端。不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
+当前 Core 格式为 **11**，正常运行只支持本格式。没有旧接口、旧格式读取或运行时自动升级；已有旧数据库返回 `ErrUnsupportedFormat`。SQLite 提供独立的 `InspectMigration` / `Migrate` 离线入口，由 Host 停服、备份后执行；Goose 按顺序补齐最新版内嵌的历史迁移。当前逻辑格式保持 11，SQLite 物理 schema 为 12；schema 11 通过离线步骤转换为共享大字段与事件引用，逻辑历史不变。格式 10 及更早版本不转换。见 [离线迁移契约](docs/migrations.md)。SQLite 是持久运行后端，Memory 用于临时会话；Host 可实现同一 Store 契约接入其他后端。不提供 JSONL 运行存储，Host 仍可导出 JSONL 历史。
 
 历史树通过 ParentID 表达分支，Session 持有执行游标、待办和当前未完成 Attempt；三者具有独立身份。普通读取只分页加载所选祖先路径的有效上下文及必要引用，内存不随归档历史总长度增长。Shared Fork 共享祖先节点，Detached Fork 分页复制所选祖先路径后原子发布；两种 Fork 都不继承父 Session 的 Attempt，消息、摘要和用量元数据不依赖父执行记录才能读取。
 

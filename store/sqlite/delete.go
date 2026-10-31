@@ -49,7 +49,43 @@ func (st *Store) DeleteSession(ctx context.Context, id string) error {
 	if _, err = tx.ExecContext(ctx, "DELETE FROM rollouts WHERE id=?", rollout); err != nil {
 		return err
 	}
+	if err = removeRolloutPayloads(ctx, tx, rollout); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 var _ core.SessionDeleter = (*Store)(nil)
+
+func discardEntryPage(ctx context.Context, tx *sql.Tx, rollout string) (int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM entries WHERE rollout_id=? LIMIT ?`, rollout, core.DefaultPageSize)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	if err = payloadCandidates(ctx, tx); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if err = replacePayloadRefs(ctx, tx, rollout, "entry", ownerKey(rollout, id), nil); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM entries WHERE rollout_id=? AND id=?`, rollout, id); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), collectPayloads(ctx, tx)
+}

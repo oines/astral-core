@@ -103,7 +103,7 @@ MayEndRun 要求唯一 ToolCall，允许 Reasoning、不允许普通正文。返
 
 根包 Store 提供 LoadState、Get、Scan、GetAttempt、ScanAttempts、Pending、Commit、LookupCommit、LookupInput 和 Fork。Get / Scan 按 RolloutID 读取；Attempt、状态、队列、提交与输入回执按 SessionID 读取。所有返回值是隔离副本。Attempt 分页游标按创建时的 Session Version 前进，不随结果完成改变；支持用途过滤和正反向扫描。
 
-格式 **11** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查格式。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
+格式 **11** 仅支持自身；旧格式返回 ErrUnsupportedFormat，不在运行时升级、导入或改写。SQLite 在变更 WAL/Schema 前检查逻辑格式、物理 schema 与迁移账本；当前逻辑格式 11 / schema 12，离线迁移支持公开的 schema 11 基线。Memory 具有相同的原子性，但不承诺进程退出后的持久性。
 
 可选维护接口 SessionDeleter.DeleteSession 由 Memory 和 SQLite 实现。Host 必须先停止并关闭目标 Session、阻止新的执行，再调用原子、幂等的永久删除；它清除私有 Rollout 的历史、Attempt、输入、队列与提交回执。多个 Session 共享同一 Rollout 时返回 ErrConflict，保留全部数据。Detached Fork 拥有独立副本，不受来源删除影响。删除业务元数据、索引和恢复未完成维护由 Host 负责，不调用模型或工具。
 
@@ -111,7 +111,7 @@ Commit 包含稳定 ID、ExpectedVersion、Entries 和 Attempts 变更。Store �
 
 确认前 Session 不推进缓存。错误后最多用独立 5 秒 Context 查询 LookupCommit，验证 ID、Digest、Version 和 CurrentVersion；其他所有者已推进版本时仍停止。相同 Commit ID 相同内容幂等，不同内容冲突。Reload 只供 Host 重新建立独占所有权后的空闲句柄使用。
 
-SQLite 使用纯 Go 驱动、WAL、synchronous=FULL、busy_timeout=5000 和 BEGIN IMMEDIATE。输入正文按索引读取，RuntimeState 只保留当前批次、审批、待办数量、分支引用和最近 Run。普通提交不扫描历史。Session 缓存有效窗口与必要引用，不持有完整历史树。Stats.RowsRead 是返回到适配器的行数，不等于数据库内部扫描量。
+SQLite 使用纯 Go 驱动、WAL、synchronous=FULL、busy_timeout=5000。写入使用 BEGIN IMMEDIATE；分页读取通过独立的只读连接池使用同一 deferred 事务快照。输入正文按索引读取，RuntimeState 只保留当前批次、审批、待办数量、分支引用和最近 Run。普通提交不扫描历史。Session 缓存有效窗口与必要引用，不持有完整历史树。Stats.RowsRead 统计逻辑记录读取，不包含正文表批量查询，也不等于数据库内部扫描量。
 
 Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可变祖先，Detached 分页复制所选路径并在完成后发布。稳定子 Session ID 与 ForkRequest 摘要用于重试确认；重试返回新句柄，Host 负责唯一活动实例。子会话继承所选位置的历史配置、Selection 与完整结果，不采用父会话的当前选择，不继承 Parent 的 Attempt、队列、运行中授权或审批。复制的 Generation 仅为来源与用量元数据，不要求父 Attempt 存在。关闭 Parent 不关闭 Child，Fork 不回滚文件或复制活动进程。清理规则见 Store 的引用与 Rollout 状态 API。
 
@@ -120,3 +120,13 @@ Fork 边界包含所选历史节点且必须协议完整。Shared 共享不可�
 Subscribe 非阻塞、尽力投递，溢出关闭并返回 ErrSlowSubscriber。先订阅，再获取 Snapshot 和分页历史；按 Entry ID 去重。Event.Sequence 与 Snapshot.EventSequence 只属于当前 Session 句柄，Host 用运行实例 Epoch 区分重启，不把事件序号当持久历史游标。
 
 AttemptStatus 提供 Purpose、Run/Turn/Attempt ID、Attempt、MaxAttempts、State、NextRetryAt 和安全错误代码。Snapshot 原子读取当前 RuntimeState、运行/维护/停止状态与尝试信息。重连恢复当前状态并忽略快照序号之前的增量；失败 Attempt 的临时输出不能恢复为对话事实。浏览器重连不调用 Prompt 或 Continue，也不取消服务器工作。
+
+### SQLite 大字段归属
+
+`inputs`、`pending` 保存实际事件引用，输入编辑后更新到新的不可变队列事件。接收 Digest 继续表示原输入幂等身份，不能用于定位编辑后的正文。
+
+SQLite 私有 envelope 将声明字段中至少 4096 字节的内容放入 `payloads`，以 SHA-256 共享不可变字节；短值内联。字符串按 UTF-8 存储，不透明 JSON 按持久化边界上的 JSON 字节存储。字段语法覆盖 Message/Content、工具参数与结果、配置、审批、Compact、RequestInput Snapshot/Changes，以及 State/Projection/Attempt 中的对应位置。内容来源和媒体类型不参与判断；不递归拆解供应商 JSON，不重新编码图片。
+
+`payload_refs` 将字节关联到 Entry（含 Projection）、Session State 或 Attempt 的完整主键。替换引用、追加历史、更新状态、写回执和回收失去全部引用的候选正文在同一事务中完成。删除使用数据库候选集合，不把全部历史 hash 载入内存。Detached Fork 登记自己的引用，删除来源不会破坏子分支；未发布 Fork 的分批清理也释放引用。
+
+分页先按还原后的逻辑大小选记录，再批量校验、加载所需正文；缺失、长度或 hash 不符返回错误。单条超预算记录仍由现有专用读取路径处理，不承诺与单条大小无关的固定内存。Store 返回完整逻辑对象，内部 hash 不进入 Core 消息、模型协议或 Host 工具。Memory 和其他 Store 不需要复制这个物理布局。

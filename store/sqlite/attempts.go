@@ -11,8 +11,13 @@ import (
 )
 
 func (st *Store) GetAttempt(ctx context.Context, id, key string) (core.ModelAttempt, error) {
+	tx, err := st.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return core.ModelAttempt{}, err
+	}
+	defer tx.Rollback()
 	var raw []byte
-	err := st.db.QueryRowContext(ctx, `SELECT a.payload FROM attempts a JOIN sessions s ON s.id=a.session_id JOIN rollouts r ON r.id=s.rollout_id WHERE a.session_id=? AND a.id=? AND s.ready=1 AND r.status='active'`, id, key).Scan(&raw)
+	err = tx.QueryRowContext(ctx, `SELECT a.payload FROM attempts a JOIN sessions s ON s.id=a.session_id JOIN rollouts r ON r.id=s.rollout_id WHERE a.session_id=? AND a.id=? AND s.ready=1 AND r.status='active'`, id, key).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.ModelAttempt{}, core.ErrNotFound
 	}
@@ -21,18 +26,31 @@ func (st *Store) GetAttempt(ctx context.Context, id, key string) (core.ModelAtte
 	}
 	st.rows.Add(1)
 	var attempt core.ModelAttempt
-	if json.Unmarshal(raw, &attempt) != nil || attempt.ID != key || attempt.SessionID != id {
+	if err = decodeValue(ctx, tx, raw, attempt12, &attempt); err != nil {
+		return attempt, err
+	}
+	if attempt.ID != key || attempt.SessionID != id {
 		return attempt, core.ErrCorrupt
 	}
 	return attempt, nil
 }
 
 func (st *Store) ScanAttempts(ctx context.Context, id string, q core.AttemptQuery) (core.AttemptPage, error) {
-	if _, err := st.LoadState(ctx, id); err != nil {
+	tx, err := st.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return core.AttemptPage{}, err
+	}
+	defer tx.Rollback()
+	var one int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sessions s JOIN rollouts r ON r.id=s.rollout_id WHERE s.id=? AND s.ready=1 AND r.status='active'`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.AttemptPage{}, core.ErrNotFound
+	}
+	if err != nil {
 		return core.AttemptPage{}, err
 	}
 	limit, maxBytes := core.PageLimits(q.Limit, q.MaxBytes)
-	query := "SELECT payload FROM attempts WHERE session_id=?"
+	query := "SELECT payload,payload_size FROM attempts WHERE session_id=?"
 	args := []any{id}
 	if q.Purpose != "" {
 		query += " AND purpose=?"
@@ -56,33 +74,55 @@ func (st *Store) ScanAttempts(ctx context.Context, id string, q core.AttemptQuer
 	}
 	query += " LIMIT ?"
 	args = append(args, limit+1)
-	rows, err := st.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return core.AttemptPage{}, err
 	}
 	defer rows.Close()
 	page, size := core.AttemptPage{}, 0
+	var values []packedValue
+	more := false
 	for rows.Next() {
 		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		var logicalSize int
+		if err := rows.Scan(&raw, &logicalSize); err != nil {
 			return core.AttemptPage{}, err
 		}
 		st.rows.Add(1)
-		if len(page.Attempts) == limit || size+len(raw) > maxBytes {
-			if len(page.Attempts) == 0 {
+		if len(values) == limit || logicalSize > maxBytes-size {
+			if len(values) == 0 {
 				return core.AttemptPage{}, core.ErrBudget
 			}
-			page.Next = strconv.FormatUint(page.Attempts[len(page.Attempts)-1].Version, 10)
+			more = true
 			break
 		}
+		if logicalSize <= 0 {
+			return core.AttemptPage{}, core.ErrCorrupt
+		}
+		values = append(values, packedValue{raw, attempt12})
+		size += logicalSize
+	}
+	if err = rows.Err(); err != nil {
+		return core.AttemptPage{}, err
+	}
+	if err = rows.Close(); err != nil {
+		return core.AttemptPage{}, err
+	}
+	decoded, err := hydrate(ctx, tx, values...)
+	if err != nil {
+		return core.AttemptPage{}, err
+	}
+	for _, raw := range decoded {
 		var attempt core.ModelAttempt
 		if json.Unmarshal(raw, &attempt) != nil || attempt.SessionID != id {
 			return core.AttemptPage{}, core.ErrCorrupt
 		}
 		page.Attempts = append(page.Attempts, attempt)
-		size += len(raw)
 	}
-	return page, rows.Err()
+	if more {
+		page.Next = strconv.FormatUint(page.Attempts[len(page.Attempts)-1].Version, 10)
+	}
+	return page, nil
 }
 
 func saveAttempts(ctx context.Context, tx *sql.Tx, id, rolloutID string, mutations []core.AttemptMutation, entries []core.Entry) error {
@@ -96,8 +136,8 @@ func saveAttempts(ctx context.Context, tx *sql.Tx, id, rolloutID string, mutatio
 		var raw []byte
 		err := tx.QueryRowContext(ctx, "SELECT payload FROM attempts WHERE session_id=? AND id=?", id, mutation.ID).Scan(&raw)
 		if err == nil {
-			if json.Unmarshal(raw, &previous) != nil {
-				return core.ErrCorrupt
+			if err = decodeValue(ctx, tx, raw, attempt12, &previous); err != nil {
+				return err
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -116,18 +156,22 @@ func saveAttempts(ctx context.Context, tx *sql.Tx, id, rolloutID string, mutatio
 				return core.ErrCorrupt
 			}
 			var head core.Projection
-			if json.Unmarshal(projection, &head) != nil || !head.Complete() || head.ConfigurationID != attempt.Input.ConfigurationID {
+			if err = decodeValue(ctx, tx, projection, projection12, &head); err != nil {
+				return err
+			}
+			if !head.Complete() || head.ConfigurationID != attempt.Input.ConfigurationID {
 				return core.ErrCorrupt
 			}
 		}
-		raw, err = json.Marshal(attempt)
+		var logicalSize int
+		raw, logicalSize, err = encodeValue(ctx, tx, rolloutID, "attempt", ownerKey(id, attempt.ID), attempt, attempt12)
 		if err != nil {
 			return err
 		}
 		if previous == nil {
-			_, err = tx.ExecContext(ctx, "INSERT INTO attempts(session_id,id,rollout_id,version,purpose,payload) VALUES(?,?,?,?,?,?)", id, attempt.ID, rolloutID, attempt.Version, attempt.Purpose, raw)
+			_, err = tx.ExecContext(ctx, "INSERT INTO attempts(session_id,id,rollout_id,version,purpose,payload,payload_size) VALUES(?,?,?,?,?,?,?)", id, attempt.ID, rolloutID, attempt.Version, attempt.Purpose, raw, logicalSize)
 		} else {
-			_, err = tx.ExecContext(ctx, "UPDATE attempts SET payload=? WHERE session_id=? AND id=?", raw, id, attempt.ID)
+			_, err = tx.ExecContext(ctx, "UPDATE attempts SET payload=?,payload_size=? WHERE session_id=? AND id=?", raw, logicalSize, id, attempt.ID)
 		}
 		if err != nil {
 			return err

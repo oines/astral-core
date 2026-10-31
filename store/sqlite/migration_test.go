@@ -19,15 +19,15 @@ import (
 func migrationFixture(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "core.db")
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = st.Close(); err != nil {
-		t.Fatal(err)
-	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("testdata/schema11.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(string(raw) + `CREATE TABLE goose_db_version(id INTEGER PRIMARY KEY AUTOINCREMENT,version_id INTEGER NOT NULL,is_applied BOOLEAN NOT NULL,tstamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP); INSERT INTO goose_db_version(version_id,is_applied) VALUES(0,1),(11,1); PRAGMA journal_mode=WAL;`); err != nil {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
@@ -44,8 +44,12 @@ func execMigrationSQL(t *testing.T, db *sql.DB, query string) {
 
 func TestMigrationNewDatabaseAndReadOnlyInspection(t *testing.T) {
 	ctx := context.Background()
-	path, db := migrationFixture(t)
-	if err := db.Close(); err != nil {
+	path := filepath.Join(t.TempDir(), "core.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(path)
@@ -57,7 +61,7 @@ func TestMigrationNewDatabaseAndReadOnlyInspection(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := InspectMigration(ctx, path)
-	if err != nil || status != (MigrationStatus{Current: 11, Target: 11}) {
+	if err != nil || status != (MigrationStatus{Current: 11, Target: 11, SchemaCurrent: 12, SchemaTarget: 12}) {
 		t.Fatalf("new database: %+v %v", status, err)
 	}
 	after, err := os.ReadFile(path)
@@ -73,7 +77,7 @@ func TestMigrationNewDatabaseAndReadOnlyInspection(t *testing.T) {
 	}
 	missing := filepath.Join(t.TempDir(), "uncreated", "core.db")
 	status, err = InspectMigration(ctx, missing)
-	if err != nil || status != (MigrationStatus{Target: 11, Missing: true}) {
+	if err != nil || status != (MigrationStatus{Target: 11, SchemaTarget: 12, Missing: true}) {
 		t.Fatalf("missing database: %+v %v", status, err)
 	}
 	if err = Migrate(ctx, missing); err != nil {
@@ -96,7 +100,7 @@ func TestMigrationAdoptsOnlySupportedBaselineAndIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := InspectMigration(ctx, path)
-	if err != nil || status != (MigrationStatus{Current: 11, Target: 11, NeedsMigration: true}) {
+	if err != nil || status != (MigrationStatus{Current: 11, Target: 11, SchemaCurrent: 11, SchemaTarget: 12, NeedsMigration: true}) {
 		t.Fatalf("baseline inspection: %+v %v", status, err)
 	}
 	after, err := os.ReadFile(path)
@@ -118,7 +122,7 @@ func TestMigrationAdoptsOnlySupportedBaselineAndIsIdempotent(t *testing.T) {
 	}
 	defer st.Close()
 	var count int
-	if err = st.db.QueryRow("SELECT count(*) FROM goose_db_version").Scan(&count); err != nil || count != 2 {
+	if err = st.db.QueryRow("SELECT count(*) FROM goose_db_version").Scan(&count); err != nil || count != 3 {
 		t.Fatalf("baseline applied more than once: %d %v", count, err)
 	}
 }
