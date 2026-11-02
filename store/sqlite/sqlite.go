@@ -615,6 +615,9 @@ func (st *Store) forkWithCheckpoint(ctx context.Context, r core.ForkRequest, che
 			cursor = page.Next
 		}
 	}
+	if checkpoint != nil {
+		checkpoint("before_source_check")
+	}
 	st.write.Lock()
 	defer st.write.Unlock()
 	tx, err := st.db.BeginTx(ctx, nil)
@@ -626,6 +629,17 @@ func (st *Store) forkWithCheckpoint(ctx context.Context, r core.ForkRequest, che
 	var status string
 	if err = tx.QueryRowContext(ctx, "SELECT status,seq FROM rollouts WHERE id=?", r.SourceRolloutID).Scan(&status, &sequence); err != nil || status != "active" {
 		return state, core.ErrNotFound
+	}
+	// A concurrent branch deletion can leave this Rollout active while removing
+	// the source cursor or head captured before copying. Recheck both in the
+	// publication transaction, including for detached Forks.
+	var sourceExists int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM sessions s JOIN entries e ON e.rollout_id=s.rollout_id WHERE s.id=? AND s.rollout_id=? AND s.ready=1 AND e.id=? AND e.projection IS NOT NULL`, r.SourceID, r.SourceRolloutID, r.HeadID).Scan(&sourceExists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return state, core.ErrNotFound
+	}
+	if err != nil {
+		return state, err
 	}
 	if r.Mode == core.ForkDetached {
 		if err = tx.QueryRowContext(ctx, "SELECT status FROM rollouts WHERE id=?", r.RolloutID()).Scan(&status); err != nil || status != "building" {
