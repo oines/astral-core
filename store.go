@@ -45,6 +45,36 @@ type SessionDeleter interface {
 	DeleteSession(context.Context, string) error
 }
 
+// BranchDeleter is optional, atomic, idempotent Host maintenance. The Host must
+// close affected Sessions and prevent new execution before deleting a branch.
+// Unlike DeleteSession it can remove part of a shared Rollout. Detached Forks
+// are independent Rollouts and are not traversed. ErrConflict leaves everything
+// unchanged when a surviving Session or record still needs a removed node.
+type BranchDeleter interface {
+	DeleteBranch(context.Context, BranchDeleteRequest) (BranchDeleteResult, error)
+}
+
+// BranchDeleteRequest selects either SessionID or RolloutID, never both.
+// SessionID selects that Session's own history and its descendants. A shared
+// Fork's inherited ForkEntryID belongs to its ancestor and is retained; a Fork
+// with no own history still loses its execution state. A non-shared Session
+// selects its entire Rollout. RolloutID with EntryID selects an inclusive
+// history subtree; an empty EntryID or a root history node selects the entire
+// Rollout. Missing targets succeed without changes. IDs must not be reused.
+type BranchDeleteRequest struct {
+	SessionID string
+	RolloutID string
+	EntryID   string
+}
+
+// SessionIDs is sorted and includes every execution cursor removed by this
+// call. A retry after deletion succeeds with an empty SessionIDs slice; Hosts
+// retain their own durable maintenance intent when they need that original set.
+type BranchDeleteResult struct {
+	RolloutID  string
+	SessionIDs []string
+}
+
 // Record pairs immutable history with the branch projection at that node.
 // Operational entries have no Projection.
 type Record struct {

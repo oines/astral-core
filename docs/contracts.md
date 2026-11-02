@@ -107,6 +107,12 @@ MayEndRun 要求唯一 ToolCall，允许 Reasoning、不允许普通正文。返
 
 可选维护接口 SessionDeleter.DeleteSession 由 Memory 和 SQLite 实现。Host 必须先停止并关闭目标 Session、阻止新的执行，再调用原子、幂等的永久删除；它清除私有 Rollout 的历史、Attempt、输入、队列与提交回执。多个 Session 共享同一 Rollout 时返回 ErrConflict，保留全部数据。Detached Fork 拥有独立副本，不受来源删除影响。删除业务元数据、索引和恢复未完成维护由 Host 负责，不调用模型或工具。
 
+可选维护接口 `BranchDeleter.DeleteBranch(ctx, BranchDeleteRequest)` 由 Memory 和 SQLite 实现，用于共享 Rollout 的递归删枝，不改变原有 `DeleteSession` 契约。请求只选择 `SessionID` 或 `RolloutID`：按 Session 选择时，共享 Fork 仅删除该 Session 自己追加的历史及其在同一 Rollout 中的所有历史后代，保留祖先的 `Creation.ForkEntryID`；尚未追加历史的共享 Fork 仍删除其执行状态和操作记录。非共享 Session 选择整个自身 Rollout，包括它的共享 Fork。按 Rollout 选择时，`EntryID` 指定包含起点的历史子树；省略 EntryID 或选择根历史节点表示整个 Rollout。Detached Fork 的独立 Rollout 不随来源删枝删除，Fork 的来源标识只保留出处，不构成跨 Rollout 的删除依赖。
+
+删枝原子移除受影响 Session 的状态、输入、Pending、Attempt、提交回执及分支操作记录；删除范围之前的祖先历史即使由被删 Session 写入，也保留给存活分支。返回 `BranchDeleteResult`，包含 RolloutID 和排序后的实际删除 SessionIDs。Host 必须在调用前停止、关闭所有受影响 Session 并阻止新的执行，负责保存业务删除意图、处理自己的关系和外部索引；Core 不解释 Host 的任务、权限或父子关系。不存在的目标幂等成功，不重复使用已删除身份；重试的 SessionIDs 可以为空，Host 不依赖该列表恢复第一次调用的结果。
+
+存活 Session、历史 Projection、工具状态、Pending、输入回执和全部 Attempt 的固定模型输入等持久引用都会受保护，不只检查当前 Head。若存活数据仍需要拟删节点，返回 ErrConflict 且不改变任何数据。独有 payload 随 owner 引用删除回收，其他分支和 Rollout 的引用继续保留正文。SQLite 在单次立即事务中选择、核对和删除；Memory 在单次写锁中完成。并发 Fork 在最终发布时重新核对来源 Session 和历史边界，不能从已删除的缓存节点重新创建分支。逻辑格式 11 与 schema 12 不变；数据库文件的物理缩小仍由 Reclaim 负责。
+
 Commit 包含稳定 ID、ExpectedVersion、Entries 和 Attempts 变更。Store 在一次原子操作中检查 CAS、分配 Rollout Sequence、执行同一个 Reduce 与 ApplyAttemptMutation、保存记录、Projection、RuntimeState、Attempt、Pending、Input 索引及回执。只有 Attempt 变更的提交仍推进 Session Version，Receipt 的 FirstSequence/LastSequence 均为零，不占用 Rollout Sequence。Entry.Version 是写入 Session 的本地版本；Entry.Sequence 是 Rollout 顺序，两者独立。创建 Attempt 时必须验证固定 Head 的协议完整性、Configuration 引用与归属；成功结果只能关联同一提交中新写入的合法节点。
 
 确认前 Session 不推进缓存。错误后最多用独立 5 秒 Context 查询 LookupCommit，验证 ID、Digest、Version 和 CurrentVersion；其他所有者已推进版本时仍停止。相同 Commit ID 相同内容幂等，不同内容冲突。Reload 只供 Host 重新建立独占所有权后的空闲句柄使用。

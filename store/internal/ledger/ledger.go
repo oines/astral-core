@@ -721,6 +721,14 @@ func (st *Store) Fork(ctx context.Context, r core.ForkRequest) (core.RuntimeStat
 	if rollout == nil || rollout.Status != "active" {
 		return state, core.ErrNotFound
 	}
+	// A branch may have been removed while a detached Fork copied history or
+	// while a shared Fork waited to publish. Never publish from a cached head
+	// after its source Session or immutable boundary has disappeared.
+	source = st.Sessions[r.SourceID]
+	currentHead, headExists := rollout.Records[r.HeadID]
+	if source == nil || source.State.RolloutID != r.SourceRolloutID || !headExists || currentHead.Projection == nil {
+		return state, core.ErrNotFound
+	}
 	if detached != nil {
 		if st.Rollouts[detached.ID] != nil {
 			return state, core.ErrConflict
