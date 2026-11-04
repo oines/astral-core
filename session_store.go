@@ -185,7 +185,11 @@ func (s *Session) pruneWindow() {
 	s.setWindow(out)
 }
 func (s *Session) loadWindow(ctx context.Context, state RuntimeState) ([]Entry, error) {
-	return loadContextWindow(ctx, s.config.Store, state.RolloutID, state.Branch, s.config.MaxContextBytes)
+	entries, err := loadContextWindow(ctx, s.config.Store, state.RolloutID, state.Branch, s.config.MaxContextBytes)
+	if err == nil {
+		err = validateWindowBodies(entries)
+	}
+	return entries, err
 }
 
 // ReadContext projects one immutable node's bounded context, independent of a

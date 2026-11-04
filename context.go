@@ -77,9 +77,9 @@ func projectBorrowed(path []Entry) (Context, error) {
 	return projectPath(path, true)
 }
 
-// projectPrepared rebuilds a path already checked by projectBorrowed, plus
-// validated input/collector messages and a text-only compaction summary. It
-// retains timeline and protocol checks without revalidating immutable bodies.
+// projectPrepared rebuilds Session-owned history whose effective bodies were
+// validated on load or admission, plus validated input/collector messages and a
+// text-only compaction summary. Timeline and protocol checks still run.
 func projectPrepared(path []Entry) (Context, error) {
 	return projectPath(path, false)
 }
@@ -96,27 +96,11 @@ func projectPath(path []Entry, validate bool) (Context, error) {
 	if len(path) > 0 {
 		view.HeadID = path[len(path)-1].ID
 	}
-	start := 0
-	var checkpoint *Entry
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i].Kind == EntryCompaction {
-			e := path[i]
-			checkpoint = &e
-			break
-		}
+	start, checkpoint, err := projectionWindowStart(path)
+	if err != nil {
+		return Context{}, err
 	}
 	if checkpoint != nil {
-		found := false
-		for i, e := range path {
-			if e.ID == checkpoint.Compaction.ThroughID {
-				start = i + 1
-				found = true
-				break
-			}
-		}
-		if !found {
-			return Context{}, fmt.Errorf("%w: compaction boundary missing", ErrCorrupt)
-		}
 		view.Request.Messages = append(view.Request.Messages, Message{Role: RoleUser, ContextKind: "summary", Content: Text(checkpoint.Compaction.Summary)})
 		view.Sources = append(view.Sources, checkpoint.ID)
 	}
@@ -203,6 +187,83 @@ func projectPath(path []Entry, validate bool) (Context, error) {
 	}
 	view.anchor = contextUsageAnchorFor(path, view.Sources)
 	return view, nil
+}
+
+func projectionWindowStart(path []Entry) (int, *Entry, error) {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i].Kind != EntryCompaction {
+			continue
+		}
+		checkpoint := &path[i]
+		if checkpoint.Compaction != nil {
+			for j := range path {
+				if path[j].ID == checkpoint.Compaction.ThroughID {
+					return j + 1, checkpoint, nil
+				}
+			}
+		}
+		return 0, nil, fmt.Errorf("%w: compaction boundary missing", ErrCorrupt)
+	}
+	return 0, nil, nil
+}
+
+// validateWindowBodies admits effective immutable history into a Session. It
+// mirrors projectPath's visibility, but deliberately accepts unfinished tool
+// batches so OpenSession can recover them. Each request still checks ordering.
+func validateWindowBodies(path []Entry) error {
+	start, _, err := projectionWindowStart(path)
+	if err != nil {
+		return err
+	}
+	visible := path[start:]
+	results := map[string]Entry{}
+	controls := map[string]bool{}
+	for _, e := range visible {
+		if e.Kind == EntryToolResult || e.Kind == EntryToolResolution || e.Kind == EntryToolControl {
+			if e.Tool == nil {
+				return fmt.Errorf("%w: missing tool payload", ErrCorrupt)
+			}
+			results[resultKey(e.Tool.Invocation.AssistantID, e.Tool.Invocation.Call.ID)] = e
+			if e.Kind == EntryToolControl {
+				controls[e.Tool.Invocation.AssistantID] = true
+			}
+		}
+	}
+	for _, e := range visible {
+		if e.Kind != EntryMessage && e.Kind != EntryContext {
+			continue
+		}
+		if e.Message == nil {
+			return fmt.Errorf("%w: missing message payload", ErrCorrupt)
+		}
+		if e.Kind == EntryMessage && (e.Message.Failed() || controls[e.ID]) {
+			continue
+		}
+		if err := validateMessage(*e.Message); err != nil {
+			return err
+		}
+		if e.Kind != EntryMessage {
+			continue
+		}
+		for _, call := range e.Message.ToolCalls() {
+			result, ok := results[resultKey(e.ID, call.ID)]
+			if !ok { // Recovery may still need to deliver this result.
+				continue
+			}
+			if result.Tool.Result == nil {
+				return fmt.Errorf("%w: missing tool result", ErrCorrupt)
+			}
+			r := result.Tool.Result
+			content := r.Content
+			if len(content) == 0 {
+				content = Text("")
+			}
+			if err := validateMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: content, IsError: r.IsError}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func contextUsageAnchorFor(path []Entry, sources []string) *contextUsageAnchor {

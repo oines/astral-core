@@ -79,7 +79,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	old, err := projectBorrowed(path)
+	old, err := projectPrepared(path)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
@@ -217,7 +217,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	var execution RequestExecution
 	if options.generation {
-		execution, err = prepareRequestExecution(ctx, model, candidate.Request)
+		execution, candidate.facts, err = prepareGenerationExecution(ctx, model, candidate.Request, candidate.facts)
 		if err != nil {
 			return preparedStep{}, summary, err
 		}

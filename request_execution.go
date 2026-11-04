@@ -39,6 +39,30 @@ func prepareRequestExecution(ctx context.Context, model Model, request Request) 
 	return preparer.PrepareExecution(ctx, request)
 }
 
+// The final request has passed validation and both budgets. Early usage facts
+// already contain its context SHA; overlap the remaining independent digest
+// with wire preparation, joining before errors or any commit can escape.
+func prepareGenerationExecution(ctx context.Context, model Model, request Request, facts *requestFacts) (RequestExecution, *requestFacts, error) {
+	if facts == nil || facts.requestDigest != "" || !facts.matches(request) {
+		execution, err := prepareRequestExecution(ctx, model, request)
+		return execution, facts, err
+	}
+	done := make(chan string, 1)
+	go func() { done <- requestDigest(request) }()
+	execution, err := prepareRequestExecution(ctx, model, request)
+	digest := <-done
+	if err != nil {
+		return execution, facts, err
+	}
+	// Keep the original early measurement immutable. Its size used the output
+	// reservation; bind the new copy to the final, possibly clamped request.
+	prepared := *facts
+	prepared.size = facts.sizeForOutput(request.MaxOutputTokens)
+	prepared.source = request
+	prepared.requestDigest = digest // Empty stays a Freeze error, after execution.
+	return execution, &prepared, nil
+}
+
 type preparedExecutionModel struct {
 	Model
 	execution RequestExecution
