@@ -39,6 +39,10 @@ type RequestChange struct {
 // FreezeRequest does no I/O. base must be the projection of the nodes being
 // atomically committed with the attempt, or an existing immutable boundary.
 func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSpec) (RequestInput, error) {
+	return freezeRequest(rolloutID, base, request, spec, nil)
+}
+
+func freezeRequest(rolloutID string, base Context, request Request, spec ModelSpec, facts *requestFacts) (RequestInput, error) {
 	input := RequestInput{RolloutID: rolloutID, HeadID: base.HeadID, ConfigurationID: base.ConfigurationID, Model: spec}
 	if rolloutID == "" || base.HeadID == "" || base.ConfigurationID == "" || request.ModelID != spec.ID {
 		return input, fmtInvalid("request input needs an immutable context boundary and model")
@@ -60,7 +64,10 @@ func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 	if err != nil {
 		return input, err
 	}
-	input.Digest = requestDigest(request)
+	input.Digest = facts.frozenDigest(request)
+	if input.Digest == "" {
+		input.Digest = requestDigest(request)
+	}
 	if input.Digest == "" {
 		return input, ErrInvalid
 	}

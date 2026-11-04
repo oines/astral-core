@@ -189,12 +189,33 @@ type requestFacts struct {
 	contextSuffix []byte
 	usageIndex    int
 	usageDigest   string
+	requestDigest string
 }
 
 // measurePreparedRequest counts the actual typed JSON and captures the
 // provenance SHA prefix during that same traversal of the message body.
 func measurePreparedRequest(request Request) (*requestFacts, error) {
 	return measureRequestFacts(request, -1)
+}
+
+// Both hashes read the same immutable final request. Always join, including
+// measurement errors, so a rejected budget never leaves background work alive.
+func measureGenerationRequest(request Request) (*requestFacts, error) {
+	done := make(chan string, 1)
+	go func() { done <- requestDigest(request) }()
+	facts, err := measurePreparedRequest(request)
+	digest := <-done
+	if err == nil {
+		facts.requestDigest = digest
+	}
+	return facts, err
+}
+
+func (facts *requestFacts) frozenDigest(request Request) string {
+	if facts == nil || facts.requestDigest == "" || facts.source.MaxOutputTokens != request.MaxOutputTokens || !facts.matches(request) {
+		return ""
+	}
+	return facts.requestDigest
 }
 
 func measureRequestFacts(request Request, usageIndex int) (*requestFacts, error) {

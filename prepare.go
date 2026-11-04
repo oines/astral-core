@@ -164,7 +164,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		return preparedStep{}, summary, err
 	}
 	incomingMessages := clone(candidate.Request.Messages[len(old.Request.Messages):])
-	candidate, budgetErr := s.fitContext(ctx, model, candidate)
+	candidate, budgetErr := s.fitContext(ctx, model, candidate, options.generation)
 	if budgetErr != nil && !errors.Is(budgetErr, ErrBudget) && !options.compact {
 		return preparedStep{}, summary, budgetErr
 	}
@@ -177,7 +177,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 			incoming := old
 			incoming.anchor = nil
 			incoming.Request.Messages = incomingMessages
-			incoming, incomingErr := s.fitContext(ctx, model, incoming)
+			incoming, incomingErr := s.fitContext(ctx, model, incoming, false)
 			if incomingErr != nil {
 				return preparedStep{}, summary, incomingErr
 			}
@@ -204,7 +204,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 				return preparedStep{}, summary, err
 			}
 			drafts = append([]Entry{compaction}, drafts...)
-			candidate, err = s.fitContext(ctx, model, candidate)
+			candidate, err = s.fitContext(ctx, model, candidate, options.generation)
 			if err != nil {
 				return preparedStep{}, summary, err
 			}
@@ -262,7 +262,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	var attempt *ModelAttempt
 	if options.generation {
-		input, err := freezeModelRequest(s.rolloutID, base, candidate.Request, model)
+		input, err := freezeModelRequest(s.rolloutID, base, candidate.Request, model, candidate.facts)
 		if err != nil {
 			return preparedStep{}, summary, err
 		}
@@ -324,7 +324,7 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 	return view, nil
 }
 
-func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Context, error) {
+func (s *Session) fitContext(ctx context.Context, model Model, view Context, generation bool) (Context, error) {
 	view, err := s.measureContext(ctx, model, view)
 	if err != nil {
 		return view, err
@@ -341,7 +341,11 @@ func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Co
 	}
 	facts := view.facts
 	if facts == nil || !facts.matches(view.Request) {
-		facts, err = measurePreparedRequest(view.Request)
+		if generation {
+			facts, err = measureGenerationRequest(view.Request)
+		} else {
+			facts, err = measurePreparedRequest(view.Request)
+		}
 		if err != nil {
 			return view, err
 		}

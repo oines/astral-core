@@ -247,12 +247,12 @@ func TestFitContextReusesUsageFactsWithFinalOutputDigits(t *testing.T) {
 				t.Fatal(err)
 			}
 			s := Session{config: Config{Budget: BudgetPolicy{OutputTokens: reservation, SafetyMargin: 1}, MaxContextBytes: len(raw)}}
-			got, err := s.fitContext(context.Background(), model, view)
+			got, err := s.fitContext(context.Background(), model, view, false)
 			if err != nil || got.Request.MaxOutputTokens != output || got.facts == nil || got.facts.source.MaxOutputTokens != reservation || got.facts.usageDigest == "" || got.facts.sizeForOutput(output) != len(raw) {
 				t.Fatalf("fit lost early measurement or final digits: output=%d view=%+v err=%v", output, got, err)
 			}
 			s.config.MaxContextBytes--
-			_, err = s.fitContext(context.Background(), model, view)
+			_, err = s.fitContext(context.Background(), model, view, false)
 			var budget *BudgetError
 			if !errors.As(err, &budget) || budget.Input != len(raw) || budget.Window != len(raw)-1 {
 				t.Fatalf("final byte budget changed at exact boundary: want=%d/%d got=%v", len(raw), len(raw)-1, err)

@@ -79,8 +79,8 @@ func resolvedOptions(model Model) GenerationOptions {
 	return clone(model.(estimatedModel).options)
 }
 
-func freezeModelRequest(rolloutID string, base Context, request Request, model Model) (RequestInput, error) {
-	input, err := FreezeRequest(rolloutID, base, request, model.Spec())
+func freezeModelRequest(rolloutID string, base Context, request Request, model Model, facts *requestFacts) (RequestInput, error) {
+	input, err := freezeRequest(rolloutID, base, request, model.Spec(), facts)
 	if err == nil {
 		input.Snapshot = append(json.RawMessage(nil), model.(estimatedModel).snapshot...)
 	}
