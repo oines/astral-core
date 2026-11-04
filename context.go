@@ -74,6 +74,17 @@ func project(path []Entry) (Context, error) {
 // headers are new, but message/configuration payloads still belong to immutable
 // entries. External callbacks and public results must receive owned copies.
 func projectBorrowed(path []Entry) (Context, error) {
+	return projectPath(path, true)
+}
+
+// projectPrepared rebuilds a path already checked by projectBorrowed, plus
+// validated input/collector messages and a text-only compaction summary. It
+// retains timeline and protocol checks without revalidating immutable bodies.
+func projectPrepared(path []Entry) (Context, error) {
+	return projectPath(path, false)
+}
+
+func projectPath(path []Entry, validate bool) (Context, error) {
 	configuration, configurationID, err := effectiveConfiguration(path)
 	if err != nil {
 		return Context{}, err
@@ -187,7 +198,7 @@ func projectBorrowed(path []Entry) (Context, error) {
 			add(*e.Message, e.ID)
 		}
 	}
-	if err = validateProtocol(view.Request.Messages); err != nil {
+	if err = checkProtocol(view.Request.Messages, validate); err != nil {
 		return Context{}, err
 	}
 	view.anchor = contextUsageAnchorFor(path, view.Sources)

@@ -254,7 +254,9 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 			canonicalPath = append(canonicalPath, draft)
 		}
 	}
-	base, err := projectBorrowed(canonicalPath)
+	// path was checked above; drafts contain only admitted inputs, validated
+	// collector context and the generated text summary. Recheck their ordering.
+	base, err := projectPrepared(canonicalPath)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
