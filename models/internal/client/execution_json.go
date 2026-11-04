@@ -22,8 +22,8 @@ type executionImage struct {
 const executionImagePrefix = `"\u0000astral-image-`
 
 // marshalExecutionBody leaves JSON syntax, key ordering, escaping and opaque
-// values to encoding/json. Only large, verified unescaped ASCII strings are spliced
-// into one final allocation, avoiding the encoder's large buffer and final copy.
+// values to encoding/json. Large strings are spliced into one final allocation;
+// strings needing escaping are encoded once by encoding/json before that splice.
 func marshalExecutionBody(body map[string]any) ([]byte, error) {
 	var images []executionImage
 	metadata, changed, supported := executionImageMetadata(body, &images, 0)
@@ -142,12 +142,21 @@ func executionImageMetadata(value any, images *[]executionImage, depth int) (any
 		}
 		return value, false, true
 	case string:
-		if len(value) < 1024 || !executionASCIIImageURL(value) && !jsonstring.UnescapedASCII(value) {
+		if len(value) < 1024 {
 			return value, false, true
 		}
 		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)
 		marker = append(marker, `\u0000"`...)
-		*images = append(*images, executionImage{marker: marker, value: value})
+		image := executionImage{marker: marker}
+		if executionASCIIImageURL(value) || jsonstring.UnescapedASCII(value) {
+			image.value = value
+		} else {
+			// A Go string always marshals successfully. Keep the standard encoder's
+			// exact escaped content, including HTML and invalid UTF-8 handling.
+			encoded, _ := json.Marshal(value)
+			image.data = encoded[1 : len(encoded)-1]
+		}
+		*images = append(*images, image)
 		return json.RawMessage(marker), true, true
 	case executionImageValue:
 		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)

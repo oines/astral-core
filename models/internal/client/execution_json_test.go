@@ -125,10 +125,15 @@ func TestExecutionJSONLargeTextMatchesStandardEncoder(t *testing.T) {
 		"marker-collision": "\x00astral-image-0\x00" + plain,
 	} {
 		t.Run(name, func(t *testing.T) {
+			var replacements []executionImage
+			_, changed, supported := executionImageMetadata(value, &replacements, 0)
+			if !changed || !supported || len(replacements) != 1 {
+				t.Fatal("large text did not use the existing segment path")
+			}
 			body := map[string]any{"system": plain, "messages": []any{map[string]any{"role": "tool", "content": value}, map[string]any{"role": "assistant", "content": plain}}, "raw": json.RawMessage(`{"html":"<>&","number":9007199254740993}`)}
 			want, wantErr := json.Marshal(body)
 			got, err := marshalExecutionBody(body)
-			if wantErr != nil || err != nil || !bytes.Equal(got, want) {
+			if wantErr != nil || err != nil || !bytes.Equal(got, want) || cap(got) != len(got) {
 				t.Fatalf("large text changed JSON bytes: old=%v new=%v", wantErr, err)
 			}
 			after, _ := json.Marshal(body)
@@ -160,7 +165,7 @@ func TestExecutionJSONLargeTextEveryByteMatchesStandardEncoder(t *testing.T) {
 			body := map[string]any{"content": string(value)}
 			want, _ := json.Marshal(body)
 			got, err := marshalExecutionBody(body)
-			if err != nil || !bytes.Equal(got, want) {
+			if err != nil || !bytes.Equal(got, want) || cap(got) != len(got) {
 				t.Fatalf("byte %02x at %d changed JSON output: %v", b, position, err)
 			}
 		}
