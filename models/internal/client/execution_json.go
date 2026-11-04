@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unsafe"
+
+	"github.com/oines/astral-core/internal/jsonstring"
 )
 
 type executionImage struct {
@@ -20,7 +22,7 @@ type executionImage struct {
 const executionImagePrefix = `"\u0000astral-image-`
 
 // marshalExecutionBody leaves JSON syntax, key ordering, escaping and opaque
-// values to encoding/json. Only large, verified ASCII image strings are spliced
+// values to encoding/json. Only large, verified unescaped ASCII strings are spliced
 // into one final allocation, avoiding the encoder's large buffer and final copy.
 func marshalExecutionBody(body map[string]any) ([]byte, error) {
 	var images []executionImage
@@ -140,7 +142,7 @@ func executionImageMetadata(value any, images *[]executionImage, depth int) (any
 		}
 		return value, false, true
 	case string:
-		if !executionASCIIImageURL(value) {
+		if len(value) < 1024 || !executionASCIIImageURL(value) && !jsonstring.UnescapedASCII(value) {
 			return value, false, true
 		}
 		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)

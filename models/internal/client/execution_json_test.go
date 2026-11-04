@@ -110,3 +110,59 @@ func TestExecutionJSONOptimizesOnlyValidatedASCIIImageURLs(t *testing.T) {
 		}
 	}
 }
+
+func TestExecutionJSONLargeTextMatchesStandardEncoder(t *testing.T) {
+	plain := strings.Repeat("Ordinary tool output 123 /._- !? ", 80)
+	for name, value := range map[string]string{
+		"plain":            plain,
+		"html":             plain + "<>&",
+		"quote":            plain + `"`,
+		"backslash":        plain + `\`,
+		"newline":          plain + "\n",
+		"controls":         plain + "\x00\b\t\r\x1f",
+		"unicode":          plain + "中文🙂\u2028\u2029",
+		"invalid-utf8":     plain + string([]byte{0xff, 0xfe}),
+		"marker-collision": "\x00astral-image-0\x00" + plain,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := map[string]any{"system": plain, "messages": []any{map[string]any{"role": "tool", "content": value}, map[string]any{"role": "assistant", "content": plain}}, "raw": json.RawMessage(`{"html":"<>&","number":9007199254740993}`)}
+			want, wantErr := json.Marshal(body)
+			got, err := marshalExecutionBody(body)
+			if wantErr != nil || err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("large text changed JSON bytes: old=%v new=%v", wantErr, err)
+			}
+			after, _ := json.Marshal(body)
+			if !bytes.Equal(after, want) {
+				t.Fatal("large text encoding mutated the public input")
+			}
+		})
+	}
+	for _, size := range []int{1023, 1024, 1025, 4096} {
+		value := strings.Repeat("x", size)
+		var replacements []executionImage
+		_, changed, supported := executionImageMetadata(value, &replacements, 0)
+		if !supported || changed != (size >= 1024) {
+			t.Fatalf("large text cutoff changed at %d: changed=%v supported=%v", size, changed, supported)
+		}
+		raw, err := marshalExecutionBody(map[string]any{"content": value})
+		want, _ := json.Marshal(map[string]any{"content": value})
+		if err != nil || !bytes.Equal(raw, want) || changed && cap(raw) != len(raw) {
+			t.Fatalf("large text final allocation/bytes changed at %d: %v", size, err)
+		}
+	}
+}
+
+func TestExecutionJSONLargeTextEveryByteMatchesStandardEncoder(t *testing.T) {
+	for _, position := range []int{0, 7, 8, 15, 16, 1023, 1024, 2047} {
+		value := bytes.Repeat([]byte{'a'}, 2048)
+		for b := range 256 {
+			value[position] = byte(b)
+			body := map[string]any{"content": string(value)}
+			want, _ := json.Marshal(body)
+			got, err := marshalExecutionBody(body)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("byte %02x at %d changed JSON output: %v", b, position, err)
+			}
+		}
+	}
+}
