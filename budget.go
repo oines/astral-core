@@ -25,7 +25,10 @@ func estimate(ctx context.Context, model Model, request Request) (tokens int, er
 	if !ok || estimator.estimate == nil {
 		return 0, fmtInvalid("session token estimator is required")
 	}
-	tokens, err = estimator.estimate(ctx, estimator.Model, clone(request))
+	if !estimator.estimateReadOnly {
+		request = cloneRequest(request)
+	}
+	tokens, err = estimator.estimate(ctx, estimator.Model, request)
 	if err == nil && tokens < 0 {
 		err = fmtInvalid("model estimator returned a negative count")
 	}

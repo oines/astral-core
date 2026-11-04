@@ -48,7 +48,7 @@ func (s *Session) boundResult(ctx context.Context, inv Invocation, result ToolRe
 		}
 		request.Messages = append(request.Messages, message)
 	}
-	_, err = s.fitContext(ctx, model, Context{Request: request})
+	_, err = s.fitContext(ctx, model, Context{Request: request}, false)
 	if errors.Is(err, ErrBudget) {
 		return deliveryFailure(result, "result_too_large", "The output exceeds the model's delivery budget."), nil
 	}

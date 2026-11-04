@@ -11,12 +11,16 @@ import (
 type Config struct {
 	MaxContextBytes int
 	EstimateTokens  TokenEstimator
-	Model           Model
-	Selection       ModelSelection
-	Store           Store
-	SystemPrompt    string
-	Options         GenerationOptions
-	Tools           []Tool
+	// EstimateTokensReadOnly borrows immutable requests instead of receiving
+	// owned copies. The callback must not mutate or retain mutable access to
+	// any request data. Set exactly one estimator field.
+	EstimateTokensReadOnly TokenEstimator
+	Model                  Model
+	Selection              ModelSelection
+	Store                  Store
+	SystemPrompt           string
+	Options                GenerationOptions
+	Tools                  []Tool
 	// ResolveModel resolves a fresh selection, including mutable model defaults.
 	ResolveModel func(context.Context, ModelSelection) (ResolvedModel, error)
 	// RestoreModel reconstructs a previously frozen target without applying
@@ -25,10 +29,15 @@ type Config struct {
 	BeforeToolCall BeforeToolCall
 	AfterToolCall  AfterToolCall
 	CollectContext CollectContext
-	Retry          RetryPolicy
-	Budget         BudgetPolicy
-	Compaction     CompactionPolicy
-	MaxTurns       int
+	// CollectContextReadOnly borrows an immutable context instead of receiving
+	// an owned copy. The callback must not mutate or retain mutable access to
+	// any context data. Set at most one collector field. Returned messages are
+	// copied before validation and use, as with CollectContext.
+	CollectContextReadOnly CollectContext
+	Retry                  RetryPolicy
+	Budget                 BudgetPolicy
+	Compaction             CompactionPolicy
+	MaxTurns               int
 	// MaxParallelTools defaults to 8. A sequential declaration still serializes
 	// the whole batch, regardless of this limit.
 	MaxParallelTools int
@@ -37,7 +46,8 @@ type Config struct {
 	MaxSteeringPerTurn int
 }
 
-// ContextBoundary is an immutable view used to collect passive host context.
+// ContextBoundary describes the request boundary for passive host context.
+// Its ownership follows the configured collector field.
 type ContextBoundary struct {
 	SessionID    string
 	Reason       string

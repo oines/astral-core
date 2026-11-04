@@ -45,7 +45,10 @@ Preserve all still-relevant information from the previous summary, including goa
 	if instructions != "" {
 		prompt += "\nAdditional summarization instructions:\n" + instructions
 	}
-	out := clone(messages)
+	// The summary adds one instruction to an immutable candidate. Own only the
+	// list; projector/legacy boundaries handle any mutable model callbacks.
+	out := make([]Message, len(messages), len(messages)+1)
+	copy(out, messages)
 	out = append(out, User(prompt))
 	return out
 }

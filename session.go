@@ -63,7 +63,7 @@ func NewSession(ctx context.Context, config Config, options SessionOptions) (*Se
 		defaults.Tools = append(defaults.Tools, clone(tool.Definition()))
 	}
 	_, err = s.append(ctx, Entry{Kind: EntryCreated, Created: &CreationRecord{FormatVersion: FormatVersion, SessionID: s.id, RolloutID: newID()}}, Entry{Kind: EntryConfiguration, Configuration: &defaults})
-	if err == nil && s.config.CollectContext != nil {
+	if err == nil && (s.config.CollectContext != nil || s.config.CollectContextReadOnly != nil) {
 		_, _, err = s.prepareStep(ctx, prepareOptions{passiveOnly: true, reason: "created"})
 	}
 	if err != nil {
@@ -100,8 +100,14 @@ func OpenSession(ctx context.Context, config Config, id string) (*Session, error
 }
 
 func configureSession(config Config, id string) (*Session, error) {
-	if id == "" || config.Store == nil || config.EstimateTokens == nil {
+	if id == "" || config.Store == nil || config.EstimateTokens == nil && config.EstimateTokensReadOnly == nil {
 		return nil, fmtInvalid("ID, Store and EstimateTokens are required")
+	}
+	if config.EstimateTokens != nil && config.EstimateTokensReadOnly != nil {
+		return nil, fmtInvalid("set exactly one of EstimateTokens and EstimateTokensReadOnly")
+	}
+	if config.CollectContext != nil && config.CollectContextReadOnly != nil {
+		return nil, fmtInvalid("set at most one of CollectContext and CollectContextReadOnly")
 	}
 	modelID := ""
 	if config.Model != nil {

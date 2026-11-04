@@ -25,9 +25,19 @@ type ModelAttempt struct {
 // GenerationProvenance keeps the context-usage anchor self-contained on the
 // accepted history node, including when its operational attempts are not cloned.
 func GenerationProvenance(attempt ModelAttempt, request Request, reply Message) GenerationRecord {
-	covered := clone(request)
-	covered.Messages = append(covered.Messages, reply)
-	return GenerationRecord{AttemptID: attempt.ID, ConfigurationID: attempt.Input.ConfigurationID, ContextDigest: contextDigest(covered), Model: attempt.Input.Model}
+	if !requestStringsUTF8(request) {
+		// The original implementation normalized the request with a JSON round
+		// trip before appending the reply. Preserve that rare-input behavior.
+		request = clone(request)
+	}
+	return GenerationRecord{AttemptID: attempt.ID, ConfigurationID: attempt.Input.ConfigurationID, ContextDigest: contextDigestReply(request, &reply), Model: attempt.Input.Model}
+}
+
+func generationProvenanceWithFacts(attempt ModelAttempt, request Request, reply Message, facts *requestFacts) GenerationRecord {
+	if digest, valid := facts.contextDigestReply(request, reply); valid {
+		return GenerationRecord{AttemptID: attempt.ID, ConfigurationID: attempt.Input.ConfigurationID, ContextDigest: digest, Model: attempt.Input.Model}
+	}
+	return GenerationProvenance(attempt, request, reply)
 }
 
 type AttemptOutcome struct {

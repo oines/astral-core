@@ -72,6 +72,12 @@ func (s *Session) resumeGeneration(ctx context.Context, id string, options prepa
 	if err != nil {
 		return preparedStep{}, err
 	}
+	// Encoding must succeed before replacing the interrupted attempt, just as
+	// it does before committing a newly selected input boundary.
+	execution, err := prepareRequestExecution(ctx, model, request)
+	if err != nil {
+		return preparedStep{}, err
+	}
 	call := modelCall{runID: options.runID, turnID: options.turnID, purpose: "generation", base: base}
 	attempt, err := s.createAttempt(ctx, previous.Input, call, 1, &previous)
 	if err != nil {
@@ -79,5 +85,5 @@ func (s *Session) resumeGeneration(ctx context.Context, id string, options prepa
 	}
 	view := base
 	view.Request = request
-	return preparedStep{model: model, view: view, base: base, attempt: &attempt}, nil
+	return preparedStep{model: model, view: view, base: base, attempt: &attempt, execution: execution, executionPrepared: true}, nil
 }

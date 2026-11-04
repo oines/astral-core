@@ -35,6 +35,10 @@ func (m *Model) PrepareRequest(ctx context.Context, req core.Request) (core.Requ
 	return m.client.PrepareRequest(ctx, req)
 }
 
+func (m *Model) ProjectRequest(ctx context.Context, req core.Request) (core.Request, error) {
+	return m.client.ProjectRequest(ctx, req)
+}
+
 func (m *Model) SnapshotConfig() models.Config { return m.client.SnapshotConfig() }
 
 func (m *Model) Spec() core.ModelSpec { return m.client.Spec() }
@@ -42,29 +46,41 @@ func (m *Model) ValidateRequest(ctx context.Context, req core.Request) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := m.RequestBody(req)
+	_, err := m.requestBody(req, true)
 	return err
+}
+
+// ValidateRequestReadOnly uses the same checks; requestBody only reads its
+// source and copies containers before projecting image URLs.
+func (m *Model) ValidateRequestReadOnly(ctx context.Context, req core.Request) error {
+	return m.ValidateRequest(ctx, req)
 }
 
 func (m *Model) EstimateTokens(ctx context.Context, req core.Request) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	var err error
-	req, err = m.client.WireRequest(req, true)
-	if err != nil {
-		return 0, err
-	}
-	if err := m.client.Validate(req); err != nil {
-		return 0, err
-	}
-	return m.client.Estimate(req)
+	return m.client.EstimateRequest(req)
 }
 func str(m map[string]any, k string) string { v, _ := m[k].(string); return v }
 
 func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
+	owned, err := core.CopyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return m.requestBody(owned, false)
+}
+
+// requestBody only borrows caller-owned history during this synchronous build.
+// Validation uses small image placeholders; final execution resolves real pixels.
+func (m *Model) requestBody(req core.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, false)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +106,7 @@ func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
 	calls := map[string]callIdentity{}
 	for _, msg := range req.Messages {
 		parts := []any{}
-		for _, part := range msg.Content {
+		for i, part := range msg.Content {
 			if msg.Role == core.RoleAssistant && len(part.Metadata) > 0 {
 				if err := m.client.Replay(part, "google.part"); err != nil {
 					return nil, err
@@ -114,6 +130,10 @@ func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
 				parts = append(parts, map[string]any{"functionCall": map[string]any{"id": c.ID, "name": c.Name, "args": c.Arguments}})
 				calls[c.ID] = callIdentity{c.Name, c.ID}
 			case "image":
+				if data, ok := images.Base64(&msg.Content[i]); ok {
+					parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": part.MediaType, "data": data}})
+					continue
+				}
 				media, data, ok := strings.Cut(strings.TrimPrefix(part.URL, "data:"), ";base64,")
 				if !strings.HasPrefix(part.URL, "data:") || !ok || !strings.HasPrefix(media, "image/") {
 					return nil, fmt.Errorf("%w: Gemini requires a resolved image data URL", core.ErrInvalid)
@@ -245,10 +265,26 @@ type response struct {
 }
 
 func (m *Model) Stream(ctx context.Context, req core.Request, emit func(core.ModelEvent)) (core.Reply, error) {
-	body, err := m.RequestBody(req)
+	body, err := m.requestBody(req, false)
 	if err != nil {
 		return core.Reply{}, err
 	}
+	return m.streamBody(ctx, body, emit)
+}
+
+func (m *Model) PrepareExecution(ctx context.Context, req core.Request) (core.RequestExecution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	body, err := m.requestBody(req, false, true)
+	if err != nil {
+		return nil, err
+	}
+	return client.NewExecution(body, m.streamBody)
+}
+
+func (m *Model) streamBody(ctx context.Context, body any, emit func(core.ModelEvent)) (core.Reply, error) {
+	var err error
 	if emit == nil {
 		emit = func(core.ModelEvent) {}
 	}

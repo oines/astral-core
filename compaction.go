@@ -28,7 +28,7 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	return record, err
 }
 func (s *Session) draftCompaction(ctx context.Context, instructions string, normalModel Model, path []Entry, keepTokens int, force bool, runID, turnID string) (CompactionRecord, error) {
-	view, err := project(path)
+	view, err := projectBorrowed(path)
 	if err != nil {
 		return CompactionRecord{}, err
 	}
@@ -40,7 +40,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	for i := len(groups) - 1; i >= 0; i-- {
 		keepStart = groups[i].start
 		request := Request{ModelID: normalModel.Spec().ID, ModelRevision: normalModel.Spec().Revision, Messages: view.Request.Messages[keepStart:], MaxOutputTokens: outputReservation(s.config.Budget.OutputTokens, normalModel.Spec())}
-		request, err := PrepareRequest(ctx, normalModel, request)
+		request, err := projectRequest(ctx, normalModel, request)
 		if err != nil {
 			return CompactionRecord{}, err
 		}
@@ -119,13 +119,21 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 			source.Request.ModelID, source.Request.ModelRevision = normalModel.Spec().ID, normalModel.Spec().Revision
 			source.Request.MaxOutputTokens = outputReservation(s.config.Budget.OutputTokens, normalModel.Spec())
 			source.Request.Options = resolvedOptions(normalModel)
-			source.Request, err = PrepareRequest(ctx, normalModel, source.Request)
+			source.Request, err = projectRequest(ctx, normalModel, source.Request)
 			if err != nil {
 				return CompactionRecord{}, err
 			}
-			if !sameJSON(source.Request.Messages, selected) {
+			if !sameRequestMessages(source.Request.Messages, selected) {
 				source.anchor = nil
 			}
+		}
+	}
+	if hasReportedContextUsage(source) {
+		// Source is fixed throughout the candidate search. Retain this exact
+		// usage-prefix digest instead of re-reading its payload for every cap.
+		source.facts, err = measureRequestFacts(source.Request, source.anchor.index)
+		if err != nil {
+			return CompactionRecord{}, err
 		}
 	}
 	summaryModelID := summaryModel.Spec().ID
@@ -140,7 +148,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	build := func(messages []Message) (Request, error) {
 		candidate := baseRequest
 		candidate.Messages = summaryMessages(messages, instructions)
-		return PrepareRequest(ctx, summaryModel, candidate)
+		return projectRequest(ctx, summaryModel, candidate)
 	}
 	check := func(request Request) (int, error) {
 		tokens, err := estimateCompaction(ctx, summaryModel, source, request)
@@ -169,19 +177,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 		}
 		for cap > 0 && errors.Is(fitErr, ErrBudget) {
 			cap /= 2
-			trimmed := clone(selected)
-			for i := range trimmed {
-				if trimmed[i].Role != RoleTool {
-					continue
-				}
-				for j := range trimmed[i].Content {
-					text := trimmed[i].Content[j].Text
-					if utf8.RuneCountInString(text) > cap {
-						runes := []rune(text)
-						trimmed[i].Content[j].Text = string(runes[:cap]) + "\n[tool output shortened for summary; original preserved in history]"
-					}
-				}
-			}
+			trimmed := shortenedToolMessages(selected, cap)
 			request, err = build(trimmed)
 			if err != nil {
 				return CompactionRecord{}, err
@@ -215,6 +211,42 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	}
 	record := CompactionRecord{AttemptID: reply.attemptID, ThroughID: path[through].ID, Summary: summary, ModelID: summaryModelID, ModelRevision: request.ModelRevision, Options: request.Options, InputTokens: inputTokens, Usage: reply.Usage, Instructions: instructions}
 	return record, nil
+}
+
+// Candidates borrow immutable payloads. Only the message/content containers
+// containing shortened text are copied; frozen images never move per round.
+func shortenedToolMessages(messages []Message, limit int) []Message {
+	trimmed := append([]Message(nil), messages...)
+	for i, message := range messages {
+		if message.Role != RoleTool {
+			continue
+		}
+		copied := false
+		for j, part := range message.Content {
+			if utf8.RuneCountInString(part.Text) <= limit {
+				continue
+			}
+			if !copied {
+				trimmed[i].Content = append([]Content(nil), message.Content...)
+				copied = true
+			}
+			cut := len(part.Text)
+			count := 0
+			for at := range part.Text {
+				if count == limit {
+					cut = at
+					break
+				}
+				count++
+			}
+			prefix := part.Text[:cut]
+			if !utf8.ValidString(prefix) {
+				prefix = string([]rune(part.Text)[:limit])
+			}
+			trimmed[i].Content[j].Text = prefix + "\n[tool output shortened for summary; original preserved in history]"
+		}
+	}
+	return trimmed
 }
 
 type messageGroup struct{ start, end int }

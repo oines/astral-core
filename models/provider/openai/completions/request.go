@@ -10,10 +10,27 @@ import (
 	"github.com/oines/astral-core/models/internal/client"
 )
 
+const toolImageHint = "\n[Image returned by this tool; attached after the tool-result batch.]"
+
 // RequestBody is the exact credential-free JSON body used for this request.
 func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
+	owned, err := astral.CopyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return m.requestBody(owned, false)
+}
+
+// requestBody only borrows caller-owned history during this synchronous build.
+// Validation uses small image placeholders and does not materialize joined text;
+// final execution resolves real pixels and includes the complete text.
+func (m *Model) requestBody(req astral.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, false)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +53,7 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 			flushImages()
 		}
 		if message.Role == astral.RoleAssistant {
-			value, err := m.assistant(message)
+			value, err := m.assistant(message, validation)
 			if err != nil {
 				return nil, err
 			}
@@ -45,17 +62,38 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 		}
 		if message.Role == astral.RoleTool {
 			var text strings.Builder
-			for _, part := range message.Content {
+			if !validation {
+				size := 0
+				for _, part := range message.Content {
+					n := 0
+					if part.Type == "text" {
+						n = len(part.Text)
+					} else if part.Type == "image" {
+						n = len(toolImageHint)
+					}
+					if n > int(^uint(0)>>1)-size {
+						size = 0 // Preserve the original growth strategy on overflow.
+						break
+					}
+					size += n
+				}
+				text.Grow(size)
+			}
+			for i, part := range message.Content {
 				switch part.Type {
 				case "text":
-					text.WriteString(part.Text)
+					if !validation {
+						text.WriteString(part.Text)
+					}
 				case "image":
 					if part.URL == "" {
 						return nil, fmt.Errorf("%w: tool image requires a resolved URL", astral.ErrInvalid)
 					}
-					text.WriteString("\n[Image returned by this tool; attached after the tool-result batch.]")
+					if !validation {
+						text.WriteString(toolImageHint)
+					}
 					toolImages = append(toolImages, map[string]any{"type": "text", "text": "Image from tool call " + message.ToolCallID + ":"},
-						map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
+						map[string]any{"type": "image_url", "image_url": map[string]any{"url": images.URL(&message.Content[i])}})
 				default:
 					return nil, fmt.Errorf("%w: unsupported tool output part %q", astral.ErrInvalid, part.Type)
 				}
@@ -63,7 +101,7 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": message.ToolCallID, "content": text.String()})
 			continue
 		}
-		parts, err := inputParts(message.Content)
+		parts, err := inputParts(message.Content, images)
 		if err != nil {
 			return nil, err
 		}
@@ -140,9 +178,9 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 	return body, nil
 }
 
-func inputParts(parts []astral.Content) ([]any, error) {
+func inputParts(parts []astral.Content, images client.ExecutionImages) ([]any, error) {
 	result := make([]any, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
 		switch part.Type {
 		case "text":
 			result = append(result, map[string]any{"type": "text", "text": part.Text})
@@ -150,7 +188,7 @@ func inputParts(parts []astral.Content) ([]any, error) {
 			if part.URL == "" {
 				return nil, fmt.Errorf("%w: image requires a resolved URL or data URL", astral.ErrInvalid)
 			}
-			result = append(result, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
+			result = append(result, map[string]any{"type": "image_url", "image_url": map[string]any{"url": images.URL(&parts[i])}})
 		default:
 			return nil, fmt.Errorf("%w: unsupported chat input part %q", astral.ErrInvalid, part.Type)
 		}
@@ -168,9 +206,10 @@ func (m *Model) replayField() string {
 	return "reasoning_content"
 }
 
-func (m *Model) assistant(message astral.Message) (map[string]any, error) {
+func (m *Model) assistant(message astral.Message, validation bool) (map[string]any, error) {
 	wire := map[string]any{"role": "assistant", "content": nil}
 	var text strings.Builder
+	hasText := false
 	var calls []any
 	var nativeContent []any
 	hasNativeContent := false
@@ -192,7 +231,10 @@ func (m *Model) assistant(message astral.Message) (map[string]any, error) {
 		}
 		switch part.Type {
 		case "text":
-			text.WriteString(part.Text)
+			hasText = hasText || part.Text != ""
+			if !validation {
+				text.WriteString(part.Text)
+			}
 			nativeContent = append(nativeContent, map[string]string{"type": "text", "text": part.Text})
 		case "refusal":
 			wire["refusal"] = part.Text
@@ -233,7 +275,7 @@ func (m *Model) assistant(message astral.Message) (map[string]any, error) {
 			return nil, fmt.Errorf("%w: unsupported assistant part %q", astral.ErrInvalid, part.Type)
 		}
 	}
-	if text.Len() > 0 || len(calls) == 0 {
+	if hasText || len(calls) == 0 {
 		wire["content"] = text.String()
 	}
 	if hasNativeContent {

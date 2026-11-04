@@ -9,6 +9,7 @@ import (
 // messages contain only the active window and its provenance.
 type Context struct {
 	anchor          *contextUsageAnchor
+	facts           *requestFacts
 	HeadID          string         `json:"head_id"`
 	ConfigurationID string         `json:"configuration_id"`
 	Selection       ModelSelection `json:"selection"`
@@ -30,7 +31,9 @@ func (s *Session) ReadContext(ctx context.Context) (Context, error) {
 		s.mu.Unlock()
 		return Context{}, ErrClosed
 	}
-	path := clone(s.pathLocked())
+	// Entries are immutable after confirmation. Own the list while the
+	// projection copies its public result outside the session lock.
+	path := append([]Entry(nil), s.pathLocked()...)
 	s.mu.Unlock()
 	return project(path)
 }
@@ -47,7 +50,10 @@ func (s *Session) InspectContext(ctx context.Context) (Context, error) {
 		return Context{}, err
 	}
 	view.Request.Options = resolvedOptions(model)
-	return s.measureContext(ctx, model, view)
+	view, err = s.measureContext(ctx, model, view)
+	// The private projection may borrow a model's immutable prepared values.
+	// Public inspection still returns an independently mutable context.
+	return cloneContext(view), err
 }
 
 func resultKey(assistantID, callID string) string { return assistantID + "\x00" + callID }
@@ -57,6 +63,28 @@ func resultKey(assistantID, callID string) string { return assistantID + "\x00" 
 // only be committed at a complete batch boundary. Since
 // no model request observes a half batch, previously sent prefixes stay stable.
 func project(path []Entry) (Context, error) {
+	view, err := projectBorrowed(path)
+	if err != nil {
+		return Context{}, err
+	}
+	return cloneContext(view), nil
+}
+
+// projectBorrowed is private to the request pipeline. The resulting slice
+// headers are new, but message/configuration payloads still belong to immutable
+// entries. External callbacks and public results must receive owned copies.
+func projectBorrowed(path []Entry) (Context, error) {
+	return projectPath(path, true)
+}
+
+// projectPrepared rebuilds a path already checked by projectBorrowed, plus
+// validated input/collector messages and a text-only compaction summary. It
+// retains timeline and protocol checks without revalidating immutable bodies.
+func projectPrepared(path []Entry) (Context, error) {
+	return projectPath(path, false)
+}
+
+func projectPath(path []Entry, validate bool) (Context, error) {
 	configuration, configurationID, err := effectiveConfiguration(path)
 	if err != nil {
 		return Context{}, err
@@ -170,10 +198,9 @@ func project(path []Entry) (Context, error) {
 			add(*e.Message, e.ID)
 		}
 	}
-	if err = validateProtocol(view.Request.Messages); err != nil {
+	if err = checkProtocol(view.Request.Messages, validate); err != nil {
 		return Context{}, err
 	}
-	view = clone(view)
 	view.anchor = contextUsageAnchorFor(path, view.Sources)
 	return view, nil
 }
@@ -255,10 +282,22 @@ func validateToolTimeline(path []Entry) error {
 }
 
 func validateProtocol(messages []Message) error {
+	return checkProtocol(messages, true)
+}
+
+// validatePreparedProtocol checks ordering after projectRequest has established
+// every output message's validity. It must not be used for unvalidated inputs.
+func validatePreparedProtocol(messages []Message) error {
+	return checkProtocol(messages, false)
+}
+
+func checkProtocol(messages []Message, validate bool) error {
 	var pending []ToolCall
 	for _, message := range messages {
-		if err := validateMessage(message); err != nil {
-			return err
+		if validate {
+			if err := validateMessage(message); err != nil {
+				return err
+			}
 		}
 		if len(pending) > 0 {
 			if message.Role != RoleTool || message.ToolCallID != pending[0].ID {

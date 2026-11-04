@@ -2,7 +2,6 @@ package astral
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -14,11 +13,13 @@ type prepareOptions struct {
 	generation                                 bool
 }
 type preparedStep struct {
-	model   Model
-	view    Context
-	driven  bool
-	base    Context
-	attempt *ModelAttempt
+	model             Model
+	view              Context
+	driven            bool
+	base              Context
+	attempt           *ModelAttempt
+	execution         RequestExecution
+	executionPrepared bool
 }
 
 var errQueueRevised = errors.New("selected queue input was revised")
@@ -67,7 +68,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		s.mu.Unlock()
 		return preparedStep{}, summary, ErrIncompleteBatch
 	}
-	path := clone(s.pathLocked())
+	path := append([]Entry(nil), s.pathLocked()...)
 	head := s.state.Branch.HeadID
 	var selected []Record
 	var err error
@@ -78,7 +79,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	old, err := project(path)
+	old, err := projectBorrowed(path)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
@@ -98,7 +99,11 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	// Collect fresh environment before the first decision, then rebuild it
 	// after a summary. No draft becomes history until the final check passes.
 	build := func(base Context, compactionID string) (Context, []Entry, error) {
-		view := cloneContext(base)
+		view := base
+		// Appending to this candidate must not overwrite the base projection.
+		// Payloads stay borrowed until PrepareRequest's isolated boundary.
+		view.Request.Messages = append([]Message(nil), base.Request.Messages...)
+		view.Sources = append([]string(nil), base.Sources...)
 		view.Request.ModelID, view.Request.ModelRevision = model.Spec().ID, model.Spec().Revision
 		view.Request.Options = resolvedOptions(model)
 		var entries []Entry
@@ -123,12 +128,12 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		}
 		// Idle passive injection avoids an ordinary scan, but a compaction
 		// always needs a fresh snapshot for its newly constructed context.
-		if (!options.skipCollect || compactionID != "") && s.config.CollectContext != nil {
+		if (!options.skipCollect || compactionID != "") && (s.config.CollectContext != nil || s.config.CollectContextReadOnly != nil) {
 			reason := options.reason
 			if compactionID != "" {
 				reason = "after_compact"
 			}
-			batch, err := collectContext(ctx, s.config.CollectContext, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: cloneContext(view)})
+			batch, err := collectContext(ctx, s.config, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: view})
 			if err != nil {
 				return Context{}, nil, err
 			}
@@ -159,7 +164,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		return preparedStep{}, summary, err
 	}
 	incomingMessages := clone(candidate.Request.Messages[len(old.Request.Messages):])
-	candidate, budgetErr := s.fitContext(ctx, model, candidate)
+	candidate, budgetErr := s.fitContext(ctx, model, candidate, options.generation)
 	if budgetErr != nil && !errors.Is(budgetErr, ErrBudget) && !options.compact {
 		return preparedStep{}, summary, budgetErr
 	}
@@ -169,10 +174,10 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if needsCompact {
 		keepTokens := budget.KeepRecentTokens
 		if !options.compact {
-			incoming := cloneContext(old)
+			incoming := old
 			incoming.anchor = nil
 			incoming.Request.Messages = incomingMessages
-			incoming, incomingErr := s.fitContext(ctx, model, incoming)
+			incoming, incomingErr := s.fitContext(ctx, model, incoming, false)
 			if incomingErr != nil {
 				return preparedStep{}, summary, incomingErr
 			}
@@ -190,7 +195,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		} else {
 			compactionID := newID()
 			compaction := Entry{ID: compactionID, Kind: EntryCompaction, RunID: options.runID, TurnID: options.turnID, Compaction: &summary}
-			base, projectErr := project(append(append([]Entry(nil), path...), compaction))
+			base, projectErr := projectBorrowed(append(append([]Entry(nil), path...), compaction))
 			if projectErr != nil {
 				return preparedStep{}, summary, projectErr
 			}
@@ -199,7 +204,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 				return preparedStep{}, summary, err
 			}
 			drafts = append([]Entry{compaction}, drafts...)
-			candidate, err = s.fitContext(ctx, model, candidate)
+			candidate, err = s.fitContext(ctx, model, candidate, options.generation)
 			if err != nil {
 				return preparedStep{}, summary, err
 			}
@@ -209,6 +214,13 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	}
 	if err = ctx.Err(); err != nil {
 		return preparedStep{}, summary, err
+	}
+	var execution RequestExecution
+	if options.generation {
+		execution, err = prepareRequestExecution(ctx, model, candidate.Request)
+		if err != nil {
+			return preparedStep{}, summary, err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -242,13 +254,15 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 			canonicalPath = append(canonicalPath, draft)
 		}
 	}
-	base, err := project(canonicalPath)
+	// path was checked above; drafts contain only admitted inputs, validated
+	// collector context and the generated text summary. Recheck their ordering.
+	base, err := projectPrepared(canonicalPath)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
 	var attempt *ModelAttempt
 	if options.generation {
-		input, err := freezeModelRequest(s.rolloutID, base, candidate.Request, model)
+		input, err := freezeModelRequest(s.rolloutID, base, candidate.Request, model, candidate.facts)
 		if err != nil {
 			return preparedStep{}, summary, err
 		}
@@ -264,16 +278,17 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		}
 		candidate.HeadID = s.state.Branch.HeadID
 	}
-	return preparedStep{model: model, view: candidate, base: base, attempt: attempt, driven: driving}, summary, nil
+	return preparedStep{model: model, view: candidate, base: base, attempt: attempt, execution: execution, executionPrepared: options.generation, driven: driving}, summary, nil
 }
 func (s *Session) measureContext(ctx context.Context, model Model, view Context) (Context, error) {
+	view.facts = nil
 	view.Request.ModelID, view.Request.ModelRevision = model.Spec().ID, model.Spec().Revision
 	view.Request.MaxOutputTokens = outputReservation(s.config.Budget.OutputTokens, model.Spec())
-	request, err := PrepareRequest(ctx, model, view.Request)
+	request, err := projectRequest(ctx, model, view.Request)
 	if err != nil {
 		return view, err
 	}
-	if !sameJSON(view.Request.Messages, request.Messages) {
+	if !sameRequestMessages(view.Request.Messages, request.Messages) {
 		selection := selectRequestMessages(view.Request.Messages, request.Messages)
 		sources := make([]string, len(selection))
 		for i, at := range selection {
@@ -285,8 +300,16 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 		view.anchor = nil
 	}
 	view.Request = request
-	if err = validateProtocol(request.Messages); err != nil {
+	if err = validatePreparedProtocol(request.Messages); err != nil {
 		return view, err
+	}
+	if hasReportedContextUsage(view) {
+		// Count this prepared body and capture both SHA prefixes in one pass.
+		// Final output digits are corrected only after the token estimate below.
+		view.facts, err = measureRequestFacts(request, view.anchor.index)
+		if err != nil {
+			return view, err
+		}
 	}
 	view.EstimatedInput, err = s.estimateContext(ctx, model, view)
 	if err != nil {
@@ -301,7 +324,7 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 	return view, nil
 }
 
-func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Context, error) {
+func (s *Session) fitContext(ctx context.Context, model Model, view Context, generation bool) (Context, error) {
 	view, err := s.measureContext(ctx, model, view)
 	if err != nil {
 		return view, err
@@ -316,7 +339,23 @@ func (s *Session) fitContext(ctx context.Context, model Model, view Context) (Co
 	if err := ValidateRequest(ctx, model, view.Request); err != nil {
 		return view, err
 	}
-	return view, s.checkRequestBytes(view.Request)
+	facts := view.facts
+	if facts == nil || !facts.matches(view.Request) {
+		if generation {
+			facts, err = measureGenerationRequest(view.Request)
+		} else {
+			facts, err = measurePreparedRequest(view.Request)
+		}
+		if err != nil {
+			return view, err
+		}
+	}
+	bytes := facts.sizeForOutput(view.Request.MaxOutputTokens)
+	if bytes > s.config.MaxContextBytes {
+		return view, &BudgetError{Input: bytes, Window: s.config.MaxContextBytes}
+	}
+	view.facts = facts
+	return view, nil
 }
 
 func (s *Session) checkRequestBudget(ctx context.Context, model Model, request Request) (int, error) {
@@ -338,14 +377,19 @@ func (s *Session) checkEstimatedRequestBudget(ctx context.Context, model Model, 
 }
 
 func (s *Session) checkRequestBytes(request Request) error {
-	raw, err := json.Marshal(request)
-	if err == nil && len(raw) > s.config.MaxContextBytes {
-		err = &BudgetError{Input: len(raw), Window: s.config.MaxContextBytes}
+	n, err := typedRequestSize(request)
+	if err == nil && n > s.config.MaxContextBytes {
+		err = &BudgetError{Input: n, Window: s.config.MaxContextBytes}
 	}
 	return err
 }
 
-func collectContext(ctx context.Context, collect CollectContext, boundary ContextBoundary) (messages []Message, err error) {
+func collectContext(ctx context.Context, config Config, boundary ContextBoundary) (messages []Message, err error) {
+	collect := config.CollectContextReadOnly
+	if collect == nil {
+		collect = config.CollectContext
+		boundary.Context = cloneContext(boundary.Context)
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("context collector panicked: %v", p)
