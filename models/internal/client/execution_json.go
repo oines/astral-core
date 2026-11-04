@@ -15,6 +15,8 @@ type executionImage struct {
 	position int
 }
 
+const executionImagePrefix = `"\u0000astral-image-`
+
 // marshalExecutionBody leaves JSON syntax, key ordering, escaping and opaque
 // values to encoding/json. Only large, verified ASCII image strings are spliced
 // into one final allocation, avoiding the encoder's large buffer and final copy.
@@ -28,15 +30,12 @@ func marshalExecutionBody(body map[string]any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !locateExecutionImages(raw, images) {
+		return json.Marshal(body)
+	}
 	size := len(raw)
 	for i := range images {
 		image := &images[i]
-		// A user-controlled identical string/key is harmless: use the original
-		// encoder rather than interpreting an ambiguous marker.
-		if bytes.Count(raw, image.marker) != 1 {
-			return json.Marshal(body)
-		}
-		image.position = bytes.Index(raw, image.marker)
 		extra := len(image.value) + 2 - len(image.marker)
 		if extra > int(^uint(0)>>1)-size {
 			return json.Marshal(body)
@@ -54,6 +53,40 @@ func marshalExecutionBody(body map[string]any) ([]byte, error) {
 		position = image.position + len(image.marker)
 	}
 	return append(result, raw[position:]...), nil
+}
+
+// Scan the metadata once for all image positions. A user-controlled identical
+// string/key causes fallback instead of interpreting an ambiguous marker.
+func locateExecutionImages(raw []byte, images []executionImage) bool {
+	for i := range images {
+		images[i].position = -1
+	}
+	for offset := 0; offset < len(raw); {
+		at := bytes.Index(raw[offset:], []byte(executionImagePrefix))
+		if at < 0 {
+			break
+		}
+		at += offset
+		digits := at + len(executionImagePrefix)
+		end := digits
+		for end < len(raw) && raw[end] >= '0' && raw[end] <= '9' {
+			end++
+		}
+		index, err := strconv.Atoi(string(raw[digits:end]))
+		if err == nil && index >= 0 && index < len(images) && bytes.HasPrefix(raw[at:], images[index].marker) {
+			if images[index].position >= 0 {
+				return false
+			}
+			images[index].position = at
+		}
+		offset = digits
+	}
+	for _, image := range images {
+		if image.position < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // This is only the provider builders' map/array vocabulary. Unsupported Go
@@ -106,7 +139,7 @@ func executionImageMetadata(value any, images *[]executionImage, depth int) (any
 		if !executionASCIIImageURL(value) {
 			return value, false, true
 		}
-		marker := strconv.AppendInt([]byte(`"\u0000astral-image-`), int64(len(*images)), 10)
+		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)
 		marker = append(marker, `\u0000"`...)
 		*images = append(*images, executionImage{marker: marker, value: value})
 		return json.RawMessage(marker), true, true

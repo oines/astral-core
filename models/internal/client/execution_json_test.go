@@ -27,6 +27,7 @@ func TestExecutionJSONMatchesStandardEncoder(t *testing.T) {
 		"marker collision":              {"image": image, "literal": "\x00astral-image-0\x00"},
 		"key collision":                 {"image": image, "\x00astral-image-0\x00": "literal"},
 		"raw collision":                 {"image": image, "raw": json.RawMessage(`"\u0000astral-image-0\u0000"`)},
+		"similar markers":               {"image": image, "short": "\x00astral-image-\x00", "suffix": "\x00astral-image-0x\x00", "leading zero": "\x00astral-image-00\x00", "unknown": "\x00astral-image-99\x00", "overflow": "\x00astral-image-999999999999999999999999999999\x00"},
 		"unknown Go value":              {"image": image, "typed": map[int]string{2: "two", 1: "<one>"}},
 		"invalid raw":                   {"image": image, "raw": json.RawMessage(`{`)},
 		"nonfinite":                     {"image": image, "number": math.NaN()},
