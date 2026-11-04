@@ -10,6 +10,8 @@ import (
 	"github.com/oines/astral-core/models/internal/client"
 )
 
+const toolImageHint = "\n[Image returned by this tool; attached after the tool-result batch.]"
+
 // RequestBody is the exact credential-free JSON body used for this request.
 func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 	owned, err := astral.CopyRequest(req)
@@ -59,6 +61,21 @@ func (m *Model) requestBody(req astral.Request, validation bool, execution ...bo
 		}
 		if message.Role == astral.RoleTool {
 			var text strings.Builder
+			size := 0
+			for _, part := range message.Content {
+				n := 0
+				if part.Type == "text" {
+					n = len(part.Text)
+				} else if part.Type == "image" {
+					n = len(toolImageHint)
+				}
+				if n > int(^uint(0)>>1)-size {
+					size = 0 // Preserve the original growth strategy on overflow.
+					break
+				}
+				size += n
+			}
+			text.Grow(size)
 			for i, part := range message.Content {
 				switch part.Type {
 				case "text":
@@ -67,7 +84,7 @@ func (m *Model) requestBody(req astral.Request, validation bool, execution ...bo
 					if part.URL == "" {
 						return nil, fmt.Errorf("%w: tool image requires a resolved URL", astral.ErrInvalid)
 					}
-					text.WriteString("\n[Image returned by this tool; attached after the tool-result batch.]")
+					text.WriteString(toolImageHint)
 					toolImages = append(toolImages, map[string]any{"type": "text", "text": "Image from tool call " + message.ToolCallID + ":"},
 						map[string]any{"type": "image_url", "image_url": map[string]any{"url": images.URL(&message.Content[i])}})
 				default:
