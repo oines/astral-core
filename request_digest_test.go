@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"math/rand"
 	"reflect"
@@ -157,6 +158,65 @@ func TestCanonicalRequestWriterPropagatesOutputFailure(t *testing.T) {
 	want := errors.New("output failed")
 	if err := writeCanonicalRequest(failedDigestWriter{err: want}, completeCopyRequest()); !errors.Is(err, want) {
 		t.Fatalf("writer failure was lost: %v", err)
+	}
+}
+
+type requestTestWriter struct {
+	bytes.Buffer
+	limit int
+	err   error
+}
+
+func (w *requestTestWriter) Write(p []byte) (int, error) {
+	n := min(len(p), w.limit)
+	_, _ = w.Buffer.Write(p[:n])
+	return n, w.err
+}
+
+func TestRequestJSONWriterPreservesConsumedCountAndErrors(t *testing.T) {
+	wantErr := errors.New("output failed")
+	for _, test := range []struct {
+		name, input, output string
+		limit, consumed     int
+		writeErr, wantErr   error
+	}{
+		{"terminator", `"value"` + "\n", `"value"`, 99, 8, nil, nil},
+		{"no terminator", `"value"`, `"value"`, 99, 7, nil, nil},
+		{"only terminator", "\n", "", 99, 1, nil, nil},
+		{"empty", "", "", 99, 0, nil, nil},
+		{"short write", `"value"` + "\n", `"va`, 3, 3, nil, io.ErrShortWrite},
+		{"output error", `"value"` + "\n", `"va`, 3, 3, wantErr, wantErr},
+		{"full write with error", `"value"` + "\n", `"value"`, 99, 8, wantErr, wantErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out := &requestTestWriter{limit: test.limit, err: test.writeErr}
+			n, err := (requestJSONWriter{out: out}).Write([]byte(test.input))
+			if n != test.consumed || !errors.Is(err, test.wantErr) || out.String() != test.output {
+				t.Fatalf("writer contract changed: n=%d err=%v output=%q", n, err, out.String())
+			}
+		})
+	}
+}
+
+func TestRequestEncoderPreservesTypedErrorsAndOutputFailures(t *testing.T) {
+	for _, raw := range []json.RawMessage{json.RawMessage(`{`), json.RawMessage(`"unterminated`), {}} {
+		request := Request{Options: GenerationOptions{ProviderOptions: map[string]json.RawMessage{"invalid": raw}}}
+		_, want := json.Marshal(request)
+		var out bytes.Buffer
+		got := writeTypedRequest(&out, request, nil)
+		if want == nil || got == nil || reflect.TypeOf(want) != reflect.TypeOf(got) || want.Error() != got.Error() {
+			t.Fatalf("typed encoder error changed: old=%v new=%v", want, got)
+		}
+	}
+	want := errors.New("output failed")
+	request := Request{SystemPrompt: strings.Repeat("escaped\n中文", 4096)}
+	for _, write := range []func(io.Writer, Request) error{writeCanonicalRequest, func(out io.Writer, request Request) error { return writeTypedRequest(out, request, nil) }} {
+		if err := write(failedDigestWriter{err: want}, request); !errors.Is(err, want) {
+			t.Fatalf("encoder lost output error: %v", err)
+		}
+		if err := write(&requestTestWriter{limit: 1}, request); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("encoder lost short write: %v", err)
+		}
 	}
 }
 

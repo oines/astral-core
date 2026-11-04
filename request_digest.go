@@ -60,8 +60,9 @@ func writeCanonicalRequest(out io.Writer, request Request) error {
 }
 
 type requestDigestWriter struct {
-	out *bufio.Writer
-	err error
+	out     *bufio.Writer
+	encoder *json.Encoder
+	err     error
 }
 
 func (w *requestDigestWriter) literal(value string) {
@@ -86,12 +87,37 @@ func (w *requestDigestWriter) string(value string) {
 		w.canonical(value)
 		return
 	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		w.err = err
+	w.encode(value)
+}
+
+// encode lets the standard encoder write directly into this traversal's output
+// without json.Marshal's additional owned result slice. Encode appends one LF;
+// the adapter consumes only that terminator, retaining every JSON content byte.
+func (w *requestDigestWriter) encode(value any) {
+	if w.err != nil {
 		return
 	}
-	w.bytes(raw)
+	if w.encoder == nil {
+		w.encoder = json.NewEncoder(requestJSONWriter{out: w.out})
+	}
+	w.err = w.encoder.Encode(value)
+}
+
+type requestJSONWriter struct{ out io.Writer }
+
+func (w requestJSONWriter) Write(p []byte) (int, error) {
+	size := len(p)
+	if size > 0 && p[size-1] == '\n' {
+		p = p[:size-1]
+	}
+	n, err := w.out.Write(p)
+	if n == len(p) {
+		return size, err
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }
 
 // Plain ASCII has the same bytes in typed and canonical JSON. Read it directly

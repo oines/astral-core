@@ -78,12 +78,7 @@ func (w *requestDigestWriter) typedValue(value any) {
 	if text, ok := value.(string); ok && w.simpleString(text) {
 		return
 	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		w.err = err
-		return
-	}
-	w.bytes(raw)
+	w.encode(value)
 }
 
 func (w *requestDigestWriter) typedRaw(value json.RawMessage) {
