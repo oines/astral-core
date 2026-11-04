@@ -3,6 +3,8 @@ package astral
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/MoeForge/moego/ojson"
 )
 
 type Role string
@@ -129,10 +131,43 @@ func (m Message) Validate() error {
 			return fmtInvalid("invalid tool argument JSON: %v", err)
 		}
 	}
-	if _, err := json.Marshal(m); err != nil {
-		return fmtInvalid("message is not JSON serializable: %v", err)
+	if !messageJSONSerializable(m) {
+		// Keep the encoder's original error and field order on invalid input.
+		// Valid messages need no serialized copy of their opaque payloads.
+		if _, err := json.Marshal(m); err != nil {
+			return fmtInvalid("message is not JSON serializable: %v", err)
+		}
 	}
 	return nil
+}
+
+func messageJSONSerializable(m Message) bool {
+	optional := func(raw json.RawMessage) bool { return len(raw) == 0 || validRequestJSON(raw) }
+	if !optional(m.Metadata) {
+		return false
+	}
+	for _, part := range m.Content {
+		if !optional(part.Data) || !optional(part.Metadata) {
+			return false
+		}
+		if call := part.ToolCall; call != nil {
+			// Arguments is required: nil encodes as null; non-nil empty is invalid.
+			if call.Arguments != nil && !json.Valid(call.Arguments) || !optional(call.Metadata) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// The SIMD fast path is restricted to one JSON string, so it cannot widen the
+// standard library's container-depth limit. Unusual or rejected inputs retain
+// encoding/json behavior (notably its accepted invalid UTF-8 strings).
+func validRequestJSON(raw []byte) bool {
+	if len(raw) > 0 && raw[0] == '"' && ojson.ValidBytes(raw) {
+		return true
+	}
+	return json.Valid(raw)
 }
 
 // Failed messages remain in history, but are omitted from model requests and

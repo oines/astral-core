@@ -35,14 +35,25 @@ type RequestValidator interface {
 	ValidateRequest(context.Context, Request) error
 }
 
+// RequestValidatorReadOnly opts into validation of an immutable borrowed
+// request. Implementations must not mutate or retain mutable access to any
+// slice, map, pointer or JSON payload reachable from the request. Core calls
+// this hook without a copy; legacy RequestValidator keeps its isolated input.
+type RequestValidatorReadOnly interface {
+	ValidateRequestReadOnly(context.Context, Request) error
+}
+
 func ValidateRequest(ctx context.Context, model Model, request Request) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("model request validation panicked: %v", p)
 		}
 	}()
+	if validator, ok := model.(RequestValidatorReadOnly); ok {
+		return validator.ValidateRequestReadOnly(ctx, request)
+	}
 	if validator, ok := model.(RequestValidator); ok {
-		return validator.ValidateRequest(ctx, clone(request))
+		return validator.ValidateRequest(ctx, cloneRequest(request))
 	}
 	return nil
 }
@@ -54,7 +65,7 @@ func PrepareRequest(ctx context.Context, model Model, request Request) (out Requ
 			err = fmt.Errorf("model request preparation panicked: %v", p)
 		}
 	}()
-	out, err = copyJSON(request)
+	out, err = CopyRequest(request)
 	if err != nil {
 		return Request{}, err
 	}
@@ -64,20 +75,34 @@ func PrepareRequest(ctx context.Context, model Model, request Request) (out Requ
 			return Request{}, err
 		}
 	}
+	if err = validatePreparedRequest(request, out); err != nil {
+		return Request{}, err
+	}
+	return CopyRequest(out)
+}
+
+func validatePreparedRequest(request, out Request) error {
+	if err := validatePreparedConfiguration(request, out); err != nil {
+		return err
+	}
+	for _, message := range out.Messages {
+		if err := validateMessage(message); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePreparedConfiguration(request, out Request) error {
 	if out.ModelID != request.ModelID || out.ModelRevision != request.ModelRevision ||
 		out.MaxOutputTokens != request.MaxOutputTokens || !sameJSON(out.Tools, request.Tools) ||
 		!sameJSON(out.Options, request.Options) {
-		return Request{}, fmtInvalid("request preparation changed model configuration")
+		return fmtInvalid("request preparation changed model configuration")
 	}
-	if err = out.Options.Validate(); err != nil {
-		return Request{}, err
+	if err := out.Options.Validate(); err != nil {
+		return err
 	}
-	for _, message := range out.Messages {
-		if err = validateMessage(message); err != nil {
-			return Request{}, err
-		}
-	}
-	return copyJSON(out)
+	return nil
 }
 
 // ModelFunc adapts host functions without a provider-specific SDK dependency.
@@ -173,7 +198,7 @@ func stream(ctx context.Context, model Model, request Request, emit func(ModelEv
 	}()
 	var check streamcheck.Check
 	var mu sync.Mutex
-	reply, err = model.Stream(ctx, clone(request), func(event ModelEvent) {
+	reply, err = model.Stream(ctx, cloneRequest(request), func(event ModelEvent) {
 		mu.Lock()
 		defer mu.Unlock()
 		owned, copyErr := copyJSON(event)

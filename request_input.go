@@ -48,20 +48,18 @@ func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 	for i, source := range selection {
 		identity = identity && source == i
 	}
-	projection := clone(base.Request)
+	// Projection is borrowed for comparison only. No value in the immutable
+	// branch is changed while recording this request's small recipe.
+	projection := base.Request
 	if !identity {
 		input.Selection = &selection
 		projection.Messages = selectedMessages(projection.Messages, selection)
 	}
-	before, err := json.Marshal(projection)
+	var err error
+	input.Changes, err = diffPreparedRequest(projection, request)
 	if err != nil {
 		return input, err
 	}
-	after, err := json.Marshal(request)
-	if err != nil {
-		return input, err
-	}
-	input.Changes = diffRequestJSON(nil, before, after)
 	input.Digest = requestDigest(request)
 	if input.Digest == "" {
 		return input, ErrInvalid
@@ -70,16 +68,19 @@ func FreezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 }
 
 func selectRequestMessages(base, actual []Message) []int {
-	byDigest := make(map[string]int, len(base))
+	var byDigest map[string]int
 	parts := make([]map[string]int, len(base))
-	for i, message := range base {
-		byDigest[canonicalDigest(message)] = i
-	}
 	out := make([]int, len(actual))
 	for i, message := range actual {
-		if i < len(base) && sameJSON(base[i], message) {
+		if i < len(base) && sameRequestMessage(base[i], message) {
 			out[i] = i
 			continue
+		}
+		if byDigest == nil {
+			byDigest = make(map[string]int, len(base))
+			for j, old := range base {
+				byDigest[canonicalDigest(old)] = j
+			}
 		}
 		if at, ok := byDigest[canonicalDigest(message)]; ok {
 			out[i] = at
@@ -176,7 +177,7 @@ func (input RequestInput) Apply(base Request) (Request, error) {
 	return request, nil
 }
 
-func requestDigest(request Request) string { return canonicalDigest(request) }
+func requestDigest(request Request) string { return canonicalRequestDigest(request) }
 
 func canonicalDigest(value any) string {
 	raw, err := json.Marshal(value)

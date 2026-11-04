@@ -100,8 +100,11 @@ func OpenSession(ctx context.Context, config Config, id string) (*Session, error
 }
 
 func configureSession(config Config, id string) (*Session, error) {
-	if id == "" || config.Store == nil || config.EstimateTokens == nil {
+	if id == "" || config.Store == nil || config.EstimateTokens == nil && config.EstimateTokensReadOnly == nil {
 		return nil, fmtInvalid("ID, Store and EstimateTokens are required")
+	}
+	if config.EstimateTokens != nil && config.EstimateTokensReadOnly != nil {
+		return nil, fmtInvalid("set exactly one of EstimateTokens and EstimateTokensReadOnly")
 	}
 	modelID := ""
 	if config.Model != nil {

@@ -11,12 +11,16 @@ import (
 type Config struct {
 	MaxContextBytes int
 	EstimateTokens  TokenEstimator
-	Model           Model
-	Selection       ModelSelection
-	Store           Store
-	SystemPrompt    string
-	Options         GenerationOptions
-	Tools           []Tool
+	// EstimateTokensReadOnly borrows immutable requests instead of receiving
+	// owned copies. The callback must not mutate or retain mutable access to
+	// any request data. Set exactly one estimator field.
+	EstimateTokensReadOnly TokenEstimator
+	Model                  Model
+	Selection              ModelSelection
+	Store                  Store
+	SystemPrompt           string
+	Options                GenerationOptions
+	Tools                  []Tool
 	// ResolveModel resolves a fresh selection, including mutable model defaults.
 	ResolveModel func(context.Context, ModelSelection) (ResolvedModel, error)
 	// RestoreModel reconstructs a previously frozen target without applying

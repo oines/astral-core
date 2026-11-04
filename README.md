@@ -77,6 +77,11 @@ if submission.Run != nil {
 
 签名、密文和原生内容保存在消息中。`RequestPreparer` 只修改当前请求副本，按目标兼容性保留或省略原生内容，保留通用文本及完整工具关系；Core 不包含服务商判断。历史本身保持原样，新回复继续正常保存。
 
+模型可选实现 `RequestProjector.ProjectRequest`，在 Core 内部只读借用已确认的请求。它与 `RequestPreparer` 承担相同的目标投影和宿主准备职责，但不得修改输入或返回值共享的 slice、map、指针和 RawMessage；修改部分应复制后再返回。未实现时保留原有隔离路径，公开 `PrepareRequest` 仍返回独立所有权。
+
+模型也可实现 `RequestValidatorReadOnly.ValidateRequestReadOnly`，在最终协议校验时同步借用不可变请求；不得修改或保留嵌套数据的可变访问。Core 优先调用该显式接口，未实现时继续为旧 `RequestValidator` 提供独立副本。两条路径运行相同校验，错误与 panic 边界不变。
+
+可选 `RequestExecutionPreparer.PrepareExecution` 接收最终预算、校验后的只读请求，在首个 Attempt 提交前完成协议编码，返回可重试的 `RequestExecution`。准备不得有外部副作用；执行对象持有本次冻结输入，普通网络重试只重新读取相同内容，协议修复则重新准备。模型自己的验证、宿主 headers、取消和错误分类仍需保留。内置 Models 使用该边界共享一次编码的协议字节，不建立跨 Session 缓存。
 ## 输入与生命周期
 
 | API | 行为 |
@@ -138,6 +143,8 @@ config.CollectContext = func(ctx context.Context, boundary core.ContextBoundary)
 摘要使用相同模型规格和目标快照时，在实际选中的历史范围内寻找普通生成基线，并按普通请求的准备结果校验覆盖前缀。预算为该次真实输入与输出，加基线之后所有选中消息（包括静默积累的旁观上下文、图片和工具结果）的估算，再加完整的摘要提示词与请求选项开销。基线包含的旧提示词和工具定义额度保守保留，不减去粗估值；已校准的原生推理内容不重新按密文长度估算。保留在近期尾段的回复不能给较早的摘要范围提供基线。目标、配置或覆盖前缀不匹配时回退到完整内容估算；缩短工具副本若改变覆盖前缀也必须回退。
 
 `TokenEstimator` 必须接受完整请求、空请求和不带 System/Tools/Options 的消息尾段；后两者只用于估算，不发送给模型。可选的 `RequestValidator` 在最终输出长度确定后校验完整协议与参数，在输入和摘要提交之前失败。完整请求与尾段使用同一套内容估算，普通上下文尾段减去空请求的固定开销；摘要尾段保留新摘要请求的全部固定开销。
+
+默认 `Config.EstimateTokens` 收到独立可变副本。估算器已保证只读时，可改用 `Config.EstimateTokensReadOnly` 借用请求，避免每轮复制整段历史；两者只能设置一个。只读估算器不得修改输入，或在返回后保留可变访问。Core 始终调用所配置的估算器，不依赖具体 Host 或模型 SDK。
 
 普通生成和摘要共用一套尝试策略：默认总共 3 次，包含首次；从 1 秒指数退避到 5 秒，较长的有效 Retry-After 优先；每次请求超时 4 分钟。明确永久错误和用户取消直接停止。网络重试复用冻结请求，不重新消费输入、扫描环境、摘要或执行工具。
 

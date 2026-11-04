@@ -36,7 +36,8 @@ func (s *Session) resolveModel(ctx context.Context, selection ModelSelection) (M
 	if len(resolved.Snapshot) != 0 && !json.Valid(resolved.Snapshot) {
 		return nil, fmtInvalid("model snapshot must be valid JSON")
 	}
-	return estimatedModel{Model: resolved.Model, estimate: s.config.EstimateTokens, options: clone(resolved.Options), snapshot: append(json.RawMessage(nil), resolved.Snapshot...)}, nil
+	estimate, readOnly := s.tokenEstimator()
+	return estimatedModel{Model: resolved.Model, estimate: estimate, estimateReadOnly: readOnly, options: clone(resolved.Options), snapshot: append(json.RawMessage(nil), resolved.Snapshot...)}, nil
 }
 
 func (s *Session) restoreModel(ctx context.Context, snapshot ModelSnapshot) (Model, error) {
@@ -55,14 +56,23 @@ func (s *Session) restoreModel(ctx context.Context, snapshot ModelSnapshot) (Mod
 	if model == nil || model.Spec() != snapshot.Spec {
 		return nil, fmtInvalid("restored model does not match frozen specification")
 	}
-	return estimatedModel{Model: model, estimate: s.config.EstimateTokens, snapshot: append(json.RawMessage(nil), snapshot.Data...)}, nil
+	estimate, readOnly := s.tokenEstimator()
+	return estimatedModel{Model: model, estimate: estimate, estimateReadOnly: readOnly, snapshot: append(json.RawMessage(nil), snapshot.Data...)}, nil
+}
+
+func (s *Session) tokenEstimator() (TokenEstimator, bool) {
+	if s.config.EstimateTokensReadOnly != nil {
+		return s.config.EstimateTokensReadOnly, true
+	}
+	return s.config.EstimateTokens, false
 }
 
 type estimatedModel struct {
 	Model
-	estimate TokenEstimator
-	options  GenerationOptions
-	snapshot json.RawMessage
+	estimate         TokenEstimator
+	estimateReadOnly bool
+	options          GenerationOptions
+	snapshot         json.RawMessage
 }
 
 func resolvedOptions(model Model) GenerationOptions {
@@ -78,11 +88,39 @@ func freezeModelRequest(rolloutID string, base Context, request Request, model M
 }
 
 func (m estimatedModel) PrepareRequest(ctx context.Context, request Request) (Request, error) {
+	// The outer Core boundary owns isolation and validation. Re-entering it
+	// here would copy the same request again around the underlying hook.
+	if preparer, ok := m.Model.(RequestPreparer); ok {
+		return preparer.PrepareRequest(ctx, request)
+	}
+	return request, nil
+}
+
+func (m estimatedModel) ProjectRequest(ctx context.Context, request Request) (Request, error) {
+	if projector, ok := m.Model.(RequestProjector); ok {
+		return projector.ProjectRequest(ctx, request)
+	}
 	return PrepareRequest(ctx, m.Model, request)
 }
 
 func (m estimatedModel) ValidateRequest(ctx context.Context, request Request) error {
+	if validator, ok := m.Model.(RequestValidator); ok {
+		return validator.ValidateRequest(ctx, request)
+	}
+	return nil
+}
+
+func (m estimatedModel) ValidateRequestReadOnly(ctx context.Context, request Request) error {
+	// Dispatch through Core so a legacy underlying validator still receives an
+	// isolated copy, while a read-only validator (or no hook) needs no copy.
 	return ValidateRequest(ctx, m.Model, request)
+}
+
+func (m estimatedModel) PrepareExecution(ctx context.Context, request Request) (RequestExecution, error) {
+	if preparer, ok := m.Model.(RequestExecutionPreparer); ok {
+		return preparer.PrepareExecution(ctx, request)
+	}
+	return nil, nil
 }
 
 func (m estimatedModel) RecoverRequest(ctx context.Context, request Request, cause error) (Request, bool, error) {

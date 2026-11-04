@@ -62,6 +62,12 @@ func (m *Model) ValidateRequest(ctx context.Context, req astral.Request) error {
 	return err
 }
 
+// ValidateRequestReadOnly uses the same checks; requestBody only reads its
+// source and copies containers before projecting image URLs.
+func (m *Model) ValidateRequestReadOnly(ctx context.Context, req astral.Request) error {
+	return m.ValidateRequest(ctx, req)
+}
+
 func (m *Model) EstimateTokens(ctx context.Context, req astral.Request) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err

@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	core "github.com/oines/astral-core"
+	"github.com/oines/astral-core/internal/base64ascii"
 )
 
 // PrepareRequest projects one bounded context for this target. Durable messages
@@ -288,7 +289,10 @@ func isPlainBase64(encoded []byte) bool {
 			end--
 		}
 	}
-	return validatePlainBase64(encoded, end)
+	if base64ascii.Supported() {
+		return base64ascii.Valid(encoded)
+	}
+	return scalarPlainBase64(encoded, end)
 }
 
 func scalarPlainBase64(encoded []byte, end int) bool {

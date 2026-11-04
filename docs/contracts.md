@@ -2,7 +2,7 @@
 
 ## Session 与所有权
 
-根包 `astral` 提供 `NewSession(ctx, Config, SessionOptions)` 和 `OpenSession(ctx, Config, id)`。Store、EstimateTokens 必填。新 Session 需要 Config.Model 或有效 Config.Selection；冷 OpenSession 不需要初始模型；Memory 与 SQLite 共用同一执行循环。Host 负责同一 ID 的唯一活动句柄与跨进程所有权。Store 乐观 CAS 拒绝冲突写入，但不能撤销已经执行的外部动作。
+根包 `astral` 提供 `NewSession(ctx, Config, SessionOptions)` 和 `OpenSession(ctx, Config, id)`。Store 和一个估算器（`EstimateTokens` 或 `EstimateTokensReadOnly`）必填。新 Session 需要 Config.Model 或有效 Config.Selection；冷 OpenSession 不需要初始模型；Memory 与 SQLite 共用同一执行循环。Host 负责同一 ID 的唯一活动句柄与跨进程所有权。Store 乐观 CAS 拒绝冲突写入，但不能撤销已经执行的外部动作。
 
 一个 Session 同时拥有一个 Run 或维护操作。冲突返回 ErrBusy。Fork 在固定、已提交的完整历史边界工作，不改变 Parent 的执行状态。OpenSession 只恢复已提交事实，不扫描环境、重放流、重启模型或恢复退避计时。
 
@@ -56,6 +56,14 @@ Model 提供 Spec / Stream。Configuration.Selection 是唯一持久模型选择
 SelectModel 验证通用形状并原子替换整个选择，不构造模型，不保留旧选择的覆盖。准备至冻结完成及整个 compact 期间返回 ErrBusy。冻结后允许选择下一请求的目标。Configure 仍只允许空闲时修改完整配置。ReadConfiguration 只 LoadState 并 Get 当前配置节点，不打开 Session、不扫描活动上下文，供批量查询选择使用。冷 OpenSession、ReadContext 与 Fork 不解析模型，旧模型失效不能阻止这些操作；InspectContext 才解析、准备与估算当前目标。
 
 RequestPreparer 在预算检查前完成无副作用的目标兼容投影，只改变请求副本中的消息与宿主上下文，不改变配置。原生包装不兼容时适配器保留通用文本、工具调用及结果关系，仅省略不可回传的私有内容；原始历史与新回复的正常持久化不受影响。Core 按投影重映射来源，内容变化时丢弃旧用量基线。准备可能被多次调用；不得在 Stream 内追加实时环境或重新读取可变附件。冻结图片与稳定引用由 Host 负责。RequestValidator 单独校验完整请求，在动态输出长度确定后、候选提交前运行；部分尾段的估算不要求完整工具协议。
+
+`RequestValidatorReadOnly` 是显式只读校验能力：同步借用完整冻结请求，不得修改或保留其中 slice、map、指针和 RawMessage 的可变访问。Core 优先调用该能力，否则仍复制后调用旧 RequestValidator；包装层必须通过 Core ValidateRequest 转发，使旧回调继续隔离，不能因为只读转发省略底层校验。无校验能力时不复制。
+
+`RequestProjector` 是可选的只读投影边界：必须包含原准备职责且无外部副作用，输入及共享输出的嵌套数据保持不变。Core 仅在私有准备路径复用已验证消息；公开 PrepareRequest、ReadContext、InspectContext 和 CollectContext 继续保持原有隔离。旧 RequestPreparer 无需迁移。
+
+`RequestExecutionPreparer` 在最终预算和 RequestValidator 通过后、首个 Attempt 提交前准备一次协议执行对象。输入只读，准备不执行外部动作；网络重试复用执行对象，修复请求后重新准备。返回 nil 保留原 Stream 路径，不能因此重复调用准备工厂。RequestValidator 和配置的 TokenEstimator 不因该能力被跳过；Host 包装必须保留自己的发送前职责。
+
+`Config.EstimateTokens` 保持独立可变请求副本的边界；已保证只读的估算器可改用互斥的 `EstimateTokensReadOnly`，在多轮预算检查中借用同一份请求，不得修改或保留可变访问。Core 不识别具体 SDK 或 Host 函数，也不因此省略估算回调。
 
 普通生成与摘要调用同一个模型入口，默认参数如下：
 

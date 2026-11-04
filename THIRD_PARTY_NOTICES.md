@@ -14,3 +14,10 @@ the Codex application, sandbox or approval-policy implementation.
 
 astral-core is licensed under Apache-2.0; see [LICENSE](LICENSE). Third-party
 adaptations and Go dependencies retain their respective licenses and attribution.
+
+Image Base64 validation and JSON-string validation use
+[MoeForge/moego](https://github.com/MoeForge/moego), pinned at
+`8aa874cd38e3d4f0579ff2d6c978220eccc1313e` (MIT, copyright 2026 Calcium-Ion).
+Its license is provided with the Go module and included in Astral's generated
+distribution notices. Non-SIMD Base64 validation and non-string JSON retain
+the standard-library compatibility path.

@@ -62,18 +62,22 @@ func (s *Session) commitLocked(ctx context.Context, drafts []Entry, attempts []A
 		s.rolloutID = next.RolloutID
 	}
 	compacting := false
+	addedBytes := 0
 	for _, e := range entries {
 		if e.IsHistory() {
 			s.windowIndex[e.ID] = len(s.window)
 			s.window = append(s.window, e)
+			// Only confirmed entries have their final Store-assigned sequence.
+			b, _ := json.Marshal(e)
+			addedBytes += len(b)
 		}
 		compacting = compacting || e.Kind == EntryCompaction
 	}
 	if compacting {
 		s.pruneWindow()
+	} else {
+		s.measureWindow(addedBytes, false)
 	}
-	// Store-assigned sequence digits change serialized sizes.
-	s.measureWindow(0, true)
 	close(s.changed)
 	s.changed = make(chan struct{})
 	for _, e := range entries {

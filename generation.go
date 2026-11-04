@@ -8,7 +8,7 @@ import (
 
 func (s *Session) generate(ctx context.Context, run *Run, turnID string, step preparedStep) (Frame, error) {
 	s.publish(Event{Type: EventMessageStart, RunID: run.id, TurnID: turnID})
-	reply, err := s.callModel(ctx, step.model, step.view.Request, modelCall{runID: run.id, turnID: turnID, purpose: "generation", base: step.base, attempt: step.attempt})
+	reply, err := s.callModel(ctx, step.model, step.view.Request, modelCall{runID: run.id, turnID: turnID, purpose: "generation", base: step.base, attempt: step.attempt, execution: step.execution, executionPrepared: step.executionPrepared, facts: step.view.facts})
 	frame := Frame{}
 	if err == nil {
 		frame = Frame{ID: reply.entryID, TurnID: turnID, Message: reply.Message}
@@ -25,6 +25,9 @@ type modelCall struct {
 	runID, turnID, purpose string
 	base                   Context
 	attempt                *ModelAttempt
+	execution              RequestExecution
+	executionPrepared      bool
+	facts                  *requestFacts
 }
 
 type modelResult struct {
@@ -37,7 +40,10 @@ type modelResult struct {
 // replace only a private request copy, within the same total attempt budget.
 func (s *Session) callModel(ctx context.Context, model Model, request Request, call modelCall) (modelResult, error) {
 	policy := s.config.Retry
-	frozen := clone(request)
+	// This private prepared input is read-only. Legacy Stream still receives
+	// an isolated request at its public callback boundary.
+	frozen := request
+	execution := call.execution
 	repaired := false
 	var input RequestInput
 	var previous *ModelAttempt
@@ -46,6 +52,13 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 	} else {
 		var err error
 		input, err = freezeModelRequest(s.rolloutID, call.base, frozen, model)
+		if err != nil {
+			return modelResult{}, err
+		}
+	}
+	if !call.executionPrepared {
+		var err error
+		execution, err = prepareRequestExecution(ctx, model, frozen)
 		if err != nil {
 			return modelResult{}, err
 		}
@@ -68,7 +81,11 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 		status := AttemptStatus{RunID: call.runID, TurnID: call.turnID, AttemptID: attemptID, Purpose: call.purpose, Attempt: attempt, MaxAttempts: policy.MaxAttempts, State: "running"}
 		s.publishAttempt(EventAttemptStart, status)
 		requestCtx, cancel := context.WithTimeout(ctx, policy.RequestTimeout)
-		reply, err := stream(requestCtx, model, frozen, func(event ModelEvent) {
+		streamModel, streamInput := model, frozen
+		if execution != nil {
+			streamModel, streamInput = preparedExecutionModel{Model: model, execution: execution}, Request{}
+		}
+		reply, err := stream(requestCtx, streamModel, streamInput, func(event ModelEvent) {
 			if call.purpose == "generation" {
 				s.publish(Event{Type: EventMessageUpdate, RunID: call.runID, TurnID: call.turnID, AttemptID: attemptID, Model: &event})
 			}
@@ -97,7 +114,7 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 			outcome.Status = "completed"
 			if call.purpose == "generation" {
 				entryID = newID()
-				generation := GenerationProvenance(current, frozen, reply.Message)
+				generation := generationProvenanceWithFacts(current, frozen, reply.Message, call.facts)
 				entries = []Entry{{Kind: EntryMessage, ID: entryID, RunID: call.runID, TurnID: call.turnID, Message: &reply.Message, Usage: reply.Usage, Generation: &generation}}
 				outcome.EntryID, outcome.Reply = entryID, nil
 			}
@@ -154,6 +171,10 @@ func (s *Session) callModel(ctx context.Context, model Model, request Request, c
 					return modelResult{}, protocolErr
 				}
 				frozen, repaired, retryable = candidate, true, true
+				execution, repairErr = prepareRequestExecution(ctx, model, frozen)
+				if repairErr != nil {
+					return modelResult{}, repairErr
+				}
 				input, repairErr = freezeModelRequest(s.rolloutID, call.base, frozen, model)
 				if repairErr != nil {
 					return modelResult{}, repairErr
