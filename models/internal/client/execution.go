@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 
 	core "github.com/oines/astral-core"
 	"github.com/oines/astral-core/models/internal/utils"
@@ -17,7 +16,7 @@ type execution struct {
 }
 
 func NewExecution(body map[string]any, stream func(context.Context, any, func(core.ModelEvent)) (core.Reply, error)) (core.RequestExecution, error) {
-	raw, err := json.Marshal(body)
+	raw, err := marshalExecutionBody(body)
 	if err != nil {
 		return nil, err
 	}

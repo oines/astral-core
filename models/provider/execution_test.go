@@ -50,7 +50,7 @@ func TestPreparedExecutionOwnsOneExactBodyAcrossAttempts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := requestFor(model, []core.Message{{Role: core.RoleUser, Content: []core.Content{{Type: "text", Text: "original"}, {Type: "image", MediaType: "image/png", Data: json.RawMessage(`"eA=="`)}}}})
+			request := requestFor(model, []core.Message{{Role: core.RoleUser, Content: []core.Content{{Type: "text", Text: "original"}, {Type: "image", MediaType: "image/png", Data: json.RawMessage(`"` + strings.Repeat("eHh4", 512) + `"`)}}}})
 			request.Tools = []core.ToolDefinition{{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}}
 			body, err := model.RequestBody(request)
 			if err != nil {
