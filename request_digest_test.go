@@ -1,6 +1,7 @@
 package astral
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -147,6 +148,56 @@ func TestCanonicalRequestDigestRandomDifferential(t *testing.T) {
 			request.Tools = []ToolDefinition{{Name: text(), Description: text(), Parameters: raw(), Version: text(), Sequential: rng.Intn(2) == 0, Exclusive: rng.Intn(2) == 0, MayEndRun: rng.Intn(2) == 0}}
 		}
 		checkCanonicalRequest(t, request)
+	}
+}
+
+func TestCanonicalRawMatchesLegacyNormalizationAndErrors(t *testing.T) {
+	cases := append(digestRawCases(),
+		json.RawMessage(" \t\r\n {\"html\":\"<>&\",\"line\":\"中文\u2028\u2029\"} \r\n"),
+		json.RawMessage(`{"escaped":"\ud800","lone-low":"\udfff","pair":"\ud83d\ude00"}`),
+		json.RawMessage(`{"<":1,"\u003c":2,"same":1,"same":3}`),
+		json.RawMessage{'{', '"', 0xff, '"', ':', '1', ',', '"', 0xfe, '"', ':', '2', '}'},
+		json.RawMessage(`[-0,1.00,1E-999,90071992547409931234567890,1e99999]`),
+		json.RawMessage(" \n\t "),
+		json.RawMessage(strings.Repeat("[", 10000)+"0"+strings.Repeat("]", 10000)),
+		json.RawMessage(strings.Repeat("[", 10001)+"0"+strings.Repeat("]", 10001)),
+	)
+	for value := range 256 {
+		cases = append(cases, json.RawMessage{'"', byte(value), '"'})
+	}
+	for i, raw := range cases {
+		var want, got bytes.Buffer
+		old := requestDigestWriter{out: bufio.NewWriter(&want)}
+		old.canonical(raw)
+		new := requestDigestWriter{out: bufio.NewWriter(&got)}
+		new.raw(raw)
+		if old.err == nil {
+			old.err = old.out.Flush()
+		}
+		if new.err == nil {
+			new.err = new.out.Flush()
+		}
+		if (old.err == nil) != (new.err == nil) || old.err == nil && !bytes.Equal(want.Bytes(), got.Bytes()) || old.err != nil && (reflect.TypeOf(old.err) != reflect.TypeOf(new.err) || old.err.Error() != new.err.Error()) {
+			t.Fatalf("Raw normalization/error changed at case %d: old=%v new=%v", i, old.err, new.err)
+		}
+	}
+}
+
+func TestCanonicalRawAllRequestFieldsKeepLegacyBytes(t *testing.T) {
+	for _, raw := range append(digestRawCases(), json.RawMessage(strings.Repeat("[", 9980)+"0"+strings.Repeat("]", 9980)), json.RawMessage(strings.Repeat("[", 10001)+"0"+strings.Repeat("]", 10001))) {
+		for _, set := range []func(*Request){
+			func(r *Request) { r.Messages[0].Metadata = raw },
+			func(r *Request) { r.Messages[0].Content[0].Data = raw },
+			func(r *Request) { r.Messages[0].Content[0].Metadata = raw },
+			func(r *Request) { r.Messages[0].Content[1].ToolCall.Arguments = raw },
+			func(r *Request) { r.Messages[0].Content[1].ToolCall.Metadata = raw },
+			func(r *Request) { r.Tools[0].Parameters = raw },
+			func(r *Request) { r.Options.ProviderOptions["opaque"] = raw },
+		} {
+			request := completeCopyRequest()
+			set(&request)
+			checkCanonicalRequest(t, request)
+		}
 	}
 }
 

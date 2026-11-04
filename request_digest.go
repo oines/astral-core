@@ -155,9 +155,21 @@ func (w *requestDigestWriter) canonical(value any) {
 }
 
 func (w *requestDigestWriter) raw(value json.RawMessage) {
+	if w.err != nil {
+		return
+	}
 	if simpleRequestJSONString(value) {
 		w.bytes(value)
 	} else {
+		// Raw JSON already has a representation: normalize it directly instead
+		// of first allocating a compacted/escaped Marshal(RawMessage) copy.
+		if len(value) > 0 {
+			if decoded, err := decodeJSON(value); err == nil {
+				w.encode(decoded)
+				return
+			}
+		}
+		// Keep nil -> null and the encoder's exact errors for empty/invalid Raw.
 		w.canonical(value)
 	}
 }
