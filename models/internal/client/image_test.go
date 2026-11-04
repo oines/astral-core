@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -125,5 +126,94 @@ func TestBorrowedEstimationKeepsLegacyJSONNormalization(t *testing.T) {
 	}
 	if _, err := c.EstimateRequest(request); err == nil {
 		t.Fatal("malformed UTF-8 identities bypassed normalized duplicate-call validation")
+	}
+}
+
+func TestPlainBase64MatchesNonStrictStandardDecoder(t *testing.T) {
+	check := func(encoded []byte) {
+		t.Helper()
+		_, err := base64.StdEncoding.DecodeString(string(encoded))
+		want := len(encoded) != 0 && !bytes.ContainsAny(encoded, "\r\n") && err == nil
+		if got := isPlainBase64(encoded); got != want {
+			t.Fatalf("base64 classification changed for %q: got %t want %t (%v)", encoded, got, want, err)
+		}
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	// All possible last sextets retain the non-Strict decoder's acceptance of
+	// nonzero discarded padding bits, including AB== and AAB=.
+	for i := range alphabet {
+		for j := range alphabet {
+			check([]byte{alphabet[i], alphabet[j], '=', '='})
+			check([]byte{'A', alphabet[i], alphabet[j], '='})
+			check([]byte{'A', 'A', alphabet[i], alphabet[j]})
+		}
+	}
+	for position := range 4 {
+		for value := range 256 {
+			encoded := []byte("AAAA")
+			encoded[position] = byte(value)
+			check(encoded)
+		}
+	}
+	random := rand.New(rand.NewSource(611041))
+	for i := range 100000 {
+		encoded := make([]byte, random.Intn(129))
+		if i%3 == 0 {
+			_, _ = random.Read(encoded)
+		} else {
+			for k := range encoded {
+				encoded[k] = alphabet[random.Intn(len(alphabet))]
+			}
+			if len(encoded) > 1 && i%3 == 1 {
+				encoded[len(encoded)-1] = '='
+				if i%2 == 0 {
+					encoded[len(encoded)-2] = '='
+				}
+			}
+			if len(encoded) > 0 && i%11 == 0 {
+				encoded[random.Intn(len(encoded))] = byte(random.Intn(256))
+			}
+		}
+		check(encoded)
+	}
+}
+
+func TestImageDataRandomizedLegacyEquivalence(t *testing.T) {
+	random := rand.New(rand.NewSource(611042))
+	c := &Client{}
+	for i := range 5000 {
+		pixels := make([]byte, 1+random.Intn(96))
+		_, _ = random.Read(pixels)
+		encoded := []byte(base64.StdEncoding.EncodeToString(pixels))
+		if i%3 == 0 {
+			encoded[random.Intn(len(encoded))] = byte(random.Intn(256))
+		}
+		var raw []byte
+		if i%2 == 0 {
+			raw = append(append([]byte{'"'}, encoded...), '"')
+		} else {
+			raw, _ = json.Marshal(string(encoded))
+		}
+		switch i % 7 {
+		case 0:
+			raw = append(append([]byte("\r\n\t"), raw...), ' ')
+		case 1:
+			raw = append([]byte("\u00a0"), raw...)
+		case 2:
+			if len(raw) > 2 {
+				raw = append(raw[:len(raw)-1], '\n', '"')
+			}
+		case 3:
+			raw = append(raw, []byte(" null")...)
+		}
+		part := core.Content{Type: "image", MediaType: "image/png", Data: raw}
+		if i%13 == 0 {
+			part.MediaType = "application/octet-stream"
+		}
+		want, wantErr := legacyFrozenImagePayload(part)
+		got, gotErr := c.imageData(part)
+		if (wantErr == nil) != (gotErr == nil) || wantErr == nil && !bytes.Equal(want, got) || wantErr != nil && gotErr != nil && wantErr.Error() != gotErr.Error() {
+			t.Fatalf("image fallback changed at seed case %d (%q): got %q/%v want %q/%v", i, raw, got, gotErr, want, wantErr)
+		}
 	}
 }

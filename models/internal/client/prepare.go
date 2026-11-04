@@ -238,14 +238,11 @@ func (c *Client) imageData(part core.Content) ([]byte, error) {
 		return nil, nil
 	}
 	raw := bytes.Trim(part.Data, " \t\r\n")
-	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' && !bytes.ContainsAny(raw[1:len(raw)-1], "\\\"\r\n") {
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
 		encoded := raw[1 : len(raw)-1]
-		if len(encoded) != 0 && strings.HasPrefix(part.MediaType, "image/") && base64.StdEncoding.DecodedLen(len(encoded)) <= 20<<20 {
-			// A successful decode proves an ASCII base64 alphabet. With quotes,
-			// escapes and CR/LF excluded, it also proves valid JSON string content.
-			if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encoded))); err == nil {
-				return encoded, nil
-			}
+		if strings.HasPrefix(part.MediaType, "image/") && base64.StdEncoding.DecodedLen(len(encoded)) <= 20<<20 && isPlainBase64(encoded) {
+			// The alphabet/padding scan also excludes JSON escapes and controls.
+			return encoded, nil
 		}
 	}
 	// Keep the original decoder and check order for escaped strings, malformed
@@ -265,6 +262,38 @@ func (c *Client) imageData(part core.Content) ([]byte, error) {
 		return nil, fmt.Errorf("%w: image contains invalid base64", core.ErrInvalid)
 	}
 	return encoded, nil
+}
+
+// This fixed character classification table contains no request-derived state.
+var base64Alphabet = func() (alphabet [256]bool) {
+	const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	for i := range characters {
+		alphabet[characters[i]] = true
+	}
+	return
+}()
+
+// isPlainBase64 recognizes StdEncoding's non-Strict form without decoding its
+// bytes. Padding bits are deliberately unrestricted. CR/LF and JSON escapes
+// take the original decoder path instead of being accepted as JSON characters.
+func isPlainBase64(encoded []byte) bool {
+	n := len(encoded)
+	if n == 0 || n%4 != 0 {
+		return false
+	}
+	end := n
+	if encoded[n-1] == '=' {
+		end--
+		if encoded[n-2] == '=' {
+			end--
+		}
+	}
+	for _, value := range encoded[:end] {
+		if !base64Alphabet[value] {
+			return false
+		}
+	}
+	return true
 }
 
 // EstimateRequest uses the same semantic checks as WireRequest, but neither
