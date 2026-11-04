@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 )
 
 // RequestInput pins an immutable branch boundary and the small differences
@@ -161,11 +162,9 @@ func (input RequestInput) Apply(base Request) (Request, error) {
 	if err != nil {
 		return Request{}, err
 	}
-	for _, change := range input.Changes {
-		raw, err = applyRequestChange(raw, change.Path, change)
-		if err != nil {
-			return Request{}, err
-		}
+	raw, err = applyRequestChanges(raw, input.Changes)
+	if err != nil {
+		return Request{}, err
 	}
 	var request Request
 	if err = json.Unmarshal(raw, &request); err != nil {
@@ -266,62 +265,200 @@ func diffRequestJSON(path []string, before, after json.RawMessage) []RequestChan
 	return []RequestChange{{Path: path, Op: "set", Value: after}}
 }
 
+// requestJSON expands only containers reached by a patch. Untouched leaves stay
+// raw: opaque JSON keeps its number spelling and duplicate fields, and large
+// images are not decoded and re-encoded for every sibling change.
+type requestJSON struct {
+	raw    json.RawMessage
+	object map[string]*requestJSON
+	array  []*requestJSON
+}
+
+func applyRequestChanges(raw json.RawMessage, changes []RequestChange) (json.RawMessage, error) {
+	for _, change := range changes {
+		for _, key := range change.Path {
+			if utf8.ValidString(key) {
+				continue
+			}
+			// Direct Go callers can supply invalid UTF-8 map keys. The old
+			// per-change JSON round trip normalized them before the next
+			// operation, possibly merging them with an existing U+FFFD key.
+			// Persisted recipes already have valid keys; keep their batch path.
+			var err error
+			for _, item := range changes {
+				raw, err = applyRequestChange(raw, item.Path, item)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return raw, nil
+		}
+	}
+	return applyRequestChangeBatch(raw, changes)
+}
+
+func applyRequestChangeBatch(raw json.RawMessage, changes []RequestChange) (json.RawMessage, error) {
+	if len(changes) == 0 {
+		return raw, nil
+	}
+	root := &requestJSON{raw: raw}
+	for _, change := range changes {
+		if err := root.apply(change.Path, change); err != nil {
+			return nil, err
+		}
+	}
+	if root.raw != nil {
+		return bytes.Clone(root.raw), nil
+	}
+	var output bytes.Buffer
+	if err := root.write(&output); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
 func applyRequestChange(raw json.RawMessage, path []string, change RequestChange) (json.RawMessage, error) {
+	change.Path = path
+	return applyRequestChangeBatch(raw, []RequestChange{change})
+}
+
+func (n *requestJSON) expand() error {
+	invalid := fmt.Errorf("%w: invalid frozen request change", ErrCorrupt)
+	if n.object != nil || n.array != nil {
+		return nil
+	}
+	if len(n.raw) == 0 {
+		return invalid
+	}
+	switch n.raw[0] {
+	case '{':
+		var object map[string]json.RawMessage
+		if json.Unmarshal(n.raw, &object) != nil {
+			return invalid
+		}
+		n.object = make(map[string]*requestJSON, len(object))
+		for key, value := range object {
+			n.object[key] = &requestJSON{raw: value}
+		}
+	case '[':
+		var array []json.RawMessage
+		if json.Unmarshal(n.raw, &array) != nil {
+			return invalid
+		}
+		n.array = make([]*requestJSON, len(array))
+		for index, value := range array {
+			n.array[index] = &requestJSON{raw: value}
+		}
+	default:
+		return invalid
+	}
+	n.raw = nil
+	return nil
+}
+
+func (n *requestJSON) apply(path []string, change RequestChange) error {
 	invalid := fmt.Errorf("%w: invalid frozen request change", ErrCorrupt)
 	if len(path) == 0 {
 		if change.Op != "set" || !json.Valid(change.Value) {
-			return nil, invalid
+			return invalid
 		}
-		return change.Value, nil
+		*n = requestJSON{raw: change.Value}
+		return nil
 	}
-	if len(raw) == 0 {
-		return nil, invalid
+	if err := n.expand(); err != nil {
+		return err
 	}
 	key := path[0]
-	if raw[0] == '{' {
-		var object map[string]json.RawMessage
-		if json.Unmarshal(raw, &object) != nil {
-			return nil, invalid
-		}
+	if n.object != nil {
 		if len(path) == 1 && change.Op == "remove" {
-			if _, exists := object[key]; !exists {
-				return nil, invalid
+			if _, exists := n.object[key]; !exists {
+				return invalid
 			}
-			delete(object, key)
-		} else {
-			value, err := applyRequestChange(object[key], path[1:], change)
-			if err != nil {
-				return nil, err
-			}
-			object[key] = value
+			delete(n.object, key)
+			return nil
 		}
-		return json.Marshal(object)
+		child := n.object[key]
+		if child == nil {
+			child = &requestJSON{}
+		}
+		if err := child.apply(path[1:], change); err != nil {
+			return err
+		}
+		// The old per-change parent marshal compacted child values before the
+		// next patch. Retain that path behavior without serializing the parent.
+		child.raw = bytes.TrimSpace(child.raw)
+		n.object[key] = child
+		return nil
 	}
-	if raw[0] == '[' {
-		var array []json.RawMessage
-		index, err := strconv.Atoi(key)
-		if err != nil || json.Unmarshal(raw, &array) != nil || index < 0 || index > len(array) {
-			return nil, invalid
-		}
-		if len(path) == 1 && change.Op == "insert" {
-			if !json.Valid(change.Value) {
-				return nil, invalid
-			}
-			array = append(array, nil)
-			copy(array[index+1:], array[index:])
-			array[index] = change.Value
-		} else if index == len(array) {
-			return nil, invalid
-		} else if len(path) == 1 && change.Op == "remove" {
-			array = append(array[:index], array[index+1:]...)
-		} else {
-			value, err := applyRequestChange(array[index], path[1:], change)
-			if err != nil {
-				return nil, err
-			}
-			array[index] = value
-		}
-		return json.Marshal(array)
+	index, err := strconv.Atoi(key)
+	if err != nil || index < 0 || index > len(n.array) {
+		return invalid
 	}
-	return nil, invalid
+	if len(path) == 1 && change.Op == "insert" {
+		if !json.Valid(change.Value) {
+			return invalid
+		}
+		n.array = append(n.array, nil)
+		copy(n.array[index+1:], n.array[index:])
+		n.array[index] = &requestJSON{raw: bytes.TrimSpace(change.Value)}
+	} else if index == len(n.array) {
+		return invalid
+	} else if len(path) == 1 && change.Op == "remove" {
+		copy(n.array[index:], n.array[index+1:])
+		n.array[len(n.array)-1] = nil
+		n.array = n.array[:len(n.array)-1]
+	} else {
+		child := n.array[index]
+		if err := child.apply(path[1:], change); err != nil {
+			return err
+		}
+		child.raw = bytes.TrimSpace(child.raw)
+	}
+	return nil
+}
+
+// Serialize expanded containers once. Marshal each raw leaf with the standard
+// encoder so its compaction and HTML escaping match the old RawMessage path,
+// without repeatedly copying the whole request at each ancestor.
+func (n *requestJSON) write(output *bytes.Buffer) error {
+	if n.raw != nil {
+		raw, err := json.Marshal(n.raw)
+		if err != nil {
+			return err
+		}
+		output.Write(raw)
+		return nil
+	}
+	if n.object != nil {
+		keys := make([]string, 0, len(n.object))
+		for key := range n.object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		output.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				output.WriteByte(',')
+			}
+			encoded, _ := json.Marshal(key)
+			output.Write(encoded)
+			output.WriteByte(':')
+			if err := n.object[key].write(output); err != nil {
+				return err
+			}
+		}
+		output.WriteByte('}')
+		return nil
+	}
+	output.WriteByte('[')
+	for index, child := range n.array {
+		if index > 0 {
+			output.WriteByte(',')
+		}
+		if err := child.write(output); err != nil {
+			return err
+		}
+	}
+	output.WriteByte(']')
+	return nil
 }
