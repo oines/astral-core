@@ -26,58 +26,116 @@ func (c *Client) PrepareRequest(ctx context.Context, req core.Request) (core.Req
 	if err != nil {
 		return core.Request{}, err
 	}
-	messages := make([]core.Message, 0, len(owned.Messages))
-	callIDs := map[string]string{}
-	for _, message := range owned.Messages {
+	return c.ProjectRequest(ctx, owned)
+}
+
+// ProjectRequest borrows immutable request data. Only modified containers and
+// tool-call identities are copied; untouched raw payloads remain shared.
+func (c *Client) ProjectRequest(ctx context.Context, req core.Request) (core.Request, error) {
+	if err := ctx.Err(); err != nil {
+		return core.Request{}, err
+	}
+	var messages []core.Message
+	var callIDs map[string]string
+	changedMessages := false
+	remember := func(original, projected string) {
+		if callIDs == nil {
+			callIDs = make(map[string]string)
+		}
+		callIDs[original] = projected
+	}
+	appendChanged := func(index int) {
+		if !changedMessages {
+			messages = make([]core.Message, 0, len(req.Messages))
+			messages = append(messages, req.Messages[:index]...)
+			changedMessages = true
+		}
+	}
+	for index, message := range req.Messages {
 		if message.Role != core.RoleAssistant {
 			if message.Role == core.RoleTool {
-				if id, ok := callIDs[message.ToolCallID]; ok {
+				if id, ok := callIDs[message.ToolCallID]; ok && id != message.ToolCallID {
 					message.ToolCallID = id
+					appendChanged(index)
 				}
 			}
-			messages = append(messages, message)
+			if changedMessages {
+				messages = append(messages, message)
+			}
 			continue
 		}
-		parts := make([]core.Content, 0, len(message.Content))
-		for _, part := range message.Content {
+		var parts []core.Content
+		changedParts := false
+		appendChangedPart := func(index int) {
+			if !changedParts {
+				parts = make([]core.Content, 0, len(message.Content))
+				parts = append(parts, message.Content[:index]...)
+				changedParts = true
+			}
+		}
+		for partIndex, part := range message.Content {
 			if c.compatibleNative(part) {
 				if part.ToolCall != nil {
-					callIDs[part.ToolCall.ID] = part.ToolCall.ID
+					remember(part.ToolCall.ID, part.ToolCall.ID)
 				}
-				parts = append(parts, part)
+				if changedParts {
+					parts = append(parts, part)
+				}
 				continue
 			}
 			switch part.Type {
 			case "reasoning", "provider":
 				// Display reasoning is not portable conversation text. No ciphertext,
 				// signature or synthetic reasoning is sent to a different target.
+				appendChangedPart(partIndex)
 				continue
 			case "text", "tool_call":
+				if part.Data != nil || part.Metadata != nil {
+					appendChangedPart(partIndex)
+				}
 				part.Data, part.Metadata = nil, nil
 				if part.ToolCall != nil {
 					original := part.ToolCall.ID
-					part.ToolCall.ID = portableToolID(original)
-					callIDs[original] = part.ToolCall.ID
+					projected := portableToolID(original)
+					if projected != original {
+						appendChangedPart(partIndex)
+						call := *part.ToolCall
+						call.ID = projected
+						part.ToolCall = &call
+					}
+					remember(original, projected)
 				}
 			case "refusal":
+				appendChangedPart(partIndex)
 				part.Type, part.Data, part.Metadata = "text", nil, nil
 			case "image":
 				if nativeOrigin(part) != nil {
+					appendChangedPart(partIndex)
 					part.Data, part.Metadata = nil, nil
 				}
 			default:
 				// Unknown portable modalities are left for the target encoder to reject.
 			}
-			parts = append(parts, part)
+			if changedParts {
+				parts = append(parts, part)
+			}
 		}
-		if len(parts) == 0 {
+		if changedParts {
+			message.Content = parts
+			appendChanged(index)
+		}
+		if len(message.Content) == 0 {
+			appendChanged(index)
 			continue
 		}
-		message.Content = parts
-		messages = append(messages, message)
+		if changedMessages {
+			messages = append(messages, message)
+		}
 	}
-	owned.Messages = messages
-	return owned, nil
+	if changedMessages {
+		req.Messages = messages
+	}
+	return req, nil
 }
 
 func nativeOrigin(part core.Content) *Origin {

@@ -34,6 +34,10 @@ func (m *Model) PrepareRequest(ctx context.Context, req astral.Request) (astral.
 	return m.client.PrepareRequest(ctx, req)
 }
 
+func (m *Model) ProjectRequest(ctx context.Context, req astral.Request) (astral.Request, error) {
+	return m.client.ProjectRequest(ctx, req)
+}
+
 func (m *Model) SnapshotConfig() models.Config { return m.client.SnapshotConfig() }
 
 func (m *Model) Spec() astral.ModelSpec { return m.client.Spec() }

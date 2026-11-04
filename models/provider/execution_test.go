@@ -133,3 +133,36 @@ func BenchmarkSDKImageEstimate(b *testing.B) {
 		}
 	}
 }
+
+func TestEveryProviderForwardsReadonlyProjection(t *testing.T) {
+	for _, protocol := range []string{completions.Protocol, responses.Protocol, anthropic.Protocol, google.Protocol} {
+		t.Run(protocol, func(t *testing.T) {
+			model, err := provider.New(protocol, config("target", "scope"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := requestFor(model, []core.Message{{Role: core.RoleUser, Content: []core.Content{{Type: "image", MediaType: "image/png", Data: json.RawMessage(`"eA=="`)}}}})
+			projector, ok := model.(interface {
+				ProjectRequest(context.Context, core.Request) (core.Request, error)
+			})
+			if !ok {
+				t.Fatal("provider hides readonly projection")
+			}
+			projected, err := projector.ProjectRequest(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if &projected.Messages[0].Content[0].Data[0] != &request.Messages[0].Content[0].Data[0] {
+				t.Fatal("provider forwarding copied immutable pixels")
+			}
+			owned, err := model.PrepareRequest(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owned.Messages[0].Content[0].Data[1] = 'Z'
+			if string(request.Messages[0].Content[0].Data) != `"eA=="` {
+				t.Fatal("public SDK preparation lost isolation")
+			}
+		})
+	}
+}

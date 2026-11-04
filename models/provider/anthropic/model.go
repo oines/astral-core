@@ -36,6 +36,10 @@ func (m *Model) PrepareRequest(ctx context.Context, req core.Request) (core.Requ
 	return m.client.PrepareRequest(ctx, req)
 }
 
+func (m *Model) ProjectRequest(ctx context.Context, req core.Request) (core.Request, error) {
+	return m.client.ProjectRequest(ctx, req)
+}
+
 func (m *Model) SnapshotConfig() models.Config { return m.client.SnapshotConfig() }
 
 func (m *Model) Spec() core.ModelSpec { return m.client.Spec() }
