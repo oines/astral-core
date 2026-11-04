@@ -313,32 +313,19 @@ func scalarPlainBase64(encoded []byte, end int) bool {
 	return true
 }
 
-// EstimateRequest uses the same semantic checks as WireRequest, but neither
-// clones history nor replaces images with wire-format strings.
+// EstimateRequest validates the actual pixels before using small image
+// placeholders for message validation. Image estimates have a fixed weight and
+// do not read Data/URL, so this avoids validating the same pixel JSON twice
+// without changing the content counted by Estimate or allocating data URLs.
 func (c *Client) EstimateRequest(req core.Request) (int, error) {
-	// The previous JSON round trip normalized malformed UTF-8 identifiers before
-	// comparing route/tool identities. Keep that uncommon path without copying
-	// ordinary image payloads during every content estimate.
-	if needsRequestNormalization(req) {
-		var err error
-		req, err = cloneRequest(req)
-		if err != nil {
-			return 0, err
-		}
-	}
-	for _, message := range req.Messages {
-		for _, part := range message.Content {
-			if part.Type == "image" {
-				if _, err := c.imageData(part); err != nil {
-					return 0, err
-				}
-			}
-		}
-	}
-	if err := c.Validate(req); err != nil {
+	wire, err := c.WireRequest(req, true)
+	if err != nil {
 		return 0, err
 	}
-	return c.Estimate(req)
+	if err := c.Validate(wire); err != nil {
+		return 0, err
+	}
+	return c.Estimate(wire)
 }
 
 func needsRequestNormalization(req core.Request) bool {
