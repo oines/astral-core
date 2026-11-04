@@ -37,7 +37,9 @@ Input.Contexts 与 Message 整体接收、整体应用。Steer 优先，默认�
 
 队列或尝试审计引起的版本增加可以使用最新版本提交；准备至冻结期间拒绝 SelectModel；其他分支变化返回 ErrConflict，被清除的输入不能应用。Model / Computer I/O 不持有 Session 锁或数据库事务。上下文采集、最终预算或提交失败不会改变旧有效上下文；未提交摘要在重启后可以重算。提交成功而回执丢失，通过稳定 Commit ID 确认。
 
-CollectContext 接收 SessionID、Reason、CompactionID 和只读 Context，返回独立消息。Host 负责发现、权限、指纹及相对当前分支的去重。新 CompactionID 要重新收集完整快照；Core 不把它当作持久待完成任务。动态环境应使用 RoleUser 普通 Context，SystemPrompt 仅放稳定规则。回调不能修改 Core 或执行业务副作用。
+CollectContext 接收 SessionID、Reason、CompactionID 和 Context 视图，返回独立消息。Host 负责发现、权限、指纹及相对当前分支的去重。新 CompactionID 要重新收集完整快照；Core 不把它当作持久待完成任务。动态环境应使用 RoleUser 普通 Context，SystemPrompt 仅放稳定规则。回调不能修改 Core 或执行业务副作用。
+
+旧 `Config.CollectContext` 获得独立可变副本；互斥的 `CollectContextReadOnly` 显式借用不可变 Context，不得修改或保留其中 slice、map、指针和 RawMessage 的可变访问。两种路径返回的 batch 都经 `copyJSON` 隔离后再验证与提交；创建、普通轮次、被动跳过及 `after_compact` 的采集条件不变。
 
 手动 Compact 复用准备流程，可应用选中的被动 Context，但不消费驱动输入、不生成普通回答。摘要请求独立校验预算，按完整消息/工具批次选择旧历史，沿用普通请求的对话顺序，保留原生消息、多模态内容和工具调用关系；同批工具结果按调用声明顺序紧随 assistant 调用，不额外附加内部历史 ID 或执行记录清单。仅摘要请求超预算时可缩短工具文本的副本；原始历史不变。只有有效非空文本摘要可提交。
 

@@ -128,12 +128,12 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 		}
 		// Idle passive injection avoids an ordinary scan, but a compaction
 		// always needs a fresh snapshot for its newly constructed context.
-		if (!options.skipCollect || compactionID != "") && s.config.CollectContext != nil {
+		if (!options.skipCollect || compactionID != "") && (s.config.CollectContext != nil || s.config.CollectContextReadOnly != nil) {
 			reason := options.reason
 			if compactionID != "" {
 				reason = "after_compact"
 			}
-			batch, err := collectContext(ctx, s.config.CollectContext, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: cloneContext(view)})
+			batch, err := collectContext(ctx, s.config, ContextBoundary{SessionID: s.id, Reason: reason, CompactionID: compactionID, Context: view})
 			if err != nil {
 				return Context{}, nil, err
 			}
@@ -378,7 +378,12 @@ func (s *Session) checkRequestBytes(request Request) error {
 	return err
 }
 
-func collectContext(ctx context.Context, collect CollectContext, boundary ContextBoundary) (messages []Message, err error) {
+func collectContext(ctx context.Context, config Config, boundary ContextBoundary) (messages []Message, err error) {
+	collect := config.CollectContextReadOnly
+	if collect == nil {
+		collect = config.CollectContext
+		boundary.Context = cloneContext(boundary.Context)
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("context collector panicked: %v", p)
