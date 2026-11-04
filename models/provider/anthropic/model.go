@@ -77,9 +77,13 @@ func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
 
 // requestBody only borrows caller-owned history during this synchronous build.
 // Validation uses small image placeholders; final execution resolves real pixels.
-func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, error) {
+func (m *Model) requestBody(req core.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, validation)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +113,7 @@ func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, 
 	}
 	for _, message := range req.Messages {
 		parts := []any{}
-		for _, part := range message.Content {
+		for i, part := range message.Content {
 			if message.Role == core.RoleAssistant && len(part.Metadata) > 0 {
 				if err := m.client.Replay(part, "anthropic.block"); err != nil {
 					return nil, err
@@ -131,7 +135,9 @@ func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, 
 				parts = append(parts, map[string]any{"type": "tool_use", "id": part.ToolCall.ID, "name": part.ToolCall.Name, "input": part.ToolCall.Arguments})
 			case "image":
 				source := map[string]any{"type": "url", "url": part.URL}
-				if strings.HasPrefix(part.URL, "data:") {
+				if data, ok := images.Base64(&message.Content[i]); ok {
+					source = map[string]any{"type": "base64", "media_type": part.MediaType, "data": data}
+				} else if strings.HasPrefix(part.URL, "data:") {
 					meta, data, ok := strings.Cut(strings.TrimPrefix(part.URL, "data:"), ";base64,")
 					if !ok || !strings.HasPrefix(meta, "image/") {
 						return nil, fmt.Errorf("%w: invalid image data URL", core.ErrInvalid)
@@ -270,7 +276,7 @@ func (m *Model) PrepareExecution(ctx context.Context, req core.Request) (core.Re
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	body, err := m.requestBody(req, false)
+	body, err := m.requestBody(req, false, true)
 	if err != nil {
 		return nil, err
 	}

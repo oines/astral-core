@@ -74,9 +74,13 @@ func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
 
 // requestBody only borrows caller-owned history during this synchronous build.
 // Validation uses small image placeholders; final execution resolves real pixels.
-func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, error) {
+func (m *Model) requestBody(req core.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, validation)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +106,7 @@ func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, 
 	calls := map[string]callIdentity{}
 	for _, msg := range req.Messages {
 		parts := []any{}
-		for _, part := range msg.Content {
+		for i, part := range msg.Content {
 			if msg.Role == core.RoleAssistant && len(part.Metadata) > 0 {
 				if err := m.client.Replay(part, "google.part"); err != nil {
 					return nil, err
@@ -126,6 +130,10 @@ func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, 
 				parts = append(parts, map[string]any{"functionCall": map[string]any{"id": c.ID, "name": c.Name, "args": c.Arguments}})
 				calls[c.ID] = callIdentity{c.Name, c.ID}
 			case "image":
+				if data, ok := images.Base64(&msg.Content[i]); ok {
+					parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": part.MediaType, "data": data}})
+					continue
+				}
 				media, data, ok := strings.Cut(strings.TrimPrefix(part.URL, "data:"), ";base64,")
 				if !strings.HasPrefix(part.URL, "data:") || !ok || !strings.HasPrefix(media, "image/") {
 					return nil, fmt.Errorf("%w: Gemini requires a resolved image data URL", core.ErrInvalid)
@@ -268,7 +276,7 @@ func (m *Model) PrepareExecution(ctx context.Context, req core.Request) (core.Re
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	body, err := m.requestBody(req, false)
+	body, err := m.requestBody(req, false, true)
 	if err != nil {
 		return nil, err
 	}

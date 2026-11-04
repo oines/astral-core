@@ -12,6 +12,8 @@ import (
 type executionImage struct {
 	marker   []byte
 	value    string
+	prefix   string
+	data     []byte
 	position int
 }
 
@@ -36,7 +38,7 @@ func marshalExecutionBody(body map[string]any) ([]byte, error) {
 	size := len(raw)
 	for i := range images {
 		image := &images[i]
-		extra := len(image.value) + 2 - len(image.marker)
+		extra := len(image.prefix) + len(image.value) + len(image.data) + 2 - len(image.marker)
 		if extra > int(^uint(0)>>1)-size {
 			return json.Marshal(body)
 		}
@@ -48,7 +50,9 @@ func marshalExecutionBody(body map[string]any) ([]byte, error) {
 	for _, image := range images {
 		result = append(result, raw[position:image.position]...)
 		result = append(result, '"')
+		result = append(result, image.prefix...)
 		result = append(result, image.value...)
+		result = append(result, image.data...)
 		result = append(result, '"')
 		position = image.position + len(image.marker)
 	}
@@ -142,6 +146,11 @@ func executionImageMetadata(value any, images *[]executionImage, depth int) (any
 		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)
 		marker = append(marker, `\u0000"`...)
 		*images = append(*images, executionImage{marker: marker, value: value})
+		return json.RawMessage(marker), true, true
+	case executionImageValue:
+		marker := strconv.AppendInt([]byte(executionImagePrefix), int64(len(*images)), 10)
+		marker = append(marker, `\u0000"`...)
+		*images = append(*images, executionImage{marker: marker, prefix: value.prefix, data: value.data})
 		return json.RawMessage(marker), true, true
 	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64, json.Number, json.RawMessage, []byte, []string:
 		return value, false, true

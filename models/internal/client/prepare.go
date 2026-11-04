@@ -174,7 +174,13 @@ func cloneRequest(req core.Request) (core.Request, error) {
 
 // WireRequest turns frozen image pixels into protocol input immediately before
 // encoding. It neither resolves files nor changes the provider-neutral snapshot.
-func (c *Client) WireRequest(req core.Request, estimate bool) (core.Request, error) {
+// A non-nil private execution map defers safe pixels by final Content address;
+// ordinary callers continue to receive complete string URLs.
+func (c *Client) WireRequest(req core.Request, estimate bool, deferred ...ExecutionImages) (core.Request, error) {
+	var images ExecutionImages
+	if len(deferred) > 0 {
+		images = deferred[0]
+	}
 	if needsRequestNormalization(req) {
 		var err error
 		req, err = cloneRequest(req)
@@ -210,6 +216,9 @@ func (c *Client) WireRequest(req core.Request, estimate bool) (core.Request, err
 			}
 			if estimate {
 				part.URL = "data:image/png;base64,AA=="
+			} else if value, ok := images.deferredValue(part, encoded); ok {
+				part.URL = value.prefix
+				images[&owned.Messages[i].Content[j]] = value
 			} else {
 				part.URL = "data:" + part.MediaType + ";base64," + string(encoded)
 			}

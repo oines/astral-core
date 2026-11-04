@@ -21,9 +21,13 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 
 // requestBody only borrows caller-owned history during this synchronous build.
 // Validation uses small image placeholders; final execution resolves real pixels.
-func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any, error) {
+func (m *Model) requestBody(req astral.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, validation)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +46,7 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 				input = append(input, item)
 			}
 		case astral.RoleTool:
-			parts, err := inputParts(message.Content)
+			parts, err := inputParts(message.Content, images)
 			if err != nil {
 				return nil, err
 			}
@@ -52,7 +56,7 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 			}
 			input = append(input, map[string]any{"type": "function_call_output", "call_id": message.ToolCallID, "output": output})
 		default:
-			parts, err := inputParts(message.Content)
+			parts, err := inputParts(message.Content, images)
 			if err != nil {
 				return nil, err
 			}
@@ -125,9 +129,9 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 	return body, nil
 }
 
-func inputParts(parts []astral.Content) ([]any, error) {
+func inputParts(parts []astral.Content, images client.ExecutionImages) ([]any, error) {
 	result := make([]any, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
 		switch part.Type {
 		case "text":
 			result = append(result, map[string]any{"type": "input_text", "text": part.Text})
@@ -135,7 +139,7 @@ func inputParts(parts []astral.Content) ([]any, error) {
 			if part.URL == "" {
 				return nil, fmt.Errorf("%w: image requires a resolved URL or data URL", astral.ErrInvalid)
 			}
-			result = append(result, map[string]any{"type": "input_image", "image_url": part.URL})
+			result = append(result, map[string]any{"type": "input_image", "image_url": images.URL(&parts[i])})
 		default:
 			return nil, fmt.Errorf("%w: unsupported Responses input part %q", astral.ErrInvalid, part.Type)
 		}

@@ -21,9 +21,13 @@ func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
 
 // requestBody only borrows caller-owned history during this synchronous build.
 // Validation uses small image placeholders; final execution resolves real pixels.
-func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any, error) {
+func (m *Model) requestBody(req astral.Request, validation bool, execution ...bool) (map[string]any, error) {
+	var images client.ExecutionImages
+	if len(execution) > 0 && execution[0] {
+		images = make(client.ExecutionImages)
+	}
 	var err error
-	req, err = m.client.WireRequest(req, validation)
+	req, err = m.client.WireRequest(req, validation, images)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +59,7 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 		}
 		if message.Role == astral.RoleTool {
 			var text strings.Builder
-			for _, part := range message.Content {
+			for i, part := range message.Content {
 				switch part.Type {
 				case "text":
 					text.WriteString(part.Text)
@@ -65,7 +69,7 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 					}
 					text.WriteString("\n[Image returned by this tool; attached after the tool-result batch.]")
 					toolImages = append(toolImages, map[string]any{"type": "text", "text": "Image from tool call " + message.ToolCallID + ":"},
-						map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
+						map[string]any{"type": "image_url", "image_url": map[string]any{"url": images.URL(&message.Content[i])}})
 				default:
 					return nil, fmt.Errorf("%w: unsupported tool output part %q", astral.ErrInvalid, part.Type)
 				}
@@ -73,7 +77,7 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": message.ToolCallID, "content": text.String()})
 			continue
 		}
-		parts, err := inputParts(message.Content)
+		parts, err := inputParts(message.Content, images)
 		if err != nil {
 			return nil, err
 		}
@@ -150,9 +154,9 @@ func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any
 	return body, nil
 }
 
-func inputParts(parts []astral.Content) ([]any, error) {
+func inputParts(parts []astral.Content, images client.ExecutionImages) ([]any, error) {
 	result := make([]any, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
 		switch part.Type {
 		case "text":
 			result = append(result, map[string]any{"type": "text", "text": part.Text})
@@ -160,7 +164,7 @@ func inputParts(parts []astral.Content) ([]any, error) {
 			if part.URL == "" {
 				return nil, fmt.Errorf("%w: image requires a resolved URL or data URL", astral.ErrInvalid)
 			}
-			result = append(result, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
+			result = append(result, map[string]any{"type": "image_url", "image_url": map[string]any{"url": images.URL(&parts[i])}})
 		default:
 			return nil, fmt.Errorf("%w: unsupported chat input part %q", astral.ErrInvalid, part.Type)
 		}

@@ -87,7 +87,7 @@ func (m *Model) PrepareExecution(ctx context.Context, req astral.Request) (astra
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	body, err := m.requestBody(req, false)
+	body, err := m.requestBody(req, false, true)
 	if err != nil {
 		return nil, err
 	}
