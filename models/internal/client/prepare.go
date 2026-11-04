@@ -288,6 +288,10 @@ func isPlainBase64(encoded []byte) bool {
 			end--
 		}
 	}
+	return validatePlainBase64(encoded, end)
+}
+
+func scalarPlainBase64(encoded []byte, end int) bool {
 	for _, value := range encoded[:end] {
 		if !base64Alphabet[value] {
 			return false

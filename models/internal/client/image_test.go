@@ -217,3 +217,52 @@ func TestImageDataRandomizedLegacyEquivalence(t *testing.T) {
 		}
 	}
 }
+
+func TestPlainBase64SIMDBoundariesAndIgnoredNewlines(t *testing.T) {
+	check := func(encoded []byte) {
+		t.Helper()
+		original := bytes.Clone(encoded)
+		_, err := base64.StdEncoding.DecodeString(string(encoded))
+		want := len(encoded) != 0 && !bytes.ContainsAny(encoded, "\r\n") && err == nil
+		if got := isPlainBase64(encoded); got != want {
+			t.Fatalf("boundary validation changed: length=%d input=%q got=%t want=%t err=%v", len(encoded), encoded, got, want, err)
+		}
+		if !bytes.Equal(encoded, original) {
+			t.Fatal("validator changed borrowed image bytes")
+		}
+	}
+	for _, size := range []int{4, 28, 32, 36, 60, 64, 68, 124, 128, 132, 188, 192, 252, 256, 508, 512, 1020, 1024, 4092, 4096} {
+		for offset := range 64 {
+			storage := bytes.Repeat([]byte("A"), offset+size)
+			encoded := storage[offset:len(storage):len(storage)]
+			check(encoded)
+			for _, position := range []int{0, size / 2, size - 1} {
+				for _, invalid := range []byte{'=', '\\', '"', '\r', '\n', 0, 0xff, '-', '_'} {
+					encoded[position] = invalid
+					check(encoded)
+				}
+				encoded[position] = 'A'
+			}
+		}
+		plain := strings.Repeat("A", size)
+		for _, tail := range []string{"", "AA==", "AB==", "AAA=", "AAB="} {
+			value := plain + tail
+			check([]byte(value))
+			for _, position := range []int{0, size / 2, len(value)} {
+				check([]byte(value[:position] + "\r\n\r\n" + value[position:]))
+			}
+		}
+	}
+}
+
+func TestPlainBase64ValidPayloadDoesNotAllocate(t *testing.T) {
+	encoded := bytes.Repeat([]byte("A"), 64<<10)
+	allocations := testing.AllocsPerRun(20, func() {
+		if !isPlainBase64(encoded) {
+			panic("valid base64 rejected")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("valid image validation allocated %.0f objects", allocations)
+	}
+}
