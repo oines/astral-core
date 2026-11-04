@@ -28,7 +28,7 @@ func (s *Session) Compact(ctx context.Context, instructions string) (CompactionR
 	return record, err
 }
 func (s *Session) draftCompaction(ctx context.Context, instructions string, normalModel Model, path []Entry, keepTokens int, force bool, runID, turnID string) (CompactionRecord, error) {
-	view, err := project(path)
+	view, err := projectBorrowed(path)
 	if err != nil {
 		return CompactionRecord{}, err
 	}
@@ -123,9 +123,17 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 			if err != nil {
 				return CompactionRecord{}, err
 			}
-			if !sameJSON(source.Request.Messages, selected) {
+			if !sameRequestMessages(source.Request.Messages, selected) {
 				source.anchor = nil
 			}
+		}
+	}
+	if hasReportedContextUsage(source) {
+		// Source is fixed throughout the candidate search. Retain this exact
+		// usage-prefix digest instead of re-reading its payload for every cap.
+		source.facts, err = measureRequestFacts(source.Request, source.anchor.index)
+		if err != nil {
+			return CompactionRecord{}, err
 		}
 	}
 	summaryModelID := summaryModel.Spec().ID
