@@ -79,7 +79,7 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	old, err := projectBorrowed(path)
+	old, err := projectPrepared(path)
 	if err != nil {
 		return preparedStep{}, summary, err
 	}

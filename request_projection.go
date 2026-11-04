@@ -25,7 +25,7 @@ func ProjectRequest(ctx context.Context, model Model, request Request) (Request,
 }
 
 // projectRequest is only for Session-owned, already validated message inputs:
-// history passes projectBorrowed's validateProtocol, queued inputs pass
+// history bodies pass Session load/admission validation, queued inputs pass
 // QueuedInput.Validate, and collected context passes ValidateContext. Summary
 // construction only adds plain text or shortens text in those valid messages.
 // The read-only projector contract lets an unchanged message retain that result.
