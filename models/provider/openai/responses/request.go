@@ -12,8 +12,18 @@ import (
 // RequestBody returns the exact credential-free body. Core owns conversation
 // state; requests never depend on server-side previous_response_id storage.
 func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
+	owned, err := astral.CopyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return m.requestBody(owned, false)
+}
+
+// requestBody only borrows caller-owned history during this synchronous build.
+// Validation uses small image placeholders; final execution resolves real pixels.
+func (m *Model) requestBody(req astral.Request, validation bool) (map[string]any, error) {
 	var err error
-	req, err = m.client.WireRequest(req, false)
+	req, err = m.client.WireRequest(req, validation)
 	if err != nil {
 		return nil, err
 	}

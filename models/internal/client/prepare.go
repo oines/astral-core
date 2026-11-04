@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	core "github.com/oines/astral-core"
 )
@@ -79,6 +81,9 @@ func (c *Client) PrepareRequest(ctx context.Context, req core.Request) (core.Req
 }
 
 func nativeOrigin(part core.Content) *Origin {
+	if len(part.Metadata) == 0 {
+		return nil
+	}
 	var value metadata
 	if json.Unmarshal(part.Metadata, &value) != nil || value.Origin.Protocol == "" {
 		return nil
@@ -105,61 +110,149 @@ func (c *Client) compatibleNative(part core.Content) bool {
 }
 
 func cloneRequest(req core.Request) (core.Request, error) {
-	data, err := json.Marshal(req)
-	if err != nil {
-		return core.Request{}, err
-	}
-	var owned core.Request
-	err = json.Unmarshal(data, &owned)
-	return owned, err
+	return core.CopyRequest(req)
 }
 
 // WireRequest turns frozen image pixels into protocol input immediately before
 // encoding. It neither resolves files nor changes the provider-neutral snapshot.
 func (c *Client) WireRequest(req core.Request, estimate bool) (core.Request, error) {
-	owned, err := cloneRequest(req)
-	if err != nil {
-		return core.Request{}, err
+	if needsRequestNormalization(req) {
+		var err error
+		req, err = cloneRequest(req)
+		if err != nil {
+			return core.Request{}, err
+		}
 	}
-	for i := range owned.Messages {
-		for j := range owned.Messages[i].Content {
-			part := &owned.Messages[i].Content[j]
+	// Only image URL/Data fields change. The caller's message/content slices and
+	// opaque payloads remain untouched; copy each container only when it changes.
+	owned := req
+	copiedMessages := false
+	for i, message := range req.Messages {
+		copiedContent := false
+		for j, original := range message.Content {
+			part := original
 			if part.Type != "image" {
 				continue
 			}
-			if c.Config.Images == "unsupported" {
-				return core.Request{}, fmt.Errorf("%w: this model does not support image input", core.ErrInvalid)
+			encoded, err := c.imageData(part)
+			if err != nil {
+				return core.Request{}, err
 			}
-			if c.compatibleNative(*part) {
+			if len(encoded) == 0 {
 				continue
 			}
-			if len(part.Data) == 0 {
-				u, parseErr := url.Parse(part.URL)
-				valid := parseErr == nil && (u.Scheme == "https" && u.Host != "" || u.Scheme == "http" && u.Host != "" || u.Scheme == "data" && strings.HasPrefix(part.URL, "data:image/"))
-				if !valid {
-					return core.Request{}, fmt.Errorf("%w: image requires frozen pixels or a resolved HTTP/data URL", core.ErrInvalid)
-				}
-				continue
+			if !copiedMessages {
+				owned.Messages = append([]core.Message(nil), req.Messages...)
+				copiedMessages = true
 			}
-			var encoded string
-			if json.Unmarshal(part.Data, &encoded) != nil || encoded == "" || !strings.HasPrefix(part.MediaType, "image/") {
-				return core.Request{}, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
-			}
-			if base64.StdEncoding.DecodedLen(len(encoded)) > 20<<20 {
-				return core.Request{}, fmt.Errorf("%w: image exceeds the 20 MiB model limit", core.ErrInvalid)
-			}
-			if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))); err != nil {
-				return core.Request{}, fmt.Errorf("%w: image contains invalid base64", core.ErrInvalid)
+			if !copiedContent {
+				owned.Messages[i].Content = append([]core.Content(nil), message.Content...)
+				copiedContent = true
 			}
 			if estimate {
 				part.URL = "data:image/png;base64,AA=="
 			} else {
-				part.URL = "data:" + part.MediaType + ";base64," + encoded
+				part.URL = "data:" + part.MediaType + ";base64," + string(encoded)
 			}
 			part.Data = nil
+			owned.Messages[i].Content[j] = part
 		}
 	}
 	return owned, nil
+}
+
+// imageData validates the original frozen payload without producing a data URL
+// or copying the usual unescaped base64 JSON string. Escaped JSON strings retain
+// the standard decoder's semantics, including its error handling.
+func (c *Client) imageData(part core.Content) ([]byte, error) {
+	if c.Config.Images == "unsupported" {
+		return nil, fmt.Errorf("%w: this model does not support image input", core.ErrInvalid)
+	}
+	if c.compatibleNative(part) {
+		return nil, nil
+	}
+	if len(part.Data) == 0 {
+		u, err := url.Parse(part.URL)
+		valid := err == nil && (u.Scheme == "https" && u.Host != "" || u.Scheme == "http" && u.Host != "" || u.Scheme == "data" && strings.HasPrefix(part.URL, "data:image/"))
+		if !valid {
+			return nil, fmt.Errorf("%w: image requires frozen pixels or a resolved HTTP/data URL", core.ErrInvalid)
+		}
+		return nil, nil
+	}
+	raw := bytes.TrimSpace(part.Data)
+	var encoded []byte
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' && !bytes.ContainsAny(raw[1:len(raw)-1], "\\\"\r\n") && json.Valid(raw) {
+		encoded = raw[1 : len(raw)-1]
+	} else {
+		var decoded string
+		if json.Unmarshal(part.Data, &decoded) != nil {
+			return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
+		}
+		encoded = []byte(decoded)
+	}
+	if len(encoded) == 0 || !strings.HasPrefix(part.MediaType, "image/") {
+		return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
+	}
+	if base64.StdEncoding.DecodedLen(len(encoded)) > 20<<20 {
+		return nil, fmt.Errorf("%w: image exceeds the 20 MiB model limit", core.ErrInvalid)
+	}
+	if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encoded))); err != nil {
+		return nil, fmt.Errorf("%w: image contains invalid base64", core.ErrInvalid)
+	}
+	return encoded, nil
+}
+
+// EstimateRequest uses the same semantic checks as WireRequest, but neither
+// clones history nor replaces images with wire-format strings.
+func (c *Client) EstimateRequest(req core.Request) (int, error) {
+	// The previous JSON round trip normalized malformed UTF-8 identifiers before
+	// comparing route/tool identities. Keep that uncommon path without copying
+	// ordinary image payloads during every content estimate.
+	if needsRequestNormalization(req) {
+		var err error
+		req, err = cloneRequest(req)
+		if err != nil {
+			return 0, err
+		}
+	}
+	for _, message := range req.Messages {
+		for _, part := range message.Content {
+			if part.Type == "image" {
+				if _, err := c.imageData(part); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err := c.Validate(req); err != nil {
+		return 0, err
+	}
+	return c.Estimate(req)
+}
+
+func needsRequestNormalization(req core.Request) bool {
+	if !utf8.ValidString(req.ModelID) || !utf8.ValidString(req.ModelRevision) || !utf8.ValidString(req.Options.ToolChoice.Name) {
+		return true
+	}
+	if req.Options.Stop != nil && len(req.Options.Stop) == 0 {
+		return true
+	}
+	for _, tool := range req.Tools {
+		if !utf8.ValidString(tool.Name) {
+			return true
+		}
+	}
+	for _, message := range req.Messages {
+		if !utf8.ValidString(message.ToolCallID) {
+			return true
+		}
+		for _, part := range message.Content {
+			if part.ToolCall != nil && (part.ToolCall.Arguments == nil || !utf8.ValidString(part.ToolCall.ID) || !utf8.ValidString(part.ToolCall.Name)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Protocols constrain call IDs differently. Canonical IDs that are already

@@ -46,7 +46,7 @@ func (m *Model) ValidateRequest(ctx context.Context, req core.Request) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := m.RequestBody(req)
+	_, err := m.requestBody(req, true)
 	return err
 }
 
@@ -54,20 +54,22 @@ func (m *Model) EstimateTokens(ctx context.Context, req core.Request) (int, erro
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	var err error
-	req, err = m.client.WireRequest(req, true)
-	if err != nil {
-		return 0, err
-	}
-	if err := m.client.Validate(req); err != nil {
-		return 0, err
-	}
-	return m.client.Estimate(req)
+	return m.client.EstimateRequest(req)
 }
 
 func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
+	owned, err := core.CopyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return m.requestBody(owned, false)
+}
+
+// requestBody only borrows caller-owned history during this synchronous build.
+// Validation uses small image placeholders; final execution resolves real pixels.
+func (m *Model) requestBody(req core.Request, validation bool) (map[string]any, error) {
 	var err error
-	req, err = m.client.WireRequest(req, false)
+	req, err = m.client.WireRequest(req, validation)
 	if err != nil {
 		return nil, err
 	}
@@ -247,10 +249,26 @@ func partFromBlock(c *client.Client, block map[string]any) core.Content {
 }
 
 func (m *Model) Stream(ctx context.Context, req core.Request, emit func(core.ModelEvent)) (core.Reply, error) {
-	body, err := m.RequestBody(req)
+	body, err := m.requestBody(req, false)
 	if err != nil {
 		return core.Reply{}, err
 	}
+	return m.streamBody(ctx, body, emit)
+}
+
+func (m *Model) PrepareExecution(ctx context.Context, req core.Request) (core.RequestExecution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	body, err := m.requestBody(req, false)
+	if err != nil {
+		return nil, err
+	}
+	return client.NewExecution(body, m.streamBody)
+}
+
+func (m *Model) streamBody(ctx context.Context, body any, emit func(core.ModelEvent)) (core.Reply, error) {
+	var err error
 	if emit == nil {
 		emit = func(core.ModelEvent) {}
 	}

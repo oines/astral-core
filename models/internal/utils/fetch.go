@@ -25,6 +25,11 @@ type RequestOptions struct {
 	DecodeError ErrorDecoder
 }
 
+// EncodedJSON is owned by one request execution and has already passed the
+// standard JSON encoder. It is never exposed by public RequestBody methods.
+// BuildRequest opens a fresh reader instead of encoding a second body copy.
+type EncodedJSON []byte
+
 func BuildRequest(ctx context.Context, opts *RequestOptions) (*http.Request, error) {
 	fullURL, err := buildURL(opts.BaseURL, opts.Path, opts.Query)
 	if err != nil {
@@ -42,9 +47,13 @@ func BuildRequest(ctx context.Context, opts *RequestOptions) (*http.Request, err
 
 	var body io.Reader
 	if opts.Body != nil {
-		data, err := json.Marshal(opts.Body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal request body: %w", err)
+		data, encoded := opts.Body.(EncodedJSON)
+		if !encoded {
+			var err error
+			data, err = json.Marshal(opts.Body)
+			if err != nil {
+				return nil, fmt.Errorf("marshal request body: %w", err)
+			}
 		}
 		body = bytes.NewReader(data)
 	}
