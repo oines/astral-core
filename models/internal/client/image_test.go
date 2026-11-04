@@ -1,7 +1,11 @@
 package client
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -20,6 +24,17 @@ func TestImagePayloadValidationKeepsJSONAndBase64Semantics(t *testing.T) {
 		{"escaped newline", `"eA==\n"`, "eA==\n", true},
 		{"escaped slash", `"\/w=="`, "/w==", true},
 		{"invalid raw newline", "\"eA==\n\"", "", false},
+		{"invalid raw CRLF", "\"eA==\r\n\"", "", false},
+		{"invalid raw tab", "\"eA==\t\"", "", false},
+		{"invalid raw NUL", "\"eA==\x00\"", "", false},
+		{"invalid raw quote", "\"eA==\"\"", "", false},
+		{"non-JSON outer whitespace", "\u00a0\"eA==\"\u00a0", "", false},
+		{"non-JSON vertical whitespace", "\v\"eA==\"", "", false},
+		{"invalid UTF-8", string([]byte{'"', 0xff, '"'}), "", false},
+		{"non-ASCII", `"中文"`, "", false},
+		{"escaped surrogate", `"\ud800"`, "", false},
+		{"escaped CRLF", `"eA==\r\n"`, "eA==\r\n", true},
+		{"trailing data", `"eA==" null`, "", false},
 		{"invalid base64", `"eA=!"`, "", false},
 		{"empty", `""`, "", false},
 		{"null", `null`, "", false},
@@ -33,11 +48,31 @@ func TestImagePayloadValidationKeepsJSONAndBase64Semantics(t *testing.T) {
 			if (err == nil) != test.valid || test.valid && string(data) != test.want {
 				t.Fatalf("data=%q error=%v", data, err)
 			}
+			oldData, oldErr := legacyFrozenImagePayload(part)
+			if (err == nil) != (oldErr == nil) || err == nil && !bytes.Equal(data, oldData) || err != nil && oldErr != nil && err.Error() != oldErr.Error() {
+				t.Fatalf("legacy payload/error changed: got %q/%v want %q/%v", data, err, oldData, oldErr)
+			}
 			if string(part.Data) != test.raw {
 				t.Fatal("validation changed frozen input")
 			}
 		})
 	}
+}
+
+// The original unmarshal-first image path is the compatibility oracle for
+// fallback error ordering and escaped/invalid UTF-8 handling.
+func legacyFrozenImagePayload(part core.Content) ([]byte, error) {
+	var encoded string
+	if json.Unmarshal(part.Data, &encoded) != nil || encoded == "" || !strings.HasPrefix(part.MediaType, "image/") {
+		return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
+	}
+	if base64.StdEncoding.DecodedLen(len(encoded)) > 20<<20 {
+		return nil, fmt.Errorf("%w: image exceeds the 20 MiB model limit", core.ErrInvalid)
+	}
+	if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))); err != nil {
+		return nil, fmt.Errorf("%w: image contains invalid base64", core.ErrInvalid)
+	}
+	return []byte(encoded), nil
 }
 
 func TestWireImagesCopyOnlyTheirChangedContainers(t *testing.T) {

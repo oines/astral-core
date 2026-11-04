@@ -237,17 +237,24 @@ func (c *Client) imageData(part core.Content) ([]byte, error) {
 		}
 		return nil, nil
 	}
-	raw := bytes.TrimSpace(part.Data)
-	var encoded []byte
-	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' && !bytes.ContainsAny(raw[1:len(raw)-1], "\\\"\r\n") && json.Valid(raw) {
-		encoded = raw[1 : len(raw)-1]
-	} else {
-		var decoded string
-		if json.Unmarshal(part.Data, &decoded) != nil {
-			return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
+	raw := bytes.Trim(part.Data, " \t\r\n")
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' && !bytes.ContainsAny(raw[1:len(raw)-1], "\\\"\r\n") {
+		encoded := raw[1 : len(raw)-1]
+		if len(encoded) != 0 && strings.HasPrefix(part.MediaType, "image/") && base64.StdEncoding.DecodedLen(len(encoded)) <= 20<<20 {
+			// A successful decode proves an ASCII base64 alphabet. With quotes,
+			// escapes and CR/LF excluded, it also proves valid JSON string content.
+			if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encoded))); err == nil {
+				return encoded, nil
+			}
 		}
-		encoded = []byte(decoded)
 	}
+	// Keep the original decoder and check order for escaped strings, malformed
+	// JSON/UTF-8, invalid base64 and oversized inputs.
+	var decoded string
+	if json.Unmarshal(part.Data, &decoded) != nil {
+		return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
+	}
+	encoded := []byte(decoded)
 	if len(encoded) == 0 || !strings.HasPrefix(part.MediaType, "image/") {
 		return nil, fmt.Errorf("%w: image is missing its frozen pixel payload", core.ErrInvalid)
 	}
