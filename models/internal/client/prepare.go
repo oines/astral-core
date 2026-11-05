@@ -23,11 +23,18 @@ func (c *Client) PrepareRequest(ctx context.Context, req core.Request) (core.Req
 	if err := ctx.Err(); err != nil {
 		return core.Request{}, err
 	}
-	owned, err := cloneRequest(req)
+	owned, err := c.CopyRequest(req)
 	if err != nil {
 		return core.Request{}, err
 	}
 	return c.ProjectRequest(ctx, owned)
+}
+
+// CopyRequest owns the public request boundary without applying native replay
+// repairs. Omit unsupported pixels before copying so they never become transient
+// work data for a text-only request.
+func (c *Client) CopyRequest(req core.Request) (core.Request, error) {
+	return cloneRequest(c.projectUnsupportedImages(req))
 }
 
 // ProjectRequest borrows immutable request data. Only modified containers and
@@ -36,6 +43,7 @@ func (c *Client) ProjectRequest(ctx context.Context, req core.Request) (core.Req
 	if err := ctx.Err(); err != nil {
 		return core.Request{}, err
 	}
+	req = c.projectUnsupportedImages(req)
 	var messages []core.Message
 	var callIDs map[string]string
 	changedMessages := false
@@ -177,6 +185,7 @@ func cloneRequest(req core.Request) (core.Request, error) {
 // A non-nil private execution map defers safe pixels by final Content address;
 // ordinary callers continue to receive complete string URLs.
 func (c *Client) WireRequest(req core.Request, estimate bool, deferred ...ExecutionImages) (core.Request, error) {
+	req = c.projectUnsupportedImages(req)
 	var images ExecutionImages
 	if len(deferred) > 0 {
 		images = deferred[0]

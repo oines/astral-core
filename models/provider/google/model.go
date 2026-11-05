@@ -65,7 +65,7 @@ func (m *Model) EstimateTokens(ctx context.Context, req core.Request) (int, erro
 func str(m map[string]any, k string) string { v, _ := m[k].(string); return v }
 
 func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
-	owned, err := core.CopyRequest(req)
+	owned, err := m.client.CopyRequest(req)
 	if err != nil {
 		return nil, err
 	}

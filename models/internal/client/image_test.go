@@ -93,7 +93,8 @@ func TestWireImagesCopyOnlyTheirChangedContainers(t *testing.T) {
 	if request.Messages[1].Content[0].URL != "host-file://original" {
 		t.Fatal("wire preparation shares the modified content container")
 	}
-	// Estimate ignores bytes but retains both capability and payload checks.
+	// Estimate validates pixels when sent, and counts only placeholders when
+	// images are explicitly unsupported.
 	c.Config = models.Config{Spec: core.ModelSpec{ID: "target"}}
 	c.Protocol = "openai-responses"
 	request.ModelID = "target"
@@ -101,8 +102,8 @@ func TestWireImagesCopyOnlyTheirChangedContainers(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Config.Images = "unsupported"
-	if _, err := c.EstimateRequest(request); err == nil {
-		t.Fatal("estimation accepted unsupported images")
+	if _, err := c.EstimateRequest(request); err != nil {
+		t.Fatal("estimation rejected an omitted image:", err)
 	}
 	c.Config.Images = "supported"
 	request.Messages[1].Content[0].Data = json.RawMessage(`"` + strings.Repeat("A", (20<<20)*4/3+8) + `"`)

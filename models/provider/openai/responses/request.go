@@ -12,7 +12,7 @@ import (
 // RequestBody returns the exact credential-free body. Core owns conversation
 // state; requests never depend on server-side previous_response_id storage.
 func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
-	owned, err := astral.CopyRequest(req)
+	owned, err := m.client.CopyRequest(req)
 	if err != nil {
 		return nil, err
 	}

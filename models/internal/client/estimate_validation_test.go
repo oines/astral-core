@@ -74,7 +74,6 @@ func TestEstimateImagePlaceholdersMatchPreviousCountsAndErrors(t *testing.T) {
 		}},
 		"custom image weight":   {true, func(c *Client, _ *core.Request) { c.Config.ImageTokenBudget = 3000 }},
 		"negative image weight": {false, func(c *Client, _ *core.Request) { c.Config.ImageTokenBudget = -1 }},
-		"unsupported images":    {false, func(c *Client, _ *core.Request) { c.Config.Images = "unsupported" }},
 		"invalid base64 before model": {false, func(_ *Client, r *core.Request) {
 			r.ModelID = "wrong"
 			r.Messages[0].Content[1].Data = json.RawMessage(`"invalid!"`)
