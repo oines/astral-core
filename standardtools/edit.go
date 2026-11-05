@@ -31,7 +31,7 @@ type EditDetails struct {
 }
 
 func (t backendTool) edit(ctx context.Context, inv astral.Invocation) (astral.ToolResult, error) {
-	arguments, err := t.PrepareArguments(inv.Call.Arguments)
+	arguments, err := prepareEditArguments(inv.Call.Arguments)
 	if err != nil {
 		return astral.ToolResult{}, err
 	}

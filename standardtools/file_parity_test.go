@@ -72,6 +72,28 @@ func sameJSON(a, b json.RawMessage) bool {
 	return json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil && reflect.DeepEqual(x, y)
 }
 
+func TestStandardToolArgumentPreparationCapabilities(t *testing.T) {
+	set, err := New(fixtureFileBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close(context.Background())
+	tools := set.Tools()
+	if len(tools) != 5 {
+		t.Fatalf("unexpected standard-tool count: %d", len(tools))
+	}
+	for _, tool := range tools {
+		name := tool.Definition().Name
+		_, prepares := tool.(astral.ToolArgumentPreparer)
+		if prepares != (name == "edit") {
+			t.Errorf("%s advertises PrepareArguments=%v; only edit needs compatibility preparation", name, prepares)
+		}
+		if _, targets := tool.(astral.TargetedTool); !targets {
+			t.Errorf("%s lost its binding capability", name)
+		}
+	}
+}
+
 func TestPiFileDefinitions(t *testing.T) {
 	var fixtures []struct {
 		Name, Description string

@@ -22,3 +22,9 @@ MB in this table means 1,000,000 bytes. Cumulative allocation is not live heap o
 The initial before full-path CPU profile sampled 1,650 ms: `prepareCandidate` accumulated 1,500 ms, `freezeRequest` 1,090 ms, `selectRequestMessages` 790 ms, and `diffPreparedRequest` 700 ms. Cumulative entries overlap and must not be added. `canonicalDigest` accumulated 1,070 ms across these paths. The observed bottleneck is repeated handling of original image content, rather than image projection or network activity.
 
 Regression coverage includes same-role image swaps, unchanged large opaque fields and tool arguments, adjacent image collapse, nil/empty content, exact large-number and JSON behavior, source immutability, and randomized round trips. Normal supported-image Host latency, repeated live heap and storage growth are measured separately against the fixed previous release source; they are not inferred from this non-visual speedup.
+
+## Non-edit argument preparation
+
+Only `edit` advertises the optional argument-preparation interface. Registering a copying no-op for other tools made the two preflight/dispatch preparations copy arguments six extra times. A capability matrix verifies that all five standard tools retain target binding while only `edit` normalizes arguments, including through Astral's wrapper.
+
+A separate microbenchmark exercises the actual private `prepareToolArguments` helper twice per iteration, with a copying no-op equivalent to the previous standard-tools implementation versus a tool without that capability. With 1 MiB arguments, three 100-iteration samples measured a median 0.347 ms and about 6.34 MB allocated for the no-op, versus about 59 ns and zero bytes without the capability. This measures only argument preparation, not tool execution, IO, persistence or complete request latency. It explains why unrelated tools should not advertise the interface; it is not a replacement for the full-path measurements above.
