@@ -90,18 +90,36 @@ func TestNonTTYRejectsInputButAllowsInterrupt(t *testing.T) {
 func TestCancelledWaitDoesNotKillOrReplayCommand(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-	result, err := h.invoke(ctx, "exec_command", map[string]any{"cmd": "printf once >> counter; printf begin; sleep 0.35; printf end", "login": false})
-	cancel()
+	outer, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	ctx, cancel := context.WithCancel(outer)
+	defer cancel()
+	args, err := json.Marshal(map[string]any{"cmd": `printf once >> counter; printf begin; gate_tries=0; while [ ! -f release ]; do gate_tries=$((gate_tries+1)); [ "$gate_tries" -lt 1000 ] || exit 97; sleep 0.01; done; printf end`, "login": false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := command(t, result)
-	if r.SessionID == 0 {
+	var progress strings.Builder
+	execution, err := h.tools["exec_command"].Execute(ctx, astral.Invocation{SessionID: "owner", Call: astral.ToolCall{ID: "call", Name: "exec_command", Arguments: args}}, func(update astral.ToolProgress) {
+		progress.WriteString(update.Text)
+		if progress.Len() >= len("begin") {
+			cancel()
+		}
+	})
+	if err != nil || execution.Result == nil {
+		t.Fatalf("cancelled execution: %v", err)
+	}
+	r := command(t, *execution.Result)
+	if ctx.Err() != context.Canceled || progress.String() != "begin" || r.Output != "begin" {
+		t.Fatalf("wait was not cancelled after observed output: ctx=%v progress=%q output=%q", ctx.Err(), progress.String(), r.Output)
+	}
+	if r.SessionID == 0 || r.ExitCode != nil {
 		t.Fatal("cancelled wait lost live process")
 	}
+	// The command cannot produce end until its cancelled wait has returned a
+	// live handle. This separates cancellation from command completion.
+	h.run(t, "write", standardtools.WriteRequest{Path: "release", Content: "continue"})
 	end := command(t, h.run(t, "write_stdin", map[string]any{"session_id": r.SessionID}))
-	if end.ExitCode == nil || end.Output != "end" || r.Output != "begin" {
+	if end.ExitCode == nil || *end.ExitCode != 0 || end.Output != "end" || r.Output != "begin" {
 		t.Fatalf("lost/repeated output: %q then %q", r.Output, end.Output)
 	}
 	file := h.run(t, "read", map[string]any{"path": "counter"})
