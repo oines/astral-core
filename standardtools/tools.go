@@ -94,6 +94,15 @@ func (t backendTool) Definition() astral.ToolDefinition {
 	return d
 }
 
+// PrepareArguments accepts Pi's edit compatibility forms without changing the
+// model's original call. All conversions are deterministic and side-effect free.
+func (t backendTool) PrepareArguments(arguments json.RawMessage) (json.RawMessage, error) {
+	if t.definition.Name == "edit" {
+		return prepareEditArguments(arguments)
+	}
+	return append(json.RawMessage(nil), arguments...), nil
+}
+
 func (t backendTool) Execute(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolExecution, error) {
 	result, err := t.execute(ctx, inv, emit)
 	return astral.ToolExecution{Result: &result}, err
@@ -112,6 +121,9 @@ func (t backendTool) execute(ctx context.Context, inv astral.Invocation, emit fu
 	stop := context.AfterFunc(t.set.ctx, cancel)
 	defer func() { stop(); cancel() }()
 	if err := ctx.Err(); err != nil {
+		if t.definition.Name == "read" || t.definition.Name == "write" || t.definition.Name == "edit" {
+			return astral.ToolResult{}, fileAborted(ctx, astral.OutcomeNotExecuted)
+		}
 		return astral.ToolResult{}, notExecuted(err.Error())
 	}
 	if emit == nil {

@@ -28,35 +28,37 @@ config.Tools = set.Tools()
 | --- | --- |
 | `read` | Pi 的 1 起始行号、offset/limit、2000 行 / 50 KiB 的完整行截断、继续读取提示、图片附件 |
 | `write` | Pi 的创建父目录、完整覆盖、按文件串行变更 |
-| `edit` | Pi 当前 `edits` 数组、对同一原文匹配、唯一性与重叠检查、Unicode 模糊匹配、保留未修改行、BOM / 换行符、diff / patch |
+| `edit` | Pi 当前 `edits` 数组与兼容输入、对同一原文匹配、唯一性与重叠检查及错误文字、Unicode 模糊匹配、保留未修改行、BOM / 换行符、diff / patch |
 | `exec_command` | Codex 的 `cmd/workdir/shell/login/tty/yield_time_ms/max_output_tokens`、默认值和等待范围、退出码或数字会话 ID |
 | `write_stdin` | Codex 的 `session_id/chars`、空输入轮询、分段增量输出、按进程串行交互、非 PTY 输入限制及 Ctrl-C |
 
-编辑和文本截断的预期结果由上述 Pi 源码生成，保存在 [testdata](../standardtools/testdata/README.md)，Go 测试不需要 Pi 或 Node。
+文件工具声明、参数规范化、完整文本读取结果、编辑匹配及文本截断的预期结果由上述 Pi 源码生成，保存在 [testdata](../standardtools/testdata/README.md)，Go 测试不需要 Pi 或 Node。
 
 这是工具语义与模型接口的对齐。保留以下明确边界：
 
 - 不内置 Codex 的沙箱、授权策略、网络审批、设备协议或应用 UI。宿主通过 Backend、Hook 和环境提供这些能力。
 - 不提供 Pi 的 `bash`；该位置由命令会话工具替代。没有在模型 schema 中加入 Codex 特定的 `sandbox_permissions` 等宿主策略字段。
-- `edit` 发布当前数组 schema，不接受 Pi 为旧客户端提供的单组 `oldText/newText` 兼容输入。工具定义版本为 `2`；持久 Session 使用的声明必须与宿主实现匹配。当前存储格式不支持旧日志自动迁移。
+- 文件工具定义版本为 `3`，命令工具仍为 `2`；持久 Session 使用的声明必须与宿主实现匹配。宿主更新后应在正常配置边界为后续请求选用当前声明，不改写旧历史或已冻结调用。
 - 匹配与修改行为有参考样例验证；Go diff 库可能为重复行选择不同但等价的 diff。Go 图片编码器的字节和压缩质量也不会与 Pi 完全相同。
 - 本地 Shell / PTY 后端支持 Unix 和带 ConPTY 的 Windows。Windows 默认使用已安装的 `$SHELL`，否则优先 PowerShell 7，再使用系统 Windows PowerShell；可通过 `local.DefaultShell()` 取得实际选择的可执行文件。其他平台仍需提供原生或远程 Backend。标准工具不读取环境中的平台字段，平台要求由宿主 Backend 处理。
 
 ### 输入声明与普通调用结果
 
-下表的 `?` 表示可省略，数字参数均使用整数。默认值由执行器填入，不是 JSON Schema 的 `default` 字段。
+下表的 `?` 表示可省略。命令参数使用整数，文件读取参数沿用 Pi 的 `number` 声明。默认值由执行器填入，不是 JSON Schema 的 `default` 字段。
 
 | 工具 | 必填参数 | 可选参数与默认值 |
 | --- | --- | --- |
 | `exec_command` | `cmd: string`，非空 | `workdir?: string`、`shell?: string`；`login?: boolean = true`；`tty?: boolean = false`；`yield_time_ms?: integer = 10000`；`max_output_tokens?: integer = 10000` |
 | `write_stdin` | `session_id: integer >= 1` | `chars?: string = ""`；`yield_time_ms?: integer = 250`，空输入时最低等待 5000ms；`max_output_tokens?: integer = 10000` |
-| `read` | `path: string`，非空 | `offset?: integer >= 1`，默认 1；`limit?: integer >= 1`，未提供时不施加调用级行数限制 |
-| `write` | `path: string`，非空；`content: string`，允许空字符串 | 无 |
-| `edit` | `path: string`，非空；非空 `edits` 数组，每项包含非空 `oldText: string` 和允许为空的 `newText: string` | 无 |
+| `read` | `path: string` | `offset?: number`，默认 1；`limit?: number`，未提供时不施加调用级行数限制 |
+| `write` | `path: string`；`content: string`，允许空字符串 | 无 |
+| `edit` | `path: string`；`edits` 数组，每项包含 `oldText: string`、`newText: string` | 接受顶层 `oldText/newText`、单对象或 JSON 字符串形式的 `edits`，先转成数组再验证 |
 
-五个输入 schema 均设置 `additionalProperties: false`。相较 Codex 的 `number` 声明，SDK 使用更准确的 `integer` 和非负范围；Codex 的命令执行器本身也按整数解析这些字段。相较 Pi，SDK 明确限制正行号、非空路径和非空编辑数组；不自动转换字符串数字、可选 null 或异常的编辑输入。Pi 额外接受旧的顶层 `oldText/newText`，并会修正字符串形式或单对象形式的 `edits`。
+命令工具设置 `additionalProperties: false`，沿用整数和非负范围。三个文件工具的输入 schema、参数说明和额外字段规则与 Pi 对齐；空编辑数组与空 `oldText` 由执行器返回 Pi 的具体错误。`read` 的零或负 offset 从首行开始，`limit: 0` 返回空选区与继续读取提示；小数及负 limit 沿用 JavaScript 数组切片规则。不要用这些兼容边界代替通常的正整数行号。
 
-参考实现为参数逐字段提供 description；当前 SDK 将说明放在工具整体 description 中。完整工具声明保存在 Session 配置中，Core 按完整 JSON 核对，因此补充参数 description 也需要考虑既有会话的声明更新，不能仅将它视为不影响兼容性的文字修改。
+文件工具逐字段保留 Pi 的 description。Pi 的系统提示词贡献中有关读取、精确编辑、同文件批量修改和完整重写的指引，放在 SDK 的工具 description 中，不要求宿主实现 Pi 的提示词协议。完整声明保存在 Session 配置中，Core 按完整 JSON 核对，因此更新说明也需要处理既有会话的声明兼容性。
+
+`edit` 的兼容转换通过可选 `ToolArgumentPreparer` 在 schema 校验、绑定、审批和执行前完成；历史保留模型原始参数，回调收到规范化的临时 Invocation。转换只处理输入，不访问文件；直接调用工具的 `Execute` 也支持相同形式。与 Pi 一样，合法的顶层 `oldText/newText` 会追加到已有数组；若 `edits` 本身无法转为数组，该合法顶层替换单独组成数组。没有合法顶层替换时，坏的 `edits` 仍交由校验拒绝。
 
 普通调用时，模型接收 `ToolResult.Content`；`Details` 用于宿主展示和持久化，不自动进入模型上下文。SDK 没有为这五个工具声明独立的输出 schema；Codex 和 Pi 为程序化调用提供的输出 schema 不改变此处普通调用的文本与图片约定。
 
@@ -71,7 +73,7 @@ config.Tools = set.Tools()
 | `write` 成功 | `Successfully wrote to PATH`，与 Pi 相同 | 无 |
 | `edit` 成功 | `Successfully replaced N block(s) in PATH.`，与 Pi 相同 | `diff / patch / firstChangedLine`，与 Pi 相同的字段；重复行的等价 diff 分组可能不同 |
 
-缺失文件、越界 offset、编辑不匹配/不唯一/重叠等错误，由 Core 转成带 `IsError` 的文本结果。SDK 还记录 `Code` 和执行事实 `Outcome`（`succeeded / failed / not_executed / unknown`）；Pi 的普通错误主要是错误文本和 `isError`。这些宿主字段不应与进程退出码混用。图片无法解码或超过解码上限时 SDK 设置 `IsError`，Pi 的图片处理失败分支返回省略文字，未显式标记工具错误。
+缺失文件、越界 offset、编辑不匹配/不唯一/重叠等错误，由 Core 转成带 `IsError` 的文本结果。编辑匹配校验和越界 offset 使用 Pi 的完整错误文字；没有开始文件写入的匹配失败标记 `not_executed`。操作系统错误仍取决于 Backend 和平台，不承诺所有 errno 的文字逐字相同。SDK 还记录 `Code` 和执行事实 `Outcome`（`succeeded / failed / not_executed / unknown`）；这些宿主字段不应与进程退出码混用。
 
 ## 文件工具
 
@@ -89,9 +91,11 @@ config.Tools = set.Tools()
 
 `write/edit` 通过 `ResolvedPath.Key` 共享进程内变更队列，不强制所有文件工具串行。这个队列不锁住外部编辑器，也不是跨进程文件锁。宿主的环境切换工具应声明 Sequential，Core 会让其所在批次顺序执行。
 
-本地路径支持相对 / 绝对路径、`~`、`@file`、`file://`、粘贴的特殊空格，以及截图文件名的 AM/PM、NFD 和弯引号变体。符号链接别名共享队列。写入遵循 Pi 的原地覆盖，跟随符号链接并保留已有权限；不是文件系统事务。所有匹配成功才开始写入，实际 IO 失败仍可能产生部分变更，此时返回未知效果。
+本地路径支持相对 / 绝对路径、`~`、`@file`、`file://`、粘贴的特殊空格，以及截图文件名的 AM/PM、NFD 和弯引号变体。符号链接别名共享队列。写入遵循 Pi 的原地覆盖，跟随符号链接并保留硬链接和已有权限；新父目录使用 `0777`，新文件使用 `0666`，均受进程 umask 限制。所有匹配成功才开始写入，实际 IO 失败仍可能产生部分变更，此时返回未知效果。
 
-Windows 同时支持盘符、UNC、`~\`、`file:///C:/...` 与 `file://server/share/...` 路径。路径由执行所在机器解析；远程 Backend 必须返回目标系统的 `Parent` 和 `Key`，宿主不能用自己的路径规则重算。Windows 环境变量覆盖忽略键名大小写，保留驱动器当前目录变量。
+`write/edit` 在每次 IO 完成后检查取消。IO 尚未结束时保持文件队列锁，不能提前返回后继续暗中写入；已经写入再观察到取消时，返回 `Operation aborted`，同时将执行事实保留为 `unknown`，不声称文件没有变化。
+
+Windows 同时支持盘符、UNC、`~\`、`file:///C:/...` 与 `file://server/share/...` 路径，并按 Pi 规则将 `/c/...`、`/mnt/c/...`、`/cygdrive/c/...` 转成 `C:\...`。路径由执行所在机器解析；远程 Backend 必须返回目标系统的 `Parent` 和 `Key`，宿主不能用自己的路径规则重算。Windows 环境变量覆盖忽略键名大小写，保留驱动器当前目录变量。
 
 ## 命令工具
 

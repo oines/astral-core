@@ -1,0 +1,150 @@
+[
+  {
+    "input": {
+      "path": "f",
+      "oldText": "a",
+      "newText": "b"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": {
+        "oldText": "a",
+        "newText": "b"
+      }
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": "[{\"oldText\":\"a\",\"newText\":\"b\"}]"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": "{\"oldText\":\"a\",\"newText\":\"b\"}"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ],
+      "oldText": "c",
+      "newText": "d"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        },
+        {
+          "oldText": "c",
+          "newText": "d"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": "malformed",
+      "oldText": "a",
+      "newText": "b"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": null,
+      "oldText": "a",
+      "newText": "b"
+    },
+    "expected": {
+      "path": "f",
+      "edits": [
+        {
+          "oldText": "a",
+          "newText": "b"
+        }
+      ]
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": "malformed"
+    },
+    "expected": {
+      "path": "f",
+      "edits": "malformed"
+    }
+  },
+  {
+    "input": {
+      "path": "f",
+      "edits": {
+        "oldText": "a"
+      }
+    },
+    "expected": {
+      "path": "f",
+      "edits": {
+        "oldText": "a"
+      }
+    }
+  }
+]

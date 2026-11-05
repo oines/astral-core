@@ -3,7 +3,9 @@ package standardtools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"sort"
 	"strings"
 	"unicode"
@@ -29,12 +31,25 @@ type EditDetails struct {
 }
 
 func (t backendTool) edit(ctx context.Context, inv astral.Invocation) (astral.ToolResult, error) {
+	arguments, err := t.PrepareArguments(inv.Call.Arguments)
+	if err != nil {
+		return astral.ToolResult{}, err
+	}
 	var r EditRequest
-	if err := decodeArguments(inv.Call.Arguments, &r); err != nil {
+	if err := decodeFileArguments(arguments, &r, "path"); err != nil {
 		return astral.ToolResult{}, err
 	}
 	if len(r.Edits) == 0 {
-		return astral.ToolResult{}, notExecuted("edits must contain at least one replacement")
+		return astral.ToolResult{}, notExecuted("Edit tool input is invalid. edits must contain at least one replacement.")
+	}
+	var fields struct {
+		Edits []json.RawMessage `json:"edits"`
+	}
+	_ = json.Unmarshal(arguments, &fields)
+	for _, edit := range fields.Edits {
+		if !singleEdit(edit) {
+			return astral.ToolResult{}, notExecuted("invalid arguments: each edit must contain oldText and newText strings")
+		}
 	}
 	fs, p, err := t.file(ctx, inv, r.Path, false)
 	if err != nil {
@@ -45,11 +60,17 @@ func (t backendTool) edit(ctx context.Context, inv astral.Invocation) (astral.To
 		return astral.ToolResult{}, err
 	}
 	defer unlock()
-	data, err := fs.ReadFile(ctx, p.Path)
-	if err != nil {
+	if err := fileAborted(ctx, astral.OutcomeNotExecuted); err != nil {
 		return astral.ToolResult{}, err
 	}
-	raw := strings.ToValidUTF8(string(data), "\ufffd")
+	data, err := fs.ReadFile(ctx, p.Path)
+	if aborted := fileAborted(ctx, astral.OutcomeNotExecuted); aborted != nil {
+		return astral.ToolResult{}, aborted
+	}
+	if err != nil {
+		return astral.ToolResult{}, editAccessError(r.Path, err)
+	}
+	raw := decodeFileText(data)
 	bom := ""
 	if strings.HasPrefix(raw, "\ufeff") {
 		bom, raw = "\ufeff", strings.TrimPrefix(raw, "\ufeff")
@@ -61,15 +82,33 @@ func (t backendTool) edit(ctx context.Context, inv astral.Invocation) (astral.To
 	original := normalizeLF(raw)
 	updated, err := applyEdits(original, r.Edits, r.Path)
 	if err != nil {
+		return astral.ToolResult{}, notExecuted(err.Error())
+	}
+	if err := fileAborted(ctx, astral.OutcomeNotExecuted); err != nil {
+		return astral.ToolResult{}, err
+	}
+	contents := bom + strings.ReplaceAll(updated, "\n", ending)
+	err = fs.WriteFile(ctx, p.Path, []byte(contents))
+	if aborted := fileAborted(ctx, astral.OutcomeUnknown); aborted != nil {
+		return astral.ToolResult{}, aborted
+	}
+	if err != nil {
 		return astral.ToolResult{}, err
 	}
 	details := editDiff(r.Path, original, updated)
-	contents := bom + strings.ReplaceAll(updated, "\n", ending)
-	if err := fs.WriteFile(ctx, p.Path, []byte(contents)); err != nil {
-		return astral.ToolResult{}, err
-	}
 	metadata, _ := json.Marshal(details)
 	return astral.ToolResult{Content: astral.Text(fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(r.Edits), r.Path)), Details: metadata}, nil
+}
+
+func editAccessError(path string, err error) error {
+	message := err.Error()
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		message = "Error code: ENOENT"
+	case errors.Is(err, fs.ErrPermission):
+		message = "Error code: EACCES"
+	}
+	return notExecuted(fmt.Sprintf("Could not edit file: %s. %s.", path, message))
 }
 
 func normalizeLF(text string) string {
@@ -111,10 +150,24 @@ func findEdit(content, old string) (int, int, bool) {
 		return at, len(old), false
 	}
 	normalizedOld := fuzzyNormalize(old)
-	if normalizedOld == "" {
-		return -1, 0, true
+	at := strings.Index(fuzzyNormalize(content), normalizedOld)
+	return at, len(normalizedOld), at >= 0
+}
+
+func editOccurrences(content, old string) int {
+	content, old = fuzzyNormalize(content), fuzzyNormalize(old)
+	if old != "" {
+		return strings.Count(content, old)
 	}
-	return strings.Index(fuzzyNormalize(content), normalizedOld), len(normalizedOld), true
+	// JS split("") counts UTF-16 code units, and countOccurrences subtracts 1.
+	count := -1
+	for _, r := range content {
+		count++
+		if r > 0xffff {
+			count++
+		}
+	}
+	return count
 }
 
 func applyEdits(original string, edits []Edit, path string) (string, error) {
@@ -123,7 +176,10 @@ func applyEdits(original string, edits []Edit, path string) (string, error) {
 	for i, e := range edits {
 		normalized[i] = Edit{OldText: normalizeLF(e.OldText), NewText: normalizeLF(e.NewText)}
 		if normalized[i].OldText == "" {
-			return "", fmt.Errorf("edits[%d].oldText must not be empty in %s", i, path)
+			if len(edits) == 1 {
+				return "", fmt.Errorf("oldText must not be empty in %s.", path)
+			}
+			return "", fmt.Errorf("edits[%d].oldText must not be empty in %s.", i, path)
 		}
 		_, _, used := findEdit(original, normalized[i].OldText)
 		fuzzy = fuzzy || used
@@ -136,18 +192,23 @@ func applyEdits(original string, edits []Edit, path string) (string, error) {
 	for i, e := range normalized {
 		start, length, _ := findEdit(base, e.OldText)
 		if start < 0 {
-			return "", fmt.Errorf("could not find edits[%d] in %s; oldText must match the original file", i, path)
+			if len(edits) == 1 {
+				return "", fmt.Errorf("Could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.", path)
+			}
+			return "", fmt.Errorf("Could not find edits[%d] in %s. The oldText must match exactly including all whitespace and newlines.", i, path)
 		}
-		needle := fuzzyNormalize(e.OldText)
-		if needle == "" || strings.Count(fuzzyNormalize(base), needle) > 1 {
-			return "", fmt.Errorf("edits[%d] is ambiguous in %s; provide more context to make oldText unique", i, path)
+		if occurrences := editOccurrences(base, e.OldText); occurrences > 1 {
+			if len(edits) == 1 {
+				return "", fmt.Errorf("Found %d occurrences of the text in %s. The text must be unique. Please provide more context to make it unique.", occurrences, path)
+			}
+			return "", fmt.Errorf("Found %d occurrences of edits[%d] in %s. Each oldText must be unique. Please provide more context to make it unique.", occurrences, i, path)
 		}
 		changes = append(changes, replacement{start: start, end: start + length, index: i, text: e.NewText})
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].start < changes[j].start })
 	for i := 1; i < len(changes); i++ {
 		if changes[i-1].end > changes[i].start {
-			return "", fmt.Errorf("edits[%d] and edits[%d] overlap in %s; merge them or target disjoint regions", changes[i-1].index, changes[i].index, path)
+			return "", fmt.Errorf("edits[%d] and edits[%d] overlap in %s. Merge them into one edit or target disjoint regions.", changes[i-1].index, changes[i].index, path)
 		}
 	}
 	result := replaceRanges(base, changes, 0)
@@ -159,7 +220,10 @@ func applyEdits(original string, edits []Edit, path string) (string, error) {
 		}
 	}
 	if result == original {
-		return "", fmt.Errorf("no changes made to %s; replacements produced identical content", path)
+		if len(edits) == 1 {
+			return "", fmt.Errorf("No changes made to %s. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.", path)
+		}
+		return "", fmt.Errorf("No changes made to %s. The replacements produced identical content.", path)
 	}
 	return result, nil
 }
@@ -186,7 +250,7 @@ func linesWithEndings(text string) []string {
 func preserveUnchangedLines(original, base string, changes []replacement) (string, error) {
 	originalLines, baseLines := linesWithEndings(original), linesWithEndings(base)
 	if len(originalLines) != len(baseLines) {
-		return "", fmt.Errorf("normalization changed line count; supply an exact match")
+		return "", fmt.Errorf("Cannot preserve unchanged lines because the base content has a different line count.")
 	}
 	starts := make([]int, len(baseLines)+1)
 	for i, line := range baseLines {
@@ -201,7 +265,7 @@ func preserveUnchangedLines(original, base string, changes []replacement) (strin
 		first := sort.Search(len(baseLines), func(i int) bool { return starts[i+1] > c.start })
 		last := sort.Search(len(baseLines), func(i int) bool { return starts[i+1] >= c.end }) + 1
 		if first >= len(baseLines) || last > len(baseLines) {
-			return "", fmt.Errorf("edit lies outside normalized file")
+			return "", fmt.Errorf("Replacement range is outside the base content.")
 		}
 		if len(groups) > 0 && first < groups[len(groups)-1].last {
 			g := &groups[len(groups)-1]
