@@ -89,15 +89,76 @@ func diffPreparedRequest(base, actual Request) ([]RequestChange, error) {
 		if sameRequestMessage(base.Messages[i], message) {
 			continue
 		}
-		before, err = json.Marshal(base.Messages[i])
+		old, next := base.Messages[i], message
+		old.Content, next.Content = nil, nil
+		before, err = json.Marshal(old)
 		if err != nil {
 			return nil, err
 		}
-		after, err = json.Marshal(message)
+		after, err = json.Marshal(next)
 		if err != nil {
 			return nil, err
 		}
 		changes = append(changes, diffRequestJSON([]string{"messages", strconv.Itoa(i)}, before, after)...)
+		contentChanges, err := diffPreparedContent([]string{"messages", strconv.Itoa(i), "content"}, base.Messages[i].Content, message.Content)
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, contentChanges...)
+	}
+	return changes, nil
+}
+
+// Walk the typed content containers before encoding. Removed images need only
+// a remove operation; replacing an image with text encodes only the new text.
+// Unchanged payloads never pass through generic JSON comparison.
+func diffPreparedContent(path []string, before, after []Content) ([]RequestChange, error) {
+	var changes []RequestChange
+	if len(before) == 0 && len(after) > 0 {
+		raw, err := json.Marshal(after)
+		return []RequestChange{{Path: path, Op: "set", Value: raw}}, err
+	}
+	if len(before) > 0 && len(after) == 0 {
+		return []RequestChange{{Path: path, Op: "remove"}}, nil
+	}
+	if len(before) != len(after) {
+		prefix, suffix := 0, 0
+		for prefix < min(len(before), len(after)) && sameRequestContent(before[prefix], after[prefix]) {
+			prefix++
+		}
+		for suffix < min(len(before), len(after))-prefix && sameRequestContent(before[len(before)-1-suffix], after[len(after)-1-suffix]) {
+			suffix++
+		}
+		for i := len(before) - suffix - 1; i >= prefix; i-- {
+			changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(i)), Op: "remove"})
+		}
+		for i := prefix; i < len(after)-suffix; i++ {
+			raw, err := json.Marshal(after[i])
+			if err != nil {
+				return nil, err
+			}
+			changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(i)), Op: "insert", Value: raw})
+		}
+		return changes, nil
+	}
+	for i, part := range after {
+		if sameRequestContent(before[i], part) {
+			continue
+		}
+		raw, err := json.Marshal(part)
+		if err != nil {
+			return nil, err
+		}
+		at := jsonPath(path, strconv.Itoa(i))
+		if before[i].Type != part.Type {
+			changes = append(changes, RequestChange{Path: at, Op: "set", Value: raw})
+			continue
+		}
+		old, err := json.Marshal(before[i])
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, diffRequestJSON(at, old, raw)...)
 	}
 	return changes, nil
 }

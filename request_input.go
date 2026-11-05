@@ -83,6 +83,13 @@ func selectRequestMessages(base, actual []Message) []int {
 			out[i] = i
 			continue
 		}
+		// Most projections change content in place. Prefer that source before
+		// building an index over the entire history, provided this cannot copy a
+		// large field moved from a different message into the request recipe.
+		if len(base) == len(actual) && sameMessageIdentity(base[i], message) && retainsLargeRequestFields(base[i], message) {
+			out[i] = i
+			continue
+		}
 		if byDigest == nil {
 			byDigest = make(map[string]int, len(base))
 			for j, old := range base {
@@ -126,6 +133,38 @@ func selectRequestMessages(base, actual []Message) []int {
 		}
 	}
 	return out
+}
+
+func retainsLargeRequestFields(before, after Message) bool {
+	const large = 4096
+	if len(after.Metadata) >= large && !bytes.Equal(before.Metadata, after.Metadata) ||
+		len(after.ErrorMessage) >= large && before.ErrorMessage != after.ErrorMessage {
+		return false
+	}
+	for _, part := range after.Content {
+		retained := false
+		for _, old := range before.Content {
+			if len(part.Text) >= large && old.Text != part.Text ||
+				len(part.URL) >= large && old.URL != part.URL ||
+				len(part.Data) >= large && !bytes.Equal(old.Data, part.Data) ||
+				len(part.Metadata) >= large && !bytes.Equal(old.Metadata, part.Metadata) {
+				continue
+			}
+			if call := part.ToolCall; call != nil && (len(call.Arguments) >= large || len(call.Metadata) >= large) {
+				if old.ToolCall == nil || len(call.Arguments) >= large && !bytes.Equal(old.ToolCall.Arguments, call.Arguments) ||
+					len(call.Metadata) >= large && !bytes.Equal(old.ToolCall.Metadata, call.Metadata) {
+					continue
+				}
+			}
+			retained = true
+			break
+		}
+		if !retained && (len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
+			part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)) {
+			return false
+		}
+	}
+	return true
 }
 
 func sameMessageIdentity(a, b Message) bool {
