@@ -132,6 +132,51 @@ func TestProjectionFreezeSelectsSwappedLargeImages(t *testing.T) {
 	}
 }
 
+func TestProjectionFreezeSelectsSwappedMessagesContainingSameImagesInDifferentOrder(t *testing.T) {
+	a, b := projectionFreezeImage("SU1H"), projectionFreezeImage("U1dQ")
+	before := Request{ModelID: "model", Messages: []Message{
+		{Role: RoleUser, Content: []Content{a, b}},
+		{Role: RoleUser, Content: []Content{b, a}},
+	}}
+	actual := projectionFreezeCopy(before)
+	actual.Messages[0], actual.Messages[1] = actual.Messages[1], actual.Messages[0]
+	input := projectionFreezeRoundTrip(t, before, actual)
+	raw, _ := json.Marshal(input)
+	t.Logf("swapped multi-image messages: selection=%v recipe_bytes=%d", input.Selection, len(raw))
+	projectionFreezeSelection(t, input, []int{1, 0})
+	projectionFreezeSmallRecipe(t, input, a.Data, b.Data)
+}
+
+func TestProjectionFreezeTypeChangeRetainsUnchangedLargeData(t *testing.T) {
+	image := projectionFreezeImage("REFU")
+	before := Request{ModelID: "model", Messages: []Message{{Role: RoleUser, Content: []Content{image}}}}
+	actual := projectionFreezeCopy(before)
+	actual.Messages[0].Content[0].Type = "provider_opaque"
+	actual.Messages[0].Content[0].MediaType = ""
+	input := projectionFreezeRoundTrip(t, before, actual)
+	raw, _ := json.Marshal(input)
+	t.Logf("changed type with retained Data: recipe_bytes=%d", len(raw))
+	projectionFreezeSmallRecipe(t, input, image.Data)
+}
+
+func TestProjectionFreezeSmallReorderingCannotDisplaceLargeAnchor(t *testing.T) {
+	large := projectionFreezeImage("QU5D")
+	x, y := Content{Type: "text", Text: "small X"}, Content{Type: "text", Text: "small Y"}
+	before := Request{ModelID: "model", Messages: []Message{
+		{Role: RoleUser, Content: []Content{large, x}},
+		{Role: RoleUser, Content: []Content{x, large, y}},
+	}}
+	actual := projectionFreezeCopy(before)
+	actual.Messages[0], actual.Messages[1] = actual.Messages[1], actual.Messages[0]
+	input := projectionFreezeRoundTrip(t, before, actual)
+	raw, _ := json.Marshal(input)
+	t.Logf("reordered small parts around large anchor: selection=%v recipe_bytes=%d", input.Selection, len(raw))
+	projectionFreezeSmallRecipe(t, input, large.Data)
+	if input.Selection != nil && !reflect.DeepEqual(*input.Selection, []int{0, 1}) && !reflect.DeepEqual(*input.Selection, []int{1, 0}) {
+		t.Fatalf("expected compact positional changes or exact swapped source references, got %v", *input.Selection)
+	}
+}
+
 func TestProjectionFreezeReplacesImageWithSmallPlaceholderAtOriginalPosition(t *testing.T) {
 	image := projectionFreezeImage("Q0ND")
 	before := Request{ModelID: "model", Messages: []Message{User("header"), {Role: RoleUser, Content: []Content{image}}, User("tail")}}
@@ -167,6 +212,30 @@ func TestProjectionFreezeCollapsesImagesWithoutCopyingOtherLargeLeaves(t *testin
 		if len(change.Path) < 4 || change.Path[0] != "messages" || change.Path[1] != "1" || change.Path[2] != "content" {
 			t.Fatalf("content-only collapse rewrote a message/array envelope: %+v", change.Path)
 		}
+	}
+}
+
+func TestProjectionFreezeCollapsesSeparateImageGroupsAroundLargeUnchangedPart(t *testing.T) {
+	a, b := projectionFreezeImage("R1JQ"), projectionFreezeImage("SU1B")
+	c, d := projectionFreezeImage("SU1C"), projectionFreezeImage("SU1D")
+	for _, big := range []Content{
+		{Type: "text", Text: strings.Repeat("unchanged-text-island-", 512)},
+		{Type: "provider_opaque", Data: json.RawMessage(`{"blob":"` + strings.Repeat("unchanged-opaque-island-", 512) + `","integer":9007199254740993,"dup":1,"dup":2}`)},
+	} {
+		t.Run(big.Type, func(t *testing.T) {
+			before := Request{ModelID: "model", Messages: []Message{{Role: RoleUser, Content: []Content{a, b, big, c, d}}}}
+			actual := projectionFreezeCopy(before)
+			placeholder := Content{Type: "text", Text: "[image group omitted]"}
+			actual.Messages[0].Content = []Content{placeholder, big, placeholder}
+			input := projectionFreezeRoundTrip(t, before, actual)
+			raw, _ := json.Marshal(input)
+			t.Logf("collapsed separate image groups around %s: recipe_bytes=%d", big.Type, len(raw))
+			large := big.Data
+			if big.Type == "text" {
+				large, _ = json.Marshal(big.Text)
+			}
+			projectionFreezeSmallRecipe(t, input, a.Data, b.Data, c.Data, d.Data, large)
+		})
 	}
 }
 

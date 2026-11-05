@@ -31,6 +31,23 @@ func sameRequestContent(a, b Content) bool {
 	return sameRequestString(a.ToolCall.ID, b.ToolCall.ID) && sameRequestString(a.ToolCall.Name, b.ToolCall.Name) && sameRequestRaw(a.ToolCall.Arguments, b.ToolCall.Arguments) && sameRequestRaw(a.ToolCall.Metadata, b.ToolCall.Metadata)
 }
 
+// Anchors are conservative: a size change is a replacement. This filter avoids
+// repeatedly JSON-normalizing a large new part against unrelated small parts.
+func sameRequestContentAnchor(a, b Content) bool {
+	if a.Type != b.Type || len(a.Text) != len(b.Text) || len(a.URL) != len(b.URL) ||
+		len(a.Data) != len(b.Data) || len(a.Metadata) != len(b.Metadata) {
+		return false
+	}
+	if a.ToolCall == nil || b.ToolCall == nil {
+		if a.ToolCall != b.ToolCall {
+			return false
+		}
+	} else if len(a.ToolCall.Arguments) != len(b.ToolCall.Arguments) || len(a.ToolCall.Metadata) != len(b.ToolCall.Metadata) {
+		return false
+	}
+	return sameRequestContent(a, b)
+}
+
 func sameRequestMessage(a, b Message) bool {
 	if a.IsError != b.IsError || len(a.Content) != len(b.Content) ||
 		!sameRequestString(string(a.Role), string(b.Role)) || !sameRequestString(a.ToolCallID, b.ToolCallID) ||
@@ -122,24 +139,40 @@ func diffPreparedContent(path []string, before, after []Content) ([]RequestChang
 		return []RequestChange{{Path: path, Op: "remove"}}, nil
 	}
 	if len(before) != len(after) {
-		prefix, suffix := 0, 0
-		for prefix < min(len(before), len(after)) && sameRequestContent(before[prefix], after[prefix]) {
-			prefix++
+		// Retain unchanged parts between several changed spans too, such as
+		// two collapsed image groups with a large text/opaque part between them.
+		oldStart, newStart := 0, 0
+		replaceSpan := func(oldEnd, newEnd int) error {
+			for i := oldEnd - oldStart - 1; i >= 0; i-- {
+				changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(newStart+i)), Op: "remove"})
+			}
+			for i := newStart; i < newEnd; i++ {
+				raw, err := json.Marshal(after[i])
+				if err != nil {
+					return err
+				}
+				changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(i)), Op: "insert", Value: raw})
+			}
+			return nil
 		}
-		for suffix < min(len(before), len(after))-prefix && sameRequestContent(before[len(before)-1-suffix], after[len(after)-1-suffix]) {
-			suffix++
-		}
-		for i := len(before) - suffix - 1; i >= prefix; i-- {
-			changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(i)), Op: "remove"})
-		}
-		for i := prefix; i < len(after)-suffix; i++ {
-			raw, err := json.Marshal(after[i])
-			if err != nil {
+		for i, part := range after {
+			if !largeRequestContent(part) {
+				continue
+			}
+			at := oldStart
+			for at < len(before) && !sameRequestContentAnchor(before[at], part) {
+				at++
+			}
+			if at == len(before) {
+				break
+			}
+			if err := replaceSpan(at, i); err != nil {
 				return nil, err
 			}
-			changes = append(changes, RequestChange{Path: jsonPath(path, strconv.Itoa(i)), Op: "insert", Value: raw})
+			oldStart, newStart = at+1, i+1
 		}
-		return changes, nil
+		err := replaceSpan(len(before), len(after))
+		return changes, err
 	}
 	for i, part := range after {
 		if sameRequestContent(before[i], part) {
@@ -150,7 +183,7 @@ func diffPreparedContent(path []string, before, after []Content) ([]RequestChang
 			return nil, err
 		}
 		at := jsonPath(path, strconv.Itoa(i))
-		if before[i].Type != part.Type {
+		if before[i].Type != part.Type && !largeRequestContent(part) {
 			changes = append(changes, RequestChange{Path: at, Op: "set", Value: raw})
 			continue
 		}

@@ -141,30 +141,45 @@ func retainsLargeRequestFields(before, after Message) bool {
 		len(after.ErrorMessage) >= large && before.ErrorMessage != after.ErrorMessage {
 		return false
 	}
-	for _, part := range after.Content {
-		retained := false
-		for _, old := range before.Content {
-			if len(part.Text) >= large && old.Text != part.Text ||
-				len(part.URL) >= large && old.URL != part.URL ||
-				len(part.Data) >= large && !bytes.Equal(old.Data, part.Data) ||
-				len(part.Metadata) >= large && !bytes.Equal(old.Metadata, part.Metadata) {
-				continue
-			}
-			if call := part.ToolCall; call != nil && (len(call.Arguments) >= large || len(call.Metadata) >= large) {
-				if old.ToolCall == nil || len(call.Arguments) >= large && !bytes.Equal(old.ToolCall.Arguments, call.Arguments) ||
-					len(call.Metadata) >= large && !bytes.Equal(old.ToolCall.Metadata, call.Metadata) {
-					continue
-				}
-			}
-			retained = true
-			break
+	next := 0
+	for i, part := range after.Content {
+		if !largeRequestContent(part) {
+			continue
 		}
-		if !retained && (len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
-			part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)) {
+		if len(before.Content) != len(after.Content) {
+			// Length-changing diffs retain ordered, unchanged content anchors.
+			for next < len(before.Content) && !sameRequestContentAnchor(before.Content[next], part) {
+				next++
+			}
+			if next == len(before.Content) {
+				return false
+			}
+			next++
+			continue
+		}
+		// Equal-length content is compared by index. Finding a large field at
+		// some other position is insufficient: the diff would copy it again.
+		old := before.Content[i]
+		if len(part.Text) >= large && old.Text != part.Text ||
+			len(part.URL) >= large && old.URL != part.URL ||
+			len(part.Data) >= large && !bytes.Equal(old.Data, part.Data) ||
+			len(part.Metadata) >= large && !bytes.Equal(old.Metadata, part.Metadata) {
 			return false
+		}
+		if call := part.ToolCall; call != nil && (len(call.Arguments) >= large || len(call.Metadata) >= large) {
+			if old.ToolCall == nil || len(call.Arguments) >= large && !bytes.Equal(old.ToolCall.Arguments, call.Arguments) ||
+				len(call.Metadata) >= large && !bytes.Equal(old.ToolCall.Metadata, call.Metadata) {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+func largeRequestContent(part Content) bool {
+	const large = 4096
+	return len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
+		part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)
 }
 
 func sameMessageIdentity(a, b Message) bool {
