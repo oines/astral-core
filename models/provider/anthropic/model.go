@@ -68,7 +68,7 @@ func (m *Model) EstimateTokens(ctx context.Context, req core.Request) (int, erro
 }
 
 func (m *Model) RequestBody(req core.Request) (map[string]any, error) {
-	owned, err := core.CopyRequest(req)
+	owned, err := m.client.CopyRequest(req)
 	if err != nil {
 		return nil, err
 	}

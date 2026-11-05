@@ -216,8 +216,13 @@ func TestFrozenImagesAreEncodedByEveryAdapter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := model.RequestBody(req); err == nil {
-				t.Fatal("unsupported image accepted")
+			body, err = model.RequestBody(req)
+			if err != nil {
+				t.Fatal("unsupported image was not projected to text:", err)
+			}
+			raw, _ = json.Marshal(body)
+			if strings.Contains(string(raw), "eHh4") || !strings.Contains(string(raw), "(image omitted: model does not support images)") {
+				t.Fatalf("unsupported image leaked or its placeholder was lost: %s", raw)
 			}
 		})
 	}

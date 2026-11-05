@@ -54,12 +54,15 @@ type Config struct {
 	// reasoning_content, reasoning_details, or reasoning. Empty uses the dialect.
 	ReasoningReplay        string
 	RequireReasoningReplay bool
-	// ImageTokenBudget overrides the content estimator's 1200-token image
-	// approximation. Encoded image bytes are never counted as text tokens.
 	// Images and ToolCalling are sparse capability facts. Empty/unknown do not
-	// forbid explicit input; unsupported rejects new image/tool declarations.
-	Images           string
-	ToolCalling      string
+	// forbid explicit input. Images=unsupported replaces typed image blocks with
+	// text placeholders in new request copies, preserving source history and frozen
+	// executions. ToolCalling=unsupported rejects tool declarations.
+	Images      string
+	ToolCalling string
+	// ImageTokenBudget overrides the content estimator's 1200-token image
+	// approximation. Omitted images count only their text placeholders; encoded
+	// image bytes are never counted as text tokens.
 	ImageTokenBudget int
 	// Codex selects the subscription Responses endpoint, which requires SSE
 	// and does not expose the public API's max_output_tokens parameter.

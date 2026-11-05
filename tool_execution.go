@@ -123,7 +123,11 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 	if err != nil {
 		return a.commitToolResult(ctx, inv, toolFailure("tool_unavailable", err.Error(), OutcomeNotExecuted), false)
 	}
-	arguments, err := decodeJSON(inv.Call.Arguments)
+	effective, err := prepareToolArguments(registered.tool, inv)
+	if err != nil {
+		return a.commitToolResult(ctx, inv, toolFailure("invalid_arguments", err.Error(), OutcomeNotExecuted), false)
+	}
+	arguments, err := decodeJSON(effective.Call.Arguments)
 	if err == nil {
 		err = registered.schema.Validate(arguments)
 	}
@@ -132,11 +136,12 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 	}
 	if !state.Prepared {
 		if targeted, ok := registered.tool.(TargetedTool); ok {
-			binding, bindErr := bindTool(ctx, targeted, inv)
+			binding, bindErr := bindTool(ctx, targeted, effective)
 			if bindErr != nil {
 				return a.commitToolResult(ctx, inv, toolFailure("target_unavailable", bindErr.Error(), OutcomeNotExecuted), false)
 			}
 			inv.Binding = binding
+			effective.Binding = binding
 		}
 		if err = a.commitTool(ctx, EntryToolPrepared, inv, nil, nil, false); err != nil {
 			return ToolResult{}, err
@@ -147,7 +152,7 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 		decision = *state.Decision
 	} else {
 		if a.config.BeforeToolCall != nil {
-			decision, err = beforeTool(ctx, a.config.BeforeToolCall, ToolContext{Invocation: clone(inv), awaitApproval: func(ctx context.Context, request ApprovalRequest) (ApprovalDecision, error) {
+			decision, err = beforeTool(ctx, a.config.BeforeToolCall, ToolContext{Invocation: clone(effective), awaitApproval: func(ctx context.Context, request ApprovalRequest) (ApprovalDecision, error) {
 				return a.awaitApproval(ctx, inv, request)
 			}})
 			if err != nil {
@@ -176,7 +181,7 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 		return a.commitToolResult(ctx, inv, toolFailure("cancelled", "Cancelled before dispatch.", OutcomeNotExecuted), false)
 	}
 	a.publish(Event{Type: EventToolStart, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID})
-	execution, executeErr := invokeTool(ctx, registered.tool, inv, func(p ToolProgress) {
+	execution, executeErr := invokeTool(ctx, registered.tool, effective, func(p ToolProgress) {
 		a.publish(Event{Type: EventToolUpdate, RunID: run.id, TurnID: inv.TurnID, ToolCallID: call.ID, ExecutionID: inv.ExecutionID, Progress: &p})
 	})
 	if execution.Result != nil {
@@ -209,7 +214,11 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 		if result.Outcome != "" {
 			outcome = result.Outcome
 		}
-		result = ToolResult{Content: Text("Tool call ended with an error; partial effects may have occurred: " + executeErr.Error()), IsError: true, Code: code, Outcome: outcome, Artifact: result.Artifact}
+		message := executeErr.Error()
+		if outcome != OutcomeNotExecuted && (classified == nil || classified.Message == "") {
+			message = "Tool call ended with an error; partial effects may have occurred: " + message
+		}
+		result = ToolResult{Content: Text(message), IsError: true, Code: code, Outcome: outcome, Artifact: result.Artifact}
 	}
 	result = normalizeResult(result)
 	if validateToolResult(result) != nil {
@@ -227,7 +236,7 @@ func (a *Session) executeTool(ctx context.Context, run *Run, assistant Frame, ca
 	}
 	actualOutcome := result.Outcome
 	if a.config.AfterToolCall != nil {
-		patch, hookErr := afterTool(ctx, a.config.AfterToolCall, inv, result)
+		patch, hookErr := afterTool(ctx, a.config.AfterToolCall, effective, result)
 		if hookErr != nil {
 			result.IsError = true
 			result.Code = "after_tool_failed"

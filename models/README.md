@@ -13,7 +13,7 @@ This is an Astral-focused fork of [Twilight AI](https://github.com/felinics/twil
 | Anthropic Messages | Anthropic-compatible endpoints | Native thinking blocks, budgets and signed replay |
 | Google GenerateContent | Gemini-compatible endpoints | Native thinking configuration and thought signatures |
 
-Text, Core frozen image pixels, resolved image URLs/data URLs, function tools, streaming and non-streaming replies are supported. Unsupported input parts and unsupported options fail explicitly. Embedding, audio/video generation, and Twilight’s agent runtime are outside this fork’s current scope. Compatibility is model/endpoint-specific; see [verification results](docs/verification.md) for the tested DeepSeek routes and the limits of fixture coverage.
+Text, Core frozen image pixels, resolved image URLs/data URLs, function tools, streaming and non-streaming replies are supported. When `Config.Images` is explicitly `unsupported`, typed images in user, tool and assistant messages become text placeholders in each new model request. Source history retains its images, and already prepared executions retain their frozen body. Empty, `unknown` and `supported` preserve image input. Other unsupported input parts and unsupported options fail explicitly. Embedding, audio/video generation, and Twilight’s agent runtime are outside this fork’s current scope. Compatibility is model/endpoint-specific; see [verification results](docs/verification.md) for the tested DeepSeek routes and the limits of fixture coverage.
 
 ## Use
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -22,9 +23,6 @@ type WriteRequest struct {
 }
 
 func (t backendTool) file(ctx context.Context, inv astral.Invocation, name string, read bool) (FileSystem, ResolvedPath, error) {
-	if name == "" {
-		return nil, ResolvedPath{}, notExecuted("path must not be empty")
-	}
 	fs, err := t.set.backend.FileSystem(ctx, inv)
 	if err != nil {
 		return nil, ResolvedPath{}, err
@@ -40,47 +38,66 @@ func (t backendTool) file(ctx context.Context, inv astral.Invocation, name strin
 }
 
 func (t backendTool) read(ctx context.Context, inv astral.Invocation) (astral.ToolResult, error) {
-	r := ReadRequest{Offset: 1}
-	if err := decodeArguments(inv.Call.Arguments, &r); err != nil {
+	var r struct {
+		Path   string   `json:"path"`
+		Offset *float64 `json:"offset"`
+		Limit  *float64 `json:"limit"`
+	}
+	if err := decodeFileArguments(inv.Call.Arguments, &r, "path"); err != nil {
 		return astral.ToolResult{}, err
 	}
-	if r.Offset < 1 || r.Limit < 0 {
-		return astral.ToolResult{}, notExecuted("offset must be positive and limit must not be negative")
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(inv.Call.Arguments, &fields)
+	for _, name := range []string{"offset", "limit"} {
+		if string(fields[name]) == "null" {
+			return astral.ToolResult{}, notExecuted("invalid arguments: " + name + " must be a number")
+		}
 	}
 	fs, p, err := t.file(ctx, inv, r.Path, true)
 	if err != nil {
 		return astral.ToolResult{}, err
 	}
 	data, err := fs.ReadFile(ctx, p.Path)
+	if aborted := fileAborted(ctx, astral.OutcomeNotExecuted); aborted != nil {
+		return astral.ToolResult{}, aborted
+	}
 	if err != nil {
 		return astral.ToolResult{}, err
 	}
 	if mime := imageMIME(data); mime != "" {
 		return readImage(ctx, data, mime, t.set.options.Images)
 	}
-	text := strings.ToValidUTF8(string(data), "\ufffd")
+	text := decodeFileText(data)
 	lines := strings.Split(text, "\n")
-	start := r.Offset - 1
-	if start >= len(lines) {
-		return astral.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", r.Offset, len(lines))
+	offset := 1.0
+	if r.Offset != nil {
+		offset = *r.Offset
 	}
-	end := len(lines)
-	if r.Limit > 0 && r.Limit < end-start {
-		end = start + r.Limit
+	start := math.Max(0, offset-1)
+	if start >= float64(len(lines)) {
+		return astral.ToolResult{}, notExecuted(fmt.Sprintf("Offset %s is beyond end of file (%d lines total)", fileNumber(offset), len(lines)))
 	}
-	truncation := truncateHead(strings.Join(lines[start:end], "\n"))
+	end := float64(len(lines))
+	if r.Limit != nil {
+		end = math.Min(start+*r.Limit, end)
+	}
+	// Pi declares numbers and delegates fractional/negative indices to JS slice.
+	// Keep those semantics while never converting an unbounded number to int.
+	first := sliceIndex(start, len(lines))
+	last := max(first, sliceIndex(end, len(lines)))
+	truncation := truncateHead(strings.Join(lines[first:last], "\n"))
 	output := truncation.Content
 	if truncation.FirstLineExceedsLimit {
-		output = fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use exec_command to inspect a bounded portion of this line.]", r.Offset, formatSize(len(lines[start])), formatSize(readMaxBytes))
+		output = fmt.Sprintf("[Line %s is %s, exceeds %s limit. Use exec_command to inspect a bounded portion of this line.]", fileNumber(start+1), formatSize(len(lines[first])), formatSize(readMaxBytes))
 	} else if truncation.Truncated {
-		last := start + truncation.OutputLines
+		last := start + float64(truncation.OutputLines)
 		if truncation.TruncatedBy == "lines" {
-			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", r.Offset, last, len(lines), last+1)
+			output += fmt.Sprintf("\n\n[Showing lines %s-%s of %d. Use offset=%s to continue.]", fileNumber(start+1), fileNumber(last), len(lines), fileNumber(last+1))
 		} else {
-			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", r.Offset, last, len(lines), formatSize(readMaxBytes), last+1)
+			output += fmt.Sprintf("\n\n[Showing lines %s-%s of %d (%s limit). Use offset=%s to continue.]", fileNumber(start+1), fileNumber(last), len(lines), formatSize(readMaxBytes), fileNumber(last+1))
 		}
-	} else if r.Limit > 0 && end < len(lines) {
-		output += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", len(lines)-end, end+1)
+	} else if r.Limit != nil && end < float64(len(lines)) {
+		output += fmt.Sprintf("\n\n[%s more lines in file. Use offset=%s to continue.]", fileNumber(float64(len(lines))-end), fileNumber(end+1))
 	}
 	var details json.RawMessage
 	if truncation.Truncated {
@@ -93,7 +110,7 @@ func (t backendTool) read(ctx context.Context, inv astral.Invocation) (astral.To
 
 func (t backendTool) write(ctx context.Context, inv astral.Invocation) (astral.ToolResult, error) {
 	var r WriteRequest
-	if err := decodeArguments(inv.Call.Arguments, &r); err != nil {
+	if err := decodeFileArguments(inv.Call.Arguments, &r, "path", "content"); err != nil {
 		return astral.ToolResult{}, err
 	}
 	fs, p, err := t.file(ctx, inv, r.Path, false)
@@ -105,13 +122,50 @@ func (t backendTool) write(ctx context.Context, inv astral.Invocation) (astral.T
 		return astral.ToolResult{}, err
 	}
 	defer unlock()
-	if err := fs.MkdirAll(ctx, p.Parent); err != nil {
+	if err := fileAborted(ctx, astral.OutcomeNotExecuted); err != nil {
 		return astral.ToolResult{}, err
 	}
-	if err := fs.WriteFile(ctx, p.Path, []byte(r.Content)); err != nil {
+	err = fs.MkdirAll(ctx, p.Parent)
+	if aborted := fileAborted(ctx, astral.OutcomeUnknown); aborted != nil {
+		return astral.ToolResult{}, aborted
+	}
+	if err != nil {
+		return astral.ToolResult{}, err
+	}
+	err = fs.WriteFile(ctx, p.Path, []byte(r.Content))
+	if aborted := fileAborted(ctx, astral.OutcomeUnknown); aborted != nil {
+		return astral.ToolResult{}, aborted
+	}
+	if err != nil {
 		return astral.ToolResult{}, err
 	}
 	return astral.ToolResult{Content: astral.Text("Successfully wrote to " + r.Path)}, nil
+}
+
+func fileNumber(value float64) string {
+	// encoding/json uses the same fixed/exponent thresholds as JS String(number).
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func sliceIndex(index float64, length int) int {
+	index = math.Trunc(index)
+	if index < 0 {
+		index += float64(length)
+	}
+	return int(math.Max(0, math.Min(index, float64(length))))
+}
+
+type fileAbortError struct{ cause error }
+
+func (e fileAbortError) Error() string { return "Operation aborted" }
+func (e fileAbortError) Unwrap() error { return e.cause }
+
+func fileAborted(ctx context.Context, outcome astral.Outcome) error {
+	if err := ctx.Err(); err != nil {
+		return &astral.ToolError{Outcome: outcome, Code: "operation_aborted", Message: "Operation aborted", Cause: fileAbortError{err}}
+	}
+	return nil
 }
 
 // Locks span Sets and sessions. Backend keys include filesystem identity, not
@@ -147,12 +201,12 @@ func lockFile(ctx context.Context, key string) (func(), error) {
 	select {
 	case <-ctx.Done():
 		release()
-		return nil, notExecuted(ctx.Err().Error())
+		return nil, fileAborted(ctx, astral.OutcomeNotExecuted)
 	case <-l.token:
 		if err := ctx.Err(); err != nil {
 			l.token <- struct{}{}
 			release()
-			return nil, notExecuted(err.Error())
+			return nil, fileAborted(ctx, astral.OutcomeNotExecuted)
 		}
 		return func() { l.token <- struct{}{}; release() }, nil
 	}
@@ -160,8 +214,29 @@ func lockFile(ctx context.Context, key string) (func(), error) {
 
 func fileDefinitions() []astral.ToolDefinition {
 	return []astral.ToolDefinition{
-		{Name: "read", Version: "2", Description: "Read a file (relative or absolute path). Supports text and images (jpg, png, gif, webp, bmp). Images are returned as attachments. Text is truncated to 2000 lines or 50KB, whichever comes first. Use offset/limit and continue with the suggested offset to read large files.", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`)},
-		{Name: "write", Version: "2", Description: "Write a file. Creates it if missing, overwrites it if present, and creates parent directories. Use for new files or complete rewrites.", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","minLength":1},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}`)},
-		{Name: "edit", Version: "2", Description: "Edit one file with targeted replacements. Each edits[].oldText must uniquely match the original file. Edits are matched against the same original content and must not overlap or nest. Merge nearby changes into one edit. Returns a diff and unified patch.", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","minLength":1},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"oldText":{"type":"string","minLength":1},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}`)},
+		{Name: "read", Version: "3", Description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete. Use read to examine files instead of cat or sed.", Parameters: json.RawMessage(`{
+			"type":"object","properties":{
+				"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},
+				"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},
+				"limit":{"type":"number","description":"Maximum number of lines to read"}
+			},"required":["path"]
+		}`)},
+		{Name: "write", Version: "3", Description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories. Use write only for new files or complete rewrites.", Parameters: json.RawMessage(`{
+			"type":"object","properties":{
+				"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},
+				"content":{"type":"string","description":"Content to write to the file"}
+			},"required":["path","content"]
+		}`)},
+		{Name: "edit", Version: "3", Description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. Use edit for precise changes (edits[].oldText must match exactly). When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls. Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit. Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.", Parameters: json.RawMessage(`{
+			"type":"object","properties":{
+				"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},
+				"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{
+					"type":"object","properties":{
+						"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},
+						"newText":{"type":"string","description":"Replacement text for this targeted edit."}
+					},"required":["oldText","newText"]
+				}}
+			},"required":["path","edits"]
+		}`)},
 	}
 }

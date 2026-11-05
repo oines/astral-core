@@ -25,8 +25,8 @@ func TestPiEditFixtures(t *testing.T) {
 		t.Run(c.Name, func(t *testing.T) {
 			got, err := applyEdits(c.Original, c.Edits, "fixture.txt")
 			if c.Error != "" {
-				if err == nil {
-					t.Fatalf("expected rejection, got %q", got)
+				if err == nil || err.Error() != c.Error {
+					t.Fatalf("got %q, %v; want exact error %q", got, err, c.Error)
 				}
 				return
 			}

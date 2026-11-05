@@ -78,7 +78,12 @@ func (s *Set) Tools() []astral.Tool {
 	definitions := append(fileDefinitions(), processDefinitions()...)
 	result := make([]astral.Tool, 0, len(definitions))
 	for _, definition := range definitions {
-		result = append(result, backendTool{set: s, definition: definition})
+		tool := backendTool{set: s, definition: definition}
+		if definition.Name == "edit" {
+			result = append(result, editTool{tool})
+		} else {
+			result = append(result, tool)
+		}
 	}
 	return result
 }
@@ -88,10 +93,18 @@ type backendTool struct {
 	definition astral.ToolDefinition
 }
 
+type editTool struct{ backendTool }
+
 func (t backendTool) Definition() astral.ToolDefinition {
 	d := t.definition
 	d.Parameters = append(json.RawMessage(nil), d.Parameters...)
 	return d
+}
+
+// PrepareArguments accepts Pi's edit compatibility forms without changing the
+// model's original call. All conversions are deterministic and side-effect free.
+func (editTool) PrepareArguments(arguments json.RawMessage) (json.RawMessage, error) {
+	return prepareEditArguments(arguments)
 }
 
 func (t backendTool) Execute(ctx context.Context, inv astral.Invocation, emit func(astral.ToolProgress)) (astral.ToolExecution, error) {
@@ -112,6 +125,9 @@ func (t backendTool) execute(ctx context.Context, inv astral.Invocation, emit fu
 	stop := context.AfterFunc(t.set.ctx, cancel)
 	defer func() { stop(); cancel() }()
 	if err := ctx.Err(); err != nil {
+		if t.definition.Name == "read" || t.definition.Name == "write" || t.definition.Name == "edit" {
+			return astral.ToolResult{}, fileAborted(ctx, astral.OutcomeNotExecuted)
+		}
 		return astral.ToolResult{}, notExecuted(err.Error())
 	}
 	if emit == nil {

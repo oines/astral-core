@@ -83,6 +83,13 @@ func selectRequestMessages(base, actual []Message) []int {
 			out[i] = i
 			continue
 		}
+		// Most projections change content in place. Prefer that source before
+		// building an index over the entire history, provided this cannot copy a
+		// large field moved from a different message into the request recipe.
+		if len(base) == len(actual) && sameMessageIdentity(base[i], message) && retainsLargeRequestFields(base[i], message) {
+			out[i] = i
+			continue
+		}
 		if byDigest == nil {
 			byDigest = make(map[string]int, len(base))
 			for j, old := range base {
@@ -126,6 +133,53 @@ func selectRequestMessages(base, actual []Message) []int {
 		}
 	}
 	return out
+}
+
+func retainsLargeRequestFields(before, after Message) bool {
+	const large = 4096
+	if len(after.Metadata) >= large && !bytes.Equal(before.Metadata, after.Metadata) ||
+		len(after.ErrorMessage) >= large && before.ErrorMessage != after.ErrorMessage {
+		return false
+	}
+	next := 0
+	for i, part := range after.Content {
+		if !largeRequestContent(part) {
+			continue
+		}
+		if len(before.Content) != len(after.Content) {
+			// Length-changing diffs retain ordered, unchanged content anchors.
+			for next < len(before.Content) && !sameRequestContentAnchor(before.Content[next], part) {
+				next++
+			}
+			if next == len(before.Content) {
+				return false
+			}
+			next++
+			continue
+		}
+		// Equal-length content is compared by index. Finding a large field at
+		// some other position is insufficient: the diff would copy it again.
+		old := before.Content[i]
+		if len(part.Text) >= large && old.Text != part.Text ||
+			len(part.URL) >= large && old.URL != part.URL ||
+			len(part.Data) >= large && !bytes.Equal(old.Data, part.Data) ||
+			len(part.Metadata) >= large && !bytes.Equal(old.Metadata, part.Metadata) {
+			return false
+		}
+		if call := part.ToolCall; call != nil && (len(call.Arguments) >= large || len(call.Metadata) >= large) {
+			if old.ToolCall == nil || len(call.Arguments) >= large && !bytes.Equal(old.ToolCall.Arguments, call.Arguments) ||
+				len(call.Metadata) >= large && !bytes.Equal(old.ToolCall.Metadata, call.Metadata) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func largeRequestContent(part Content) bool {
+	const large = 4096
+	return len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
+		part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)
 }
 
 func sameMessageIdentity(a, b Message) bool {

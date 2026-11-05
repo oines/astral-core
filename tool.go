@@ -11,6 +11,14 @@ type Tool interface {
 	Execute(context.Context, Invocation, func(ToolProgress)) (ToolExecution, error)
 }
 
+// ToolArgumentPreparer optionally converts compatibility forms before schema
+// validation, binding, approval hooks and execution. It must be deterministic,
+// side-effect free and covered by the tool's Version. The original model call is
+// retained in history; only the invocation passed to callbacks is normalized.
+type ToolArgumentPreparer interface {
+	PrepareArguments(json.RawMessage) (json.RawMessage, error)
+}
+
 // TargetedTool optionally resolves a resource's original execution target before
 // the invocation is persisted or approved. This is useful for process handles
 // whose runtime is selected and managed by the host.
@@ -135,6 +143,25 @@ func bindTool(ctx context.Context, tool TargetedTool, inv Invocation) (binding j
 		binding, err = copyJSON(binding)
 	}
 	return
+}
+
+func prepareToolArguments(tool Tool, inv Invocation) (prepared Invocation, err error) {
+	prepared = inv
+	preparer, ok := tool.(ToolArgumentPreparer)
+	if !ok {
+		return prepared, nil
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("tool argument preparation panicked: %v", p)
+		}
+	}()
+	arguments, err := preparer.PrepareArguments(append(json.RawMessage(nil), inv.Call.Arguments...))
+	if err != nil {
+		return prepared, err
+	}
+	prepared.Call.Arguments = append(json.RawMessage(nil), arguments...)
+	return prepared, nil
 }
 
 func invokeTool(ctx context.Context, tool Tool, inv Invocation, emit func(ToolProgress)) (execution ToolExecution, err error) {

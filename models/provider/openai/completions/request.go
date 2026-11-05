@@ -14,7 +14,7 @@ const toolImageHint = "\n[Image returned by this tool; attached after the tool-r
 
 // RequestBody is the exact credential-free JSON body used for this request.
 func (m *Model) RequestBody(req astral.Request) (map[string]any, error) {
-	owned, err := astral.CopyRequest(req)
+	owned, err := m.client.CopyRequest(req)
 	if err != nil {
 		return nil, err
 	}

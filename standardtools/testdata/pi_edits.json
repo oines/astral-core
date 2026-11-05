@@ -172,5 +172,76 @@
       }
     ],
     "expected": "x\nnew\n"
+  },
+  {
+    "name": "multi missing",
+    "original": "alpha\nbeta\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "A"
+      },
+      {
+        "oldText": "missing",
+        "newText": "B"
+      }
+    ],
+    "error": "Could not find edits[1] in fixture.txt. The oldText must match exactly including all whitespace and newlines."
+  },
+  {
+    "name": "multi duplicate",
+    "original": "alpha\none\none\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "A"
+      },
+      {
+        "oldText": "one",
+        "newText": "B"
+      }
+    ],
+    "error": "Found 2 occurrences of edits[1] in fixture.txt. Each oldText must be unique. Please provide more context to make it unique."
+  },
+  {
+    "name": "multi empty",
+    "original": "alpha\nbeta\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "A"
+      },
+      {
+        "oldText": "",
+        "newText": "B"
+      }
+    ],
+    "error": "edits[1].oldText must not be empty in fixture.txt."
+  },
+  {
+    "name": "multi no change",
+    "original": "alpha\nbeta\n",
+    "edits": [
+      {
+        "oldText": "alpha",
+        "newText": "alpha"
+      },
+      {
+        "oldText": "beta",
+        "newText": "beta"
+      }
+    ],
+    "error": "No changes made to fixture.txt. The replacements produced identical content."
+  },
+  {
+    "name": "fuzzy whitespace-only range",
+    "original": "ﬁ\n \n",
+    "edits": [
+      {
+        "oldText": "  ",
+        "newText": "changed"
+      }
+    ],
+    "error": "Found 3 occurrences of the text in fixture.txt. The text must be unique. Please provide more context to make it unique."
   }
 ]

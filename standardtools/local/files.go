@@ -28,6 +28,9 @@ func expandPath(path, cwd, home string) (string, error) {
 		}
 		return r
 	}, path)
+	if runtime.GOOS == "windows" {
+		path = normalizeWindowsShellPath(path)
+	}
 	if path == "~" || strings.HasPrefix(path, "~/") || runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`) {
 		if home == "" {
 			return "", errors.New("home directory is unavailable")
@@ -118,7 +121,33 @@ func (*fileSystem) MkdirAll(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
 		return beforeStart(err)
 	}
-	return os.MkdirAll(path, 0755)
+	return os.MkdirAll(path, 0777)
+}
+
+// Pi accepts common MSYS/Cygwin/WSL drive spellings on native Windows, while
+// leaving UNC paths, ordinary Unix paths and mixed separators unchanged.
+func normalizeWindowsShellPath(path string) string {
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") || strings.Contains(path, `\`) {
+		return path
+	}
+	rest := strings.TrimPrefix(path, "/")
+	for _, prefix := range []string{"mnt/", "cygdrive/"} {
+		if len(rest) >= len(prefix) && strings.EqualFold(rest[:len(prefix)], prefix) {
+			rest = rest[len(prefix):]
+			break
+		}
+	}
+	if len(rest) == 0 || len(rest) > 1 && rest[1] != '/' {
+		return path
+	}
+	drive := rest[0]
+	if drive >= 'a' && drive <= 'z' {
+		drive -= 'a' - 'A'
+	}
+	if drive < 'A' || drive > 'Z' {
+		return path
+	}
+	return string(drive) + `:\` + strings.ReplaceAll(strings.TrimPrefix(rest[1:], "/"), "/", `\`)
 }
 
 // Like Pi, writes follow symlinks, preserve existing permissions and update
