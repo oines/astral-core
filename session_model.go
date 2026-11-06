@@ -124,5 +124,9 @@ func (m estimatedModel) PrepareExecution(ctx context.Context, request Request) (
 }
 
 func (m estimatedModel) RecoverRequest(ctx context.Context, request Request, cause error) (Request, bool, error) {
-	return RecoverModelRequest(ctx, m.Model, request, cause)
+	// The outer recovery boundary already owns the request and isolates output.
+	if recoverer, ok := m.Model.(ModelRequestRecoverer); ok {
+		return recoverer.RecoverRequest(ctx, request, cause)
+	}
+	return Request{}, false, nil
 }
