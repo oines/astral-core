@@ -85,9 +85,11 @@ config.Tools = set.Tools()
 
 `read` 默认从第 1 行开始，未指定 `limit` 时读取至结尾，再应用 2000 行 / 50 KiB 上限。它不把超长第一行切成不完整代码，而是说明该行超过限制。带分页或截断的结果包含后续 offset；超出文件末尾的 offset 报错。
 
-图片按文件内容识别 PNG、JPEG、GIF、WebP、BMP，并使用 Core 的统一图片管线。默认优先保持原尺寸，base64 内容最多 150,000 字节，重新编码的 WebP 质量为 75，解码上限为 4000 万像素。`MaxWidth`、`MaxHeight`、`MaxPatches` 默认为 0，不施加对应限制；宿主可用 `Options.Images` 显式设置这些限制，或覆盖 `Quality`、`MaxBytes` 和 `MaxPixels`。
+图片按文件内容识别 PNG、JPEG、GIF、WebP、BMP，并使用 Core 的统一图片管线。默认优先保持原尺寸，base64 内容超过 150,000 字节时尝试一次质量 75、Method4 的 WebP 编码，采用原生 Go 的 VPX 实现，不依赖 CGo、原生动态库或 WASM。`CompressAboveBytes` 是是否尝试压缩的阈值，不是输出大小保证；图片的实际输出大小随内容变化。`MaxBytes` 保留独立的硬上限语义，默认 4.5 MiB；一次编码后仍超出硬上限时返回图片省略原因，不缩小重试。解码上限保持为 4000 万像素。
 
-满足限制且无需转换的原图保留原字节。需要压缩时先按原尺寸编码为 WebP，仅在仍超过字节预算时缩小尺寸；显式尺寸或 patch 限制，以及 WebP 重新编码的单边 16383 像素上限也会约束输出尺寸。BMP 转为 WebP；JPEG 在重新编码前应用 EXIF 朝向，透明通道保留，动画图片重新编码时只保留解码帧。`DisableResize` 跳过自动尺寸、patch 和字节预算压缩，但仍检查解码像素上限；必要的格式转换和 EXIF 处理仍会执行，重新编码仍受 WebP 格式限制。
+`MaxWidth`、`MaxHeight`、`MaxPatches` 默认为 0，不施加对应限制；宿主可用 `Options.Images` 显式设置这些限制，或覆盖压缩阈值、质量、硬字节上限和解码像素上限。满足限制且无需转换的原图保留原字节。显式尺寸或 patch 限制只执行一次等比缩放；默认不自动缩放。无需方向、格式或尺寸修正时，若编码结果更大则保留更小的原件。WebP 无法表示的尺寸也不暗中缩小：可保留合规原件时保留，否则返回图片省略原因。
+
+BMP 转为 WebP；JPEG 在重新编码前应用 EXIF 朝向，透明通道保留，动画图片重新编码时只保留解码帧。`DisableResize` 保留旧的尺寸、patch 和字节限制旁路语义，但仍检查解码像素上限；必要的格式转换和 EXIF 处理仍会执行，重新编码仍受 WebP 格式限制。Core 的 WebP 输入显式使用已有 `x/image/webp` 解码器，避免编码依赖的全局格式注册更改 Core 的解码路径。
 
 模型 Content 包含文本提示和 `image` 内容，`Data` 是 base64 字符串的 JSON 值；Model 适配器负责映射至 Provider 协议。图片在准入时处理一次，后续请求复用已有图片字节。
 

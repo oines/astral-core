@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"golang.org/x/image/bmp"
+	xwebp "golang.org/x/image/webp"
 )
 
 func TestImageFormatsAndDecodeLimit(t *testing.T) {
@@ -99,7 +100,13 @@ func TestJPEGOrientationBeforeResize(t *testing.T) {
 func imagePixels(t *testing.T, result ToolResult) image.Image {
 	t.Helper()
 	data := imageBytes(t, result)
-	decoded, _, err := image.Decode(bytes.NewReader(data))
+	var decoded image.Image
+	var err error
+	if result.Content[1].MediaType == "image/webp" {
+		decoded, err = xwebp.Decode(bytes.NewReader(data))
+	} else {
+		decoded, _, err = image.Decode(bytes.NewReader(data))
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,24 +129,19 @@ func imageBytes(t *testing.T, result ToolResult) []byte {
 	return data
 }
 
-func TestProcessImagePatchAndPayloadLimitsKeepTransparency(t *testing.T) {
+func TestProcessImageExplicitPatchLimitKeepsTransparency(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		size    int
 		options ImageOptions
-		noise   bool
 	}{
-		{"explicit patch limit", 2048, ImageOptions{MaxPatches: 2500, MaxBytes: 9 * 1024 * 1024 / 2}, false},
-		{"base64 limit", 256, ImageOptions{MaxBytes: 4096}, true},
+		{"explicit patch limit", 2048, ImageOptions{MaxPatches: 2500}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := image.NewNRGBA(image.Rect(0, 0, tt.size, tt.size))
 			for y := 0; y < tt.size; y++ {
 				for x := 0; x < tt.size; x++ {
 					pixel := color.NRGBA{R: 90, G: 60, B: 30, A: 128}
-					if tt.noise {
-						pixel = color.NRGBA{R: uint8(x*37 + y*19), G: uint8(x*11 + y*53), B: uint8(x*23 + y*7), A: 128}
-					}
 					source.SetNRGBA(x, y, pixel)
 				}
 			}
@@ -166,7 +168,7 @@ func TestProcessImagePatchAndPayloadLimitsKeepTransparency(t *testing.T) {
 			_ = json.Unmarshal(result.Content[1].Data, &encoded)
 			limit := tt.options.MaxBytes
 			if limit == 0 {
-				limit = 150_000
+				limit = 9 * 1024 * 1024 / 2
 			}
 			if len(encoded) > limit {
 				t.Fatalf("base64 budget exceeded: %d", len(encoded))
@@ -319,9 +321,9 @@ func TestProcessImageWebPMetadataAndQuality(t *testing.T) {
 			t.Fatal(err)
 		}
 		data := imageBytes(t, result)
-		config, format, err := image.DecodeConfig(bytes.NewReader(data))
-		if err != nil || format != "webp" || config.Width != 48 || config.Height != 32 || result.Content[1].MediaType != "image/webp" {
-			t.Fatalf("WebP output: %s %+v %v", format, config, err)
+		config, err := xwebp.DecodeConfig(bytes.NewReader(data))
+		if err != nil || config.Width != 48 || config.Height != 32 || result.Content[1].MediaType != "image/webp" {
+			t.Fatalf("WebP output: %+v %v", config, err)
 		}
 		var dimensions map[string]int
 		if err := json.Unmarshal(result.Content[1].Metadata, &dimensions); err != nil {
@@ -367,7 +369,7 @@ func TestImageOptionsDefaultsAndValidation(t *testing.T) {
 	if err := options.Validate(); err != nil || options.Quality != 0 {
 		t.Fatalf("Validate mutated options or rejected defaults: %+v %v", options, err)
 	}
-	if err := options.defaults(); err != nil || options.Quality != 75 || options.MaxBytes != 150_000 || options.MaxPixels != 40_000_000 || options.MaxWidth != 0 || options.MaxHeight != 0 || options.MaxPatches != 0 {
+	if err := options.defaults(); err != nil || options.Quality != 75 || options.MaxBytes != 9*1024*1024/2 || options.CompressAboveBytes != 150_000 || options.MaxPixels != 40_000_000 || options.MaxWidth != 0 || options.MaxHeight != 0 || options.MaxPatches != 0 {
 		t.Fatalf("image defaults: %+v %v", options, err)
 	}
 	for _, quality := range []int{-1, 101} {
@@ -381,11 +383,12 @@ func TestImageOptionsDefaultsAndValidation(t *testing.T) {
 		}
 	}
 	for name, options := range map[string]ImageOptions{
-		"negative width":   {MaxWidth: -1},
-		"negative height":  {MaxHeight: -1},
-		"negative patches": {MaxPatches: -1},
-		"negative pixels":  {MaxPixels: -1},
-		"small byte limit": {MaxBytes: 127},
+		"negative width":                 {MaxWidth: -1},
+		"negative height":                {MaxHeight: -1},
+		"negative patches":               {MaxPatches: -1},
+		"negative pixels":                {MaxPixels: -1},
+		"small byte limit":               {MaxBytes: 127},
+		"negative compression threshold": {CompressAboveBytes: -1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := options.Validate(); err == nil {
@@ -446,9 +449,9 @@ func TestProcessImageKeepsOriginalDimensionsWhenCompressionFits(t *testing.T) {
 	}
 }
 
-func TestProcessImageReencodingHonorsWebPDimensionLimit(t *testing.T) {
+func TestProcessImageDoesNotResizeToFitWebPFormat(t *testing.T) {
 	// A thin BMP is cheap to decode but requires conversion to a supported image.
-	// Its 17k pixels are below MaxPixels; WebP's side limit still needs a fallback.
+	// Its 17k pixels are below MaxPixels, but cannot be encoded as lossy WebP.
 	var raw bytes.Buffer
 	if err := bmp.Encode(&raw, image.NewNRGBA(image.Rect(0, 0, 17_000, 1))); err != nil {
 		t.Fatal(err)
@@ -457,16 +460,104 @@ func TestProcessImageReencodingHonorsWebPDimensionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded := imagePixels(t, result)
-	if decoded.Bounds().Dx() > 16383 || decoded.Bounds().Dy() != 1 || result.Content[1].MediaType != "image/webp" {
-		t.Fatalf("WebP dimension fallback failed: %v", decoded.Bounds())
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "dimensions exceed the WebP encoding limit") {
+		t.Fatalf("unsupported BMP was silently resized: %+v", result)
 	}
-	var dimensions map[string]int
-	if err := json.Unmarshal(result.Content[1].Metadata, &dimensions); err != nil {
+	var pngData bytes.Buffer
+	if err := (&png.Encoder{CompressionLevel: png.NoCompression}).Encode(&pngData, image.NewNRGBA(image.Rect(0, 0, 17_000, 1))); err != nil {
 		t.Fatal(err)
 	}
-	if dimensions["original_width"] != 17_000 || dimensions["original_height"] != 1 || dimensions["width"] != decoded.Bounds().Dx() {
-		t.Fatalf("format fallback lost original dimensions: %v", dimensions)
+	result, err = ProcessImage(context.Background(), pngData.Bytes(), ImageOptions{CompressAboveBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(imageBytes(t, result), pngData.Bytes()) || result.Content[1].MediaType != "image/png" {
+		t.Fatal("a portable long original was changed to fit the encoding format")
+	}
+}
+
+func noisyImagePNG(t *testing.T) []byte {
+	t.Helper()
+	source := image.NewNRGBA(image.Rect(0, 0, 96, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 96; x++ {
+			source.SetNRGBA(x, y, color.NRGBA{R: uint8(x*37 + y*19), G: uint8(x*11 + y*53), B: uint8(x*23 + y*7), A: 128})
+		}
+	}
+	var raw bytes.Buffer
+	if err := (&png.Encoder{CompressionLevel: png.NoCompression}).Encode(&raw, source); err != nil {
+		t.Fatal(err)
+	}
+	return raw.Bytes()
+}
+
+func TestProcessImageCompressionThresholdDoesNotResizeOrSearch(t *testing.T) {
+	result, err := ProcessImage(context.Background(), noisyImagePNG(t), ImageOptions{CompressAboveBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := imagePixels(t, result).Bounds()
+	if got.Dx() != 96 || got.Dy() != 64 || result.Content[1].MediaType != "image/webp" {
+		t.Fatalf("compression threshold changed dimensions or skipped encoding: %v %+v", got, result)
+	}
+	if base64.StdEncoding.EncodedLen(len(imageBytes(t, result))) <= 128 {
+		t.Fatal("fixture no longer distinguishes a threshold from an output cap")
+	}
+}
+
+func TestProcessImageKeepsSmallerPortableOriginal(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	source.SetNRGBA(0, 0, color.NRGBA{R: 90, G: 60, B: 30, A: 128})
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, source); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ProcessImage(context.Background(), raw.Bytes(), ImageOptions{CompressAboveBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content[1].MediaType != "image/png" || !bytes.Equal(imageBytes(t, result), raw.Bytes()) {
+		t.Fatal("a larger encoded result replaced the smaller portable original")
+	}
+}
+
+func TestProcessImageKeepsExistingWebPDecoder(t *testing.T) {
+	var raw bytes.Buffer
+	source := image.NewRGBA(image.Rect(0, 0, 8, 4))
+	for i := 3; i < len(source.Pix); i += 4 {
+		source.Pix[i] = 255
+	}
+	if err := bmp.Encode(&raw, source); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ProcessImage(context.Background(), raw.Bytes(), ImageOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := imageBytes(t, result)
+	config, err := decodeImageConfig(data, "image/webp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := config.ColorModel.Convert(color.Black).(color.YCbCr); !ok {
+		t.Fatal("WebP header decoding switched to the encoding dependency's decoder")
+	}
+	pixels, err := decodeImagePixels(data, "image/webp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pixels.(*image.YCbCr); !ok {
+		t.Fatal("WebP pixel decoding switched to the encoding dependency's decoder")
+	}
+}
+
+func TestProcessImageHardLimitDoesNotRetryAtSmallerDimensions(t *testing.T) {
+	result, err := ProcessImage(context.Background(), noisyImagePNG(t), ImageOptions{MaxBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "encoded image exceeds the configured inline size limit") {
+		t.Fatalf("hard limit did not reject the one encoded output: %+v", result)
 	}
 }
 

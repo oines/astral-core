@@ -14,31 +14,36 @@ import (
 	"math"
 	"net/http"
 
-	"github.com/oines/astral-core/internal/webp"
+	webp "github.com/gen2brain/vpx/webp"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
+	xwebp "golang.org/x/image/webp"
 )
 
-// ImageOptions bounds inline images. MaxBytes counts the base64 payload and
-// defaults to 150,000 bytes. Quality defaults to 75 for WebP reencoding.
-// Zero width, height and patch limits preserve resolution unless the byte budget
-// or output format requires resizing. MaxPixels bounds decoding before allocation.
+// ImageOptions prepares inline images once. CompressAboveBytes counts base64
+// bytes and defaults to 150,000; it triggers compression, not a target-size search.
+// MaxBytes is the separate hard base64 limit and defaults to 4.5 MiB.
+// Quality defaults to 75. Zero width, height and patch limits preserve resolution.
+// MaxPixels bounds decoding before allocation.
 // Hosts can supply provider-specific limits; Core is provider-neutral.
 type ImageOptions struct {
-	DisableResize bool
-	MaxWidth      int
-	MaxHeight     int
-	MaxBytes      int
-	MaxPixels     int64
-	MaxPatches    int
-	Quality       int
+	DisableResize      bool
+	MaxWidth           int
+	MaxHeight          int
+	MaxBytes           int
+	CompressAboveBytes int
+	MaxPixels          int64
+	MaxPatches         int
+	Quality            int
 }
 
 func (o *ImageOptions) defaults() error {
 	if o.MaxBytes == 0 {
-		o.MaxBytes = 150_000
+		o.MaxBytes = 9 * 1024 * 1024 / 2
+	}
+	if o.CompressAboveBytes == 0 {
+		o.CompressAboveBytes = 150_000
 	}
 	if o.Quality == 0 {
 		o.Quality = 75
@@ -46,7 +51,7 @@ func (o *ImageOptions) defaults() error {
 	if o.MaxPixels == 0 {
 		o.MaxPixels = 40_000_000
 	}
-	if o.MaxWidth < 0 || o.MaxHeight < 0 || o.MaxBytes < 128 || o.MaxPixels < 1 || o.MaxPatches < 0 || o.Quality < 1 || o.Quality > 100 {
+	if o.MaxWidth < 0 || o.MaxHeight < 0 || o.MaxBytes < 128 || o.CompressAboveBytes < 1 || o.MaxPixels < 1 || o.MaxPatches < 0 || o.Quality < 1 || o.Quality > 100 {
 		return fmt.Errorf("invalid image limits")
 	}
 	return nil
@@ -78,7 +83,7 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 	if err := ctx.Err(); err != nil {
 		return ToolResult{}, err
 	}
-	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	config, err := decodeImageConfig(data, mime)
 	if err != nil {
 		return ToolResult{Content: Text("Read image file [" + mime + "]\n[Image omitted: could not decode image.]"), IsError: true}, nil
 	}
@@ -93,22 +98,21 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 	fitsDimensions := (options.MaxWidth == 0 || ow <= options.MaxWidth) &&
 		(options.MaxHeight == 0 || oh <= options.MaxHeight) &&
 		(options.MaxPatches == 0 || imagePatches(ow, oh) <= options.MaxPatches)
-	if orientation == 1 && mime != "image/bmp" && (options.DisableResize || fitsDimensions && base64.StdEncoding.EncodedLen(len(data)) <= options.MaxBytes) {
+	originalBytes := base64.StdEncoding.EncodedLen(len(data))
+	if orientation == 1 && mime != "image/bmp" && (options.DisableResize || fitsDimensions && originalBytes <= options.CompressAboveBytes && originalBytes <= options.MaxBytes) {
 		return imageResult(data, mime, ow, oh, ow, oh, ""), nil
 	}
 	if err := ctx.Err(); err != nil {
 		return ToolResult{}, err
 	}
-	decoded, _, err := image.Decode(bytes.NewReader(data))
+	decoded, err := decodeImagePixels(data, mime)
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("decode image: %w", err)
 	}
 	decoded = orientImage(decoded, orientation)
 	w, h := ow, oh
 	if !options.DisableResize {
-		// WebP's bitstream limit applies only when reencoding. Already fitting
-		// originals above this dimension remain byte-for-byte unchanged.
-		scale := math.Min(1, math.Min(float64(webp.MaxDimension)/float64(w), float64(webp.MaxDimension)/float64(h)))
+		scale := 1.0
 		if options.MaxWidth > 0 {
 			scale = math.Min(scale, float64(options.MaxWidth)/float64(w))
 		}
@@ -116,39 +120,62 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 			scale = math.Min(scale, float64(options.MaxHeight)/float64(h))
 		}
 		if options.MaxPatches > 0 {
-			scale = math.Min(scale, math.Sqrt(float64(options.MaxPatches)*32*32/float64(w*h)))
+			// Choose a patch grid once; rounded-up dimensions must fit it.
+			columns := max(1, min(options.MaxPatches, int(math.Sqrt(float64(options.MaxPatches)*float64(w)/float64(h)))))
+			rows := options.MaxPatches / columns
+			scale = math.Min(scale, math.Min(float64(columns)*32/float64(w), float64(rows)*32/float64(h)))
 		}
 		w, h = max(1, int(math.Floor(float64(w)*scale))), max(1, int(math.Floor(float64(h)*scale)))
-		for options.MaxPatches > 0 && imagePatches(w, h) > options.MaxPatches {
-			scale *= 0.99
-			w, h = max(1, int(float64(ow)*scale)), max(1, int(float64(oh)*scale))
-		}
 	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return ToolResult{}, err
-		}
-		// Avoid a full-size resampling pass when only encoding changes. The
-		// codec converts pixel layout as needed without rescaling the image.
-		pixels := decoded
-		if w != ow || h != oh {
-			canvas := image.NewNRGBA(image.Rect(0, 0, w, h))
-			draw.CatmullRom.Scale(canvas, canvas.Bounds(), decoded, decoded.Bounds(), draw.Src, nil)
-			pixels = canvas
-		}
-		var encoded bytes.Buffer
-		if err := webp.Encode(&encoded, pixels, options.Quality); err != nil {
-			return ToolResult{}, err
-		}
-		if options.DisableResize || base64.StdEncoding.EncodedLen(encoded.Len()) <= options.MaxBytes {
-			return imageResult(encoded.Bytes(), "image/webp", ow, oh, w, h, mime), nil
-		}
-		if w == 1 && h == 1 {
-			break
-		}
-		w, h = max(1, w*3/4), max(1, h*3/4)
+	if err := ctx.Err(); err != nil {
+		return ToolResult{}, err
 	}
-	return ToolResult{Content: Text("[Image omitted: could not be resized below the inline image size limit.]"), IsError: true}, nil
+	pixels := decoded
+	resized := w != ow || h != oh
+	if resized {
+		canvas := image.NewNRGBA(image.Rect(0, 0, w, h))
+		draw.ApproxBiLinear.Scale(canvas, canvas.Bounds(), decoded, decoded.Bounds(), draw.Src, nil)
+		pixels = canvas
+	}
+	canKeepOriginal := !resized && orientation == 1 && mime != "image/bmp" && originalBytes <= options.MaxBytes
+	// A compression threshold must not silently change a long image's size.
+	// The lossy WebP format can represent at most 16383 pixels per side.
+	if w > 16383 || h > 16383 {
+		if canKeepOriginal {
+			return imageResult(data, mime, ow, oh, ow, oh, ""), nil
+		}
+		return ToolResult{Content: Text("[Image omitted: dimensions exceed the WebP encoding limit.]"), IsError: true}, nil
+	}
+	var encoded bytes.Buffer
+	if err := webp.Encode(&encoded, pixels, webp.EncodeOptions{Quality: options.Quality, Method: 4}); err != nil {
+		return ToolResult{}, err
+	}
+	// Compression alone must not replace a smaller portable original.
+	if canKeepOriginal && encoded.Len() >= len(data) {
+		return imageResult(data, mime, ow, oh, ow, oh, ""), nil
+	}
+	if !options.DisableResize && base64.StdEncoding.EncodedLen(encoded.Len()) > options.MaxBytes {
+		return ToolResult{Content: Text("[Image omitted: encoded image exceeds the configured inline size limit.]"), IsError: true}, nil
+	}
+	return imageResult(encoded.Bytes(), "image/webp", ow, oh, w, h, mime), nil
+}
+
+// Keep Core's existing WebP decoder even when the encoding dependency registers
+// its own decoder with image.Decode. No global registry is changed here.
+func decodeImageConfig(data []byte, mime string) (image.Config, error) {
+	if mime == "image/webp" {
+		return xwebp.DecodeConfig(bytes.NewReader(data))
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	return config, err
+}
+
+func decodeImagePixels(data []byte, mime string) (image.Image, error) {
+	if mime == "image/webp" {
+		return xwebp.Decode(bytes.NewReader(data))
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	return decoded, err
 }
 
 func imageResult(data []byte, mime string, ow, oh, w, h int, from string) ToolResult {
