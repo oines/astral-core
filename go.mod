@@ -1,10 +1,11 @@
 module github.com/oines/astral-core
 
-go 1.25.7
+go 1.26.4
 
 require (
 	github.com/MoeForge/moego v0.1.0-alpha.1.0.20261104092832-8aa874cd38e3
 	github.com/creack/pty v1.1.24
+	github.com/gen2brain/vpx v0.2.1
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2

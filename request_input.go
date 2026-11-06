@@ -74,9 +74,11 @@ func freezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 	return input, nil
 }
 
+const requestLiteralLimit = 4096
+
 func selectRequestMessages(base, actual []Message) []int {
 	var byDigest map[string]int
-	parts := make([]map[string]int, len(base))
+	var parts []map[string]int
 	out := make([]int, len(actual))
 	for i, message := range actual {
 		if i < len(base) && sameRequestMessage(base[i], message) {
@@ -91,7 +93,27 @@ func selectRequestMessages(base, actual []Message) []int {
 			continue
 		}
 		if byDigest == nil {
+			// Only a bounded small tail can be cheaper to record literally.
+			// Count it once, before building the history index; treating each
+			// shifted small message separately would duplicate an entire history.
+			literal := true
+			for _, tail := range actual[i:] {
+				if !retainsLargeRequestFields(Message{}, tail) {
+					literal = false
+					break
+				}
+			}
+			if literal {
+				size, err := typedRequestSize(Request{Messages: actual[i:]})
+				if err == nil && size < requestLiteralLimit {
+					for j := i; j < len(out); j++ {
+						out[j] = -1
+					}
+					return out
+				}
+			}
 			byDigest = make(map[string]int, len(base))
+			parts = make([]map[string]int, len(base))
 			for j, old := range base {
 				byDigest[canonicalDigest(old)] = j
 			}
@@ -136,7 +158,7 @@ func selectRequestMessages(base, actual []Message) []int {
 }
 
 func retainsLargeRequestFields(before, after Message) bool {
-	const large = 4096
+	const large = requestLiteralLimit
 	if len(after.Metadata) >= large && !bytes.Equal(before.Metadata, after.Metadata) ||
 		len(after.ErrorMessage) >= large && before.ErrorMessage != after.ErrorMessage {
 		return false
@@ -177,7 +199,7 @@ func retainsLargeRequestFields(before, after Message) bool {
 }
 
 func largeRequestContent(part Content) bool {
-	const large = 4096
+	const large = requestLiteralLimit
 	return len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
 		part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)
 }

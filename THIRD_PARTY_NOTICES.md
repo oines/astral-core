@@ -21,3 +21,9 @@ Image Base64 validation and JSON-string validation use
 Its license is provided with the Go module and included in Astral's generated
 distribution notices. Non-SIMD Base64 validation and non-string JSON retain
 the standard-library compatibility path.
+
+Image encoding uses [gen2brain/vpx v0.2.1](https://github.com/gen2brain/vpx/tree/v0.2.1),
+an independent Go/SIMD WebP implementation. Its BSD-3-Clause and webpkit MIT
+license files are retained in the dependency module as `COPYING` and
+`COPYING.webpkit` and must accompany binary distributions. Core does not copy
+or modify the codec's source or install a native shared library.
