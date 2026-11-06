@@ -74,9 +74,11 @@ func freezeRequest(rolloutID string, base Context, request Request, spec ModelSp
 	return input, nil
 }
 
+const requestLiteralLimit = 4096
+
 func selectRequestMessages(base, actual []Message) []int {
 	var byDigest map[string]int
-	parts := make([]map[string]int, len(base))
+	var parts []map[string]int
 	out := make([]int, len(actual))
 	for i, message := range actual {
 		if i < len(base) && sameRequestMessage(base[i], message) {
@@ -90,8 +92,19 @@ func selectRequestMessages(base, actual []Message) []int {
 			out[i] = i
 			continue
 		}
+		// A small literal costs less than searching the whole history for a
+		// source. Reject large leaves before counting this message's encoded
+		// size; the single-message request envelope makes the bound conservative.
+		if retainsLargeRequestFields(Message{}, message) {
+			size, err := typedRequestSize(Request{Messages: []Message{message}})
+			if err == nil && size < requestLiteralLimit {
+				out[i] = -1
+				continue
+			}
+		}
 		if byDigest == nil {
 			byDigest = make(map[string]int, len(base))
+			parts = make([]map[string]int, len(base))
 			for j, old := range base {
 				byDigest[canonicalDigest(old)] = j
 			}
@@ -136,7 +149,7 @@ func selectRequestMessages(base, actual []Message) []int {
 }
 
 func retainsLargeRequestFields(before, after Message) bool {
-	const large = 4096
+	const large = requestLiteralLimit
 	if len(after.Metadata) >= large && !bytes.Equal(before.Metadata, after.Metadata) ||
 		len(after.ErrorMessage) >= large && before.ErrorMessage != after.ErrorMessage {
 		return false
@@ -177,7 +190,7 @@ func retainsLargeRequestFields(before, after Message) bool {
 }
 
 func largeRequestContent(part Content) bool {
-	const large = 4096
+	const large = requestLiteralLimit
 	return len(part.Text) >= large || len(part.URL) >= large || len(part.Data) >= large || len(part.Metadata) >= large ||
 		part.ToolCall != nil && (len(part.ToolCall.Arguments) >= large || len(part.ToolCall.Metadata) >= large)
 }
