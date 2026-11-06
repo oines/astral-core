@@ -138,7 +138,7 @@ func TestReadImageAttachmentAndResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := h.run(t, "read", map[string]any{"path": "image.png"})
-	if len(r.Content) != 2 || r.Content[1].Type != "image" || r.Content[1].MediaType != "image/png" || !strings.Contains(r.Content[0].Text, "displayed at 64x32") {
+	if len(r.Content) != 2 || r.Content[1].Type != "image" || r.Content[1].MediaType != "image/webp" || !strings.Contains(r.Content[0].Text, "displayed at 64x32") {
 		t.Fatalf("image result: %+v", r.Content)
 	}
 	var encoded string
@@ -149,8 +149,8 @@ func TestReadImageAttachmentAndResize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil || config.Width != 64 || config.Height != 32 {
+	config, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || format != "webp" || config.Width != 64 || config.Height != 32 {
 		t.Fatalf("resized image: %+v %v", config, err)
 	}
 }

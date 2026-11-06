@@ -9,19 +9,23 @@ import (
 	"fmt"
 	"image"
 	_ "image/gif"
-	"image/jpeg"
-	"image/png"
+	_ "image/jpeg"
+	_ "image/png"
 	"math"
 	"net/http"
+
+	"github.com/oines/astral-core/internal/webp"
 
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
-// ImageOptions bounds inline images. MaxBytes counts the base64 payload, like
-// Pi's default 4.5 MiB limit. MaxPixels bounds decoding memory before allocation.
-// Provider-specific limits can be supplied by the host; Core is provider-neutral.
+// ImageOptions bounds inline images. MaxBytes counts the base64 payload and
+// defaults to 150,000 bytes. Quality defaults to 75 for WebP reencoding.
+// Zero width, height and patch limits preserve resolution unless the byte budget
+// or output format requires resizing. MaxPixels bounds decoding before allocation.
+// Hosts can supply provider-specific limits; Core is provider-neutral.
 type ImageOptions struct {
 	DisableResize bool
 	MaxWidth      int
@@ -29,25 +33,20 @@ type ImageOptions struct {
 	MaxBytes      int
 	MaxPixels     int64
 	MaxPatches    int
+	Quality       int
 }
 
 func (o *ImageOptions) defaults() error {
-	if o.MaxWidth == 0 {
-		o.MaxWidth = 2048
-	}
-	if o.MaxHeight == 0 {
-		o.MaxHeight = 2048
-	}
 	if o.MaxBytes == 0 {
-		o.MaxBytes = 9 * 1024 * 1024 / 2
+		o.MaxBytes = 150_000
 	}
-	if o.MaxPatches == 0 {
-		o.MaxPatches = 2500
+	if o.Quality == 0 {
+		o.Quality = 75
 	}
 	if o.MaxPixels == 0 {
 		o.MaxPixels = 40_000_000
 	}
-	if o.MaxWidth < 1 || o.MaxHeight < 1 || o.MaxBytes < 128 || o.MaxPixels < 1 || o.MaxPatches < 1 {
+	if o.MaxWidth < 0 || o.MaxHeight < 0 || o.MaxBytes < 128 || o.MaxPixels < 1 || o.MaxPatches < 0 || o.Quality < 1 || o.Quality > 100 {
 		return fmt.Errorf("invalid image limits")
 	}
 	return nil
@@ -76,6 +75,9 @@ func ProcessImage(ctx context.Context, data []byte, options ImageOptions) (ToolR
 func (o ImageOptions) Validate() error { return o.defaults() }
 
 func readImage(ctx context.Context, data []byte, mime string, options ImageOptions) (ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ToolResult{}, err
+	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return ToolResult{Content: Text("Read image file [" + mime + "]\n[Image omitted: could not decode image.]"), IsError: true}, nil
@@ -88,7 +90,10 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 	if orientation >= 5 && orientation <= 8 {
 		ow, oh = oh, ow
 	}
-	if orientation == 1 && mime != "image/bmp" && (options.DisableResize || ow <= options.MaxWidth && oh <= options.MaxHeight && imagePatches(ow, oh) <= options.MaxPatches && base64.StdEncoding.EncodedLen(len(data)) <= options.MaxBytes) {
+	fitsDimensions := (options.MaxWidth == 0 || ow <= options.MaxWidth) &&
+		(options.MaxHeight == 0 || oh <= options.MaxHeight) &&
+		(options.MaxPatches == 0 || imagePatches(ow, oh) <= options.MaxPatches)
+	if orientation == 1 && mime != "image/bmp" && (options.DisableResize || fitsDimensions && base64.StdEncoding.EncodedLen(len(data)) <= options.MaxBytes) {
 		return imageResult(data, mime, ow, oh, ow, oh, ""), nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -101,10 +106,20 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 	decoded = orientImage(decoded, orientation)
 	w, h := ow, oh
 	if !options.DisableResize {
-		scale := math.Min(1, math.Min(float64(options.MaxWidth)/float64(w), float64(options.MaxHeight)/float64(h)))
-		scale = math.Min(scale, math.Sqrt(float64(options.MaxPatches*32*32)/float64(w*h)))
+		// WebP's bitstream limit applies only when reencoding. Already fitting
+		// originals above this dimension remain byte-for-byte unchanged.
+		scale := math.Min(1, math.Min(float64(webp.MaxDimension)/float64(w), float64(webp.MaxDimension)/float64(h)))
+		if options.MaxWidth > 0 {
+			scale = math.Min(scale, float64(options.MaxWidth)/float64(w))
+		}
+		if options.MaxHeight > 0 {
+			scale = math.Min(scale, float64(options.MaxHeight)/float64(h))
+		}
+		if options.MaxPatches > 0 {
+			scale = math.Min(scale, math.Sqrt(float64(options.MaxPatches)*32*32/float64(w*h)))
+		}
 		w, h = max(1, int(math.Floor(float64(w)*scale))), max(1, int(math.Floor(float64(h)*scale)))
-		for imagePatches(w, h) > options.MaxPatches {
+		for options.MaxPatches > 0 && imagePatches(w, h) > options.MaxPatches {
 			scale *= 0.99
 			w, h = max(1, int(float64(ow)*scale)), max(1, int(float64(oh)*scale))
 		}
@@ -113,26 +128,20 @@ func readImage(ctx context.Context, data []byte, mime string, options ImageOptio
 		if err := ctx.Err(); err != nil {
 			return ToolResult{}, err
 		}
-		canvas := image.NewNRGBA(image.Rect(0, 0, w, h))
-		draw.CatmullRom.Scale(canvas, canvas.Bounds(), decoded, decoded.Bounds(), draw.Src, nil)
+		// Avoid a full-size resampling pass when only encoding changes. The
+		// codec converts pixel layout as needed without rescaling the image.
+		pixels := decoded
+		if w != ow || h != oh {
+			canvas := image.NewNRGBA(image.Rect(0, 0, w, h))
+			draw.CatmullRom.Scale(canvas, canvas.Bounds(), decoded, decoded.Bounds(), draw.Src, nil)
+			pixels = canvas
+		}
 		var encoded bytes.Buffer
-		if err := png.Encode(&encoded, canvas); err != nil {
+		if err := webp.Encode(&encoded, pixels, options.Quality); err != nil {
 			return ToolResult{}, err
 		}
-		if options.DisableResize || base64.StdEncoding.EncodedLen(encoded.Len()) < options.MaxBytes {
-			return imageResult(encoded.Bytes(), "image/png", ow, oh, w, h, mime), nil
-		}
-		for _, quality := range []int{85, 80, 70, 55, 40} {
-			if !canvas.Opaque() {
-				break
-			}
-			encoded.Reset()
-			if err := jpeg.Encode(&encoded, canvas, &jpeg.Options{Quality: quality}); err != nil {
-				return ToolResult{}, err
-			}
-			if base64.StdEncoding.EncodedLen(encoded.Len()) < options.MaxBytes {
-				return imageResult(encoded.Bytes(), "image/jpeg", ow, oh, w, h, mime), nil
-			}
+		if options.DisableResize || base64.StdEncoding.EncodedLen(encoded.Len()) <= options.MaxBytes {
+			return imageResult(encoded.Bytes(), "image/webp", ow, oh, w, h, mime), nil
 		}
 		if w == 1 && h == 1 {
 			break

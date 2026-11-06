@@ -85,7 +85,11 @@ config.Tools = set.Tools()
 
 `read` 默认从第 1 行开始，未指定 `limit` 时读取至结尾，再应用 2000 行 / 50 KiB 上限。它不把超长第一行切成不完整代码，而是说明该行超过限制。带分页或截断的结果包含后续 offset；超出文件末尾的 offset 报错。
 
-图片按文件内容识别 PNG、JPEG、GIF、WebP、BMP。默认最大边长 2048×2048，并受最多 2500 个 32×32 patch 约束，base64 内容最多 4.5 MiB，解码上限 4000 万像素；宿主可用 `Options.Images` 调整。Pi 的无模型配置默认边长为 2000×2000，也可从当前模型读取缩放限制；SDK 使用宿主传入的固定选项。BMP 转为 PNG；需要压缩时可能转为 JPEG，动画图片缩放时只保留解码帧。JPEG 缩放前处理 EXIF 朝向。模型 Content 包含文本提示和 `image` 内容，`Data` 是 base64 字符串的 JSON 值；Model 适配器负责映射至 Provider 协议。`DisableResize` 保留图片原尺寸和编码大小，但仍检查解码像素上限。
+图片按文件内容识别 PNG、JPEG、GIF、WebP、BMP，并使用 Core 的统一图片管线。默认优先保持原尺寸，base64 内容最多 150,000 字节，重新编码的 WebP 质量为 75，解码上限为 4000 万像素。`MaxWidth`、`MaxHeight`、`MaxPatches` 默认为 0，不施加对应限制；宿主可用 `Options.Images` 显式设置这些限制，或覆盖 `Quality`、`MaxBytes` 和 `MaxPixels`。
+
+满足限制且无需转换的原图保留原字节。需要压缩时先按原尺寸编码为 WebP，仅在仍超过字节预算时缩小尺寸；显式尺寸或 patch 限制，以及 WebP 重新编码的单边 16383 像素上限也会约束输出尺寸。BMP 转为 WebP；JPEG 在重新编码前应用 EXIF 朝向，透明通道保留，动画图片重新编码时只保留解码帧。`DisableResize` 跳过自动尺寸、patch 和字节预算压缩，但仍检查解码像素上限；必要的格式转换和 EXIF 处理仍会执行，重新编码仍受 WebP 格式限制。
+
+模型 Content 包含文本提示和 `image` 内容，`Data` 是 base64 字符串的 JSON 值；Model 适配器负责映射至 Provider 协议。图片在准入时处理一次，后续请求复用已有图片字节。
 
 `edit` 先验证整组修改，再调用一次 `WriteFile`。所有 `oldText` 都针对原文件，不能依赖同批前一条修改的结果。缺失、歧义、重叠、空 oldText 或整体没有变化都会报错。先精确匹配，再按 Pi 规则处理 NFKC、行末空白、智能引号、横线和特殊空格。模糊匹配只改变涉及的行，其他行保留原字节；BOM 和原始 CRLF 格式恢复后写入。
 
