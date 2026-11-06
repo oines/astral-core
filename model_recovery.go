@@ -27,7 +27,7 @@ func RecoverModelRequest(ctx context.Context, model Model, request Request, caus
 	if !ok {
 		return Request{}, false, nil
 	}
-	owned, err := copyJSON(request)
+	owned, err := CopyRequest(request)
 	if err != nil {
 		return Request{}, false, err
 	}
@@ -48,6 +48,6 @@ func RecoverModelRequest(ctx context.Context, model Model, request Request, caus
 			return Request{}, false, err
 		}
 	}
-	out, err = copyJSON(out)
+	out, err = CopyRequest(out)
 	return out, err == nil, err
 }
