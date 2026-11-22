@@ -42,7 +42,6 @@ type Session struct {
 	changed            chan struct{}
 	events             eventHub
 	attempt            *AttemptStatus
-	effortUsage        *effortUsageEvidence
 }
 
 // NewSession creates only a new-format session. All inputs use the same durable

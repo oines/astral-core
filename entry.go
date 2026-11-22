@@ -120,8 +120,8 @@ type RunRecord struct {
 }
 
 // GenerationRecord links a committed assistant to the exact successful attempt.
-// ContextDigest fingerprints its frozen request plus reply, excluding only the
-// output limit. It is a validity check, not a second usage ledger.
+// ContextDigest fingerprints the input-affecting fields of its frozen request
+// plus the reply, for reusing provider-reported usage in later budgets.
 type GenerationRecord struct {
 	AttemptID       string    `json:"attempt_id"`
 	ConfigurationID string    `json:"configuration_id"`

@@ -50,11 +50,11 @@ func TestPreparedRequestFactsPreserveSizeAndLegacyProvenance(t *testing.T) {
 				t.Fatal("facts did not preserve the uncommon UTF-8 normalization fallback")
 			}
 			for _, reply := range replies {
-				want := legacyGenerationContextDigest(request, reply)
+				want := referenceGenerationContextDigest(request, reply)
 				for repeat := 0; repeat < 2; repeat++ {
 					got := generationProvenanceWithFacts(ModelAttempt{}, request, reply, facts).ContextDigest
 					if got != want {
-						t.Fatalf("provenance facts changed the original digest: want=%s got=%s", want, got)
+						t.Fatalf("provenance facts differ from the reference usage digest: want=%s got=%s", want, got)
 					}
 				}
 			}
@@ -85,13 +85,13 @@ func TestPreparedRequestFactsRejectChangedInputs(t *testing.T) {
 		if _, valid := facts.contextDigestReply(changed, reply); valid {
 			t.Fatal("provenance reused facts for a changed request")
 		}
-		if got, want := generationProvenanceWithFacts(ModelAttempt{}, changed, reply, facts).ContextDigest, legacyGenerationContextDigest(changed, reply); got != want {
+		if got, want := generationProvenanceWithFacts(ModelAttempt{}, changed, reply, facts).ContextDigest, referenceGenerationContextDigest(changed, reply); got != want {
 			t.Fatalf("changed request fallback changed digest: want=%s got=%s", want, got)
 		}
 	}
 	changed := request
 	changed.MaxOutputTokens++
-	if got, valid := facts.contextDigestReply(changed, reply); !valid || got != legacyGenerationContextDigest(changed, reply) {
+	if got, valid := facts.contextDigestReply(changed, reply); !valid || got != referenceGenerationContextDigest(changed, reply) {
 		t.Fatal("output reservation affected provenance's fixed-zero digest")
 	}
 	nilMessages, err := measurePreparedRequest(Request{})
@@ -114,13 +114,18 @@ func TestPreparedRequestFactsDiscardInvalidSHAState(t *testing.T) {
 	}
 	facts.contextPrefix = []byte("invalid SHA state")
 	reply := User("reply")
-	if got, want := generationProvenanceWithFacts(ModelAttempt{}, request, reply, facts).ContextDigest, legacyGenerationContextDigest(request, reply); got != want {
-		t.Fatalf("invalid state did not fall back to original digest: want=%s got=%s", want, got)
+	if got, want := generationProvenanceWithFacts(ModelAttempt{}, request, reply, facts).ContextDigest, referenceGenerationContextDigest(request, reply); got != want {
+		t.Fatalf("invalid state did not fall back to the reference usage digest: want=%s got=%s", want, got)
 	}
 }
 
-func legacyTypedContextDigest(request Request) string {
+func referenceUsageDigest(request Request) string {
 	request.MaxOutputTokens = 0
+	request.Options = GenerationOptions{
+		ToolChoice:      request.Options.ToolChoice,
+		ResponseFormat:  request.Options.ResponseFormat,
+		ProviderOptions: request.Options.ProviderOptions,
+	}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		return ""
@@ -129,17 +134,17 @@ func legacyTypedContextDigest(request Request) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func legacyReportedContextTokens(view Context) (int, bool, error) {
+func referenceReportedContextTokens(view Context, spec ModelSpec) (int, bool, error) {
 	a := view.anchor
 	if a == nil || !a.usage.Available || a.usage.InputMissing || a.usage.OutputMissing ||
 		a.index < 0 || a.index >= len(view.Request.Messages) || a.generation.ContextDigest == "" ||
-		a.generation.ConfigurationID != view.ConfigurationID || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
+		a.generation.Model != spec || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
 		(a.usage.InputTokens == 0 && a.usage.OutputTokens == 0) {
 		return 0, false, nil
 	}
 	covered := view.Request
 	covered.Messages = covered.Messages[:a.index+1]
-	if legacyTypedContextDigest(covered) != a.generation.ContextDigest {
+	if referenceUsageDigest(covered) != a.generation.ContextDigest {
 		return 0, false, nil
 	}
 	total := a.usage.InputTokens
@@ -159,8 +164,8 @@ func TestRequestFactsCaptureExactUsagePrefixes(t *testing.T) {
 		}
 		covered := request
 		covered.Messages = covered.Messages[:index+1]
-		if facts.usageIndex != index || facts.usageDigest != legacyTypedContextDigest(covered) {
-			t.Fatalf("usage prefix %d differs from original typed JSON digest", index)
+		if facts.usageIndex != index || facts.usageDigest != referenceUsageDigest(covered) {
+			t.Fatalf("usage prefix %d differs from reference typed JSON digest", index)
 		}
 		for _, output := range []int{0, 1, 9, 10, 99, 100, 999, 1000, 12800, -1, -1000} {
 			actual := request
@@ -173,32 +178,34 @@ func TestRequestFactsCaptureExactUsagePrefixes(t *testing.T) {
 	}
 }
 
-func TestReportedUsageFactsKeepOriginalConditionsAndInvalidation(t *testing.T) {
+func TestReportedUsageFactsRequireMatchingModelAndPreparedInput(t *testing.T) {
 	request := Request{ModelID: "model", SystemPrompt: "instructions", Messages: []Message{User("first"), {Role: RoleAssistant, Content: Text("reply")}, User("tail")}, MaxOutputTokens: 12800}
 	covered := request
 	covered.Messages = covered.Messages[:1]
-	base := Context{ConfigurationID: "configuration", Request: request, anchor: &contextUsageAnchor{index: 0, usage: Usage{Available: true, InputTokens: 100, OutputTokens: 20}, generation: GenerationRecord{ConfigurationID: "configuration", ContextDigest: legacyTypedContextDigest(covered)}}}
+	spec := ModelSpec{ID: "model", ContextWindow: 1000000, MaxOutputTokens: 12800}
+	base := Context{ConfigurationID: "configuration", Request: request, anchor: &contextUsageAnchor{index: 0, usage: Usage{Available: true, InputTokens: 100, OutputTokens: 20}, generation: GenerationRecord{ConfigurationID: "configuration", Model: spec, ContextDigest: referenceUsageDigest(covered)}}}
 	facts, err := measureRequestFacts(request, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for name, change := range map[string]func(*Context){
-		"unchanged":           func(*Context) {},
-		"missing-anchor":      func(v *Context) { v.anchor = nil },
-		"unavailable":         func(v *Context) { v.anchor.usage.Available = false },
-		"input-missing":       func(v *Context) { v.anchor.usage.InputMissing = true },
-		"output-missing":      func(v *Context) { v.anchor.usage.OutputMissing = true },
-		"negative-index":      func(v *Context) { v.anchor.index = -1 },
-		"out-of-range":        func(v *Context) { v.anchor.index = len(v.Request.Messages) },
-		"empty-digest":        func(v *Context) { v.anchor.generation.ContextDigest = "" },
-		"wrong-digest":        func(v *Context) { v.anchor.generation.ContextDigest = "wrong" },
-		"wrong-configuration": func(v *Context) { v.ConfigurationID = "changed" },
-		"negative-input":      func(v *Context) { v.anchor.usage.InputTokens = -1 },
-		"negative-output":     func(v *Context) { v.anchor.usage.OutputTokens = -1 },
-		"zero-usage":          func(v *Context) { v.anchor.usage.InputTokens, v.anchor.usage.OutputTokens = 0, 0 },
-		"overflow":            func(v *Context) { v.anchor.usage.InputTokens = int(^uint(0) >> 1) },
-		"changed-output":      func(v *Context) { v.Request.MaxOutputTokens = 9 },
-		"changed-header":      func(v *Context) { v.Request.SystemPrompt += " changed" },
+		"unchanged":             func(*Context) {},
+		"missing-anchor":        func(v *Context) { v.anchor = nil },
+		"unavailable":           func(v *Context) { v.anchor.usage.Available = false },
+		"input-missing":         func(v *Context) { v.anchor.usage.InputMissing = true },
+		"output-missing":        func(v *Context) { v.anchor.usage.OutputMissing = true },
+		"negative-index":        func(v *Context) { v.anchor.index = -1 },
+		"out-of-range":          func(v *Context) { v.anchor.index = len(v.Request.Messages) },
+		"empty-digest":          func(v *Context) { v.anchor.generation.ContextDigest = "" },
+		"wrong-digest":          func(v *Context) { v.anchor.generation.ContextDigest = "wrong" },
+		"changed-model-spec":    func(v *Context) { v.anchor.generation.Model.MaxInputTokens++ },
+		"changed-configuration": func(v *Context) { v.ConfigurationID = "changed" },
+		"negative-input":        func(v *Context) { v.anchor.usage.InputTokens = -1 },
+		"negative-output":       func(v *Context) { v.anchor.usage.OutputTokens = -1 },
+		"zero-usage":            func(v *Context) { v.anchor.usage.InputTokens, v.anchor.usage.OutputTokens = 0, 0 },
+		"overflow":              func(v *Context) { v.anchor.usage.InputTokens = int(^uint(0) >> 1) },
+		"changed-output":        func(v *Context) { v.Request.MaxOutputTokens = 9 },
+		"changed-header":        func(v *Context) { v.Request.SystemPrompt += " changed" },
 		"changed-covered-message": func(v *Context) {
 			v.Request = cloneRequest(v.Request)
 			v.Request.Messages[0].Content[0].Text += " changed"
@@ -211,7 +218,7 @@ func TestReportedUsageFactsKeepOriginalConditionsAndInvalidation(t *testing.T) {
 			v.anchor.index = 1
 			prefix := v.Request
 			prefix.Messages = prefix.Messages[:2]
-			v.anchor.generation.ContextDigest = legacyTypedContextDigest(prefix)
+			v.anchor.generation.ContextDigest = referenceUsageDigest(prefix)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -219,13 +226,30 @@ func TestReportedUsageFactsKeepOriginalConditionsAndInvalidation(t *testing.T) {
 			anchor := *base.anchor
 			view.anchor = &anchor
 			change(&view)
-			wantCount, wantValid, wantErr := legacyReportedContextTokens(view)
+			wantCount, wantValid, wantErr := referenceReportedContextTokens(view, spec)
 			view.facts = facts
-			gotCount, gotValid, gotErr := reportedContextTokens(view)
+			gotCount, gotValid, gotErr := reportedContextTokens(view, spec)
 			if gotCount != wantCount || gotValid != wantValid || (gotErr == nil) != (wantErr == nil) || gotErr != nil && gotErr.Error() != wantErr.Error() {
 				t.Fatalf("facts changed reported usage: old=%d/%v/%v new=%d/%v/%v", wantCount, wantValid, wantErr, gotCount, gotValid, gotErr)
 			}
 		})
+	}
+}
+
+func TestLegacyUsageDigestFallsBackToEstimator(t *testing.T) {
+	spec := ModelSpec{ID: "model", ContextWindow: 10000, MaxOutputTokens: 100}
+	req := Request{ModelID: spec.ID, Messages: []Message{User("question"), {Role: RoleAssistant, Content: Text("answer")}}, Options: GenerationOptions{Reasoning: ReasoningOptions{Effort: "high"}}}
+	// Pre-upgrade digests zeroed only MaxOutputTokens.
+	legacy, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := Context{Request: req, anchor: &contextUsageAnchor{index: 1, usage: Usage{Available: true, InputTokens: 900, OutputTokens: 50}, generation: GenerationRecord{Model: spec, ContextDigest: testContextDigestBytes(legacy)}}}
+	view.Request.Options.Reasoning.Effort = "low"
+	model := estimatedModel{Model: ModelFunc{Specification: spec}, estimate: func(context.Context, Model, Request) (int, error) { return 17, nil }}
+	n, err := new(Session).estimateContext(context.Background(), model, view)
+	if err != nil || n != 17 {
+		t.Fatalf("legacy digest did not fall back to full estimate: %d, %v", n, err)
 	}
 }
 
@@ -239,7 +263,7 @@ func TestFitContextReusesUsageFactsWithFinalOutputDigits(t *testing.T) {
 	for _, output := range []int{1, 9, 10, 99, 100, 999, 1000, 12799} {
 		t.Run(strconv.Itoa(output), func(t *testing.T) {
 			request := Request{ModelID: "model", ModelRevision: "revision", SystemPrompt: "instructions", Messages: []Message{User("question"), {Role: RoleAssistant, Content: Text("answer")}}}
-			view := Context{ConfigurationID: "configuration", Request: request, anchor: &contextUsageAnchor{index: len(request.Messages) - 1, usage: Usage{Available: true, InputTokens: window - 1 - output}, generation: GenerationRecord{ConfigurationID: "configuration", ContextDigest: legacyTypedContextDigest(request)}}}
+			view := Context{ConfigurationID: "configuration", Request: request, anchor: &contextUsageAnchor{index: len(request.Messages) - 1, usage: Usage{Available: true, InputTokens: window - 1 - output}, generation: GenerationRecord{ConfigurationID: "configuration", Model: model.Spec(), ContextDigest: referenceUsageDigest(request)}}}
 			actual := request
 			actual.MaxOutputTokens = output
 			raw, err := json.Marshal(actual)

@@ -113,7 +113,7 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 	source.Request.Messages = selected
 	source.Sources = selectedSources
 	source.anchor = nil
-	if normalModel.Spec() == summaryModel.Spec() && sameJSON(normalModel.(estimatedModel).snapshot, summaryModel.(estimatedModel).snapshot) {
+	if normalModel.Spec() == summaryModel.Spec() {
 		source.anchor = contextUsageAnchorFor(path, selectedSources)
 		if source.anchor != nil {
 			source.Request.ModelID, source.Request.ModelRevision = normalModel.Spec().ID, normalModel.Spec().Revision
@@ -128,8 +128,13 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 			}
 		}
 	}
-	if err := s.prepareUsageFacts(ctx, normalModel, &source); err != nil {
-		return CompactionRecord{}, err
+	if hasReportedContextUsage(source, normalModel.Spec()) {
+		// Source is fixed throughout the candidate search. Retain this exact
+		// usage-prefix digest instead of re-reading its payload for every cap.
+		source.facts, err = measureRequestFacts(source.Request, source.anchor.index)
+		if err != nil {
+			return CompactionRecord{}, err
+		}
 	}
 	summaryModelID := summaryModel.Spec().ID
 	output := s.config.Compaction.OutputTokens

@@ -163,17 +163,21 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 	if err != nil {
 		return preparedStep{}, summary, err
 	}
-	incomingMessages := clone(candidate.Request.Messages[len(old.Request.Messages):])
-	candidate, budgetErr := s.fitContext(ctx, model, candidate, options.generation)
-	if budgetErr != nil && !errors.Is(budgetErr, ErrBudget) && !options.compact {
-		return preparedStep{}, summary, budgetErr
-	}
 	budget := s.compactionBudget(model)
-	near := candidate.EstimatedInput > model.Spec().ContextWindow-budget.ReserveTokens
-	needsCompact := options.compact || !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
-	if needsCompact {
-		keepTokens := budget.KeepRecentTokens
-		if !options.compact {
+	keepTokens := budget.KeepRecentTokens
+	needsCompact := options.compact
+	var budgetErr error
+	// A forced compaction discards this candidate. Only automatic compaction
+	// needs its budget to decide whether to summarize and how much to retain.
+	if !options.compact {
+		incomingMessages := clone(candidate.Request.Messages[len(old.Request.Messages):])
+		candidate, budgetErr = s.fitContext(ctx, model, candidate, options.generation)
+		if budgetErr != nil && !errors.Is(budgetErr, ErrBudget) {
+			return preparedStep{}, summary, budgetErr
+		}
+		near := candidate.EstimatedInput > model.Spec().ContextWindow-budget.ReserveTokens
+		needsCompact = !s.config.Compaction.Disabled && (errors.Is(budgetErr, ErrBudget) || near)
+		if needsCompact {
 			incoming := old
 			incoming.anchor = nil
 			incoming.Request.Messages = incomingMessages
@@ -187,6 +191,8 @@ func (s *Session) prepareCandidate(ctx context.Context, options prepareOptions) 
 			}
 			keepTokens = min(keepTokens, max(1, (limit-incoming.EstimatedInput)/2))
 		}
+	}
+	if needsCompact {
 		summary, err = s.draftCompaction(ctx, options.instructions, model, path, keepTokens, options.overflow, options.runID, options.turnID)
 		if err != nil {
 			if options.compact || budgetErr != nil || !errors.Is(err, ErrCompactionNoProgress) {
@@ -303,8 +309,13 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 	if err = validatePreparedProtocol(request.Messages); err != nil {
 		return view, err
 	}
-	if err := s.prepareUsageFacts(ctx, model, &view); err != nil {
-		return view, err
+	if hasReportedContextUsage(view, model.Spec()) {
+		// Count this prepared body and capture both SHA prefixes in one pass.
+		// Final output digits are corrected only after the token estimate below.
+		view.facts, err = measureRequestFacts(request, view.anchor.index)
+		if err != nil {
+			return view, err
+		}
 	}
 	view.EstimatedInput, err = s.estimateContext(ctx, model, view)
 	if err != nil {

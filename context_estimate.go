@@ -9,17 +9,26 @@ import (
 )
 
 type contextUsageAnchor struct {
-	index          int
-	usage          Usage
-	generation     GenerationRecord
-	owner          string
-	previousEffort string // checked only for a cross-configuration usage estimate
+	index      int
+	usage      Usage
+	generation GenerationRecord
 }
 
 func cloneContext(view Context) Context {
 	owned := clone(view)
 	owned.anchor = view.anchor
 	return owned
+}
+
+// The usage fingerprint describes model-visible input. Decoding controls and
+// the output reservation configure generation after that input.
+func usageDigestRequest(request Request) Request {
+	request.MaxOutputTokens = 0
+	request.Options.Reasoning = ReasoningOptions{}
+	request.Options.Temperature, request.Options.TopP = nil, nil
+	request.Options.Stop, request.Options.Seed = nil, nil
+	request.Options.FrequencyPenalty, request.Options.PresencePenalty = nil, nil
+	return request
 }
 
 func contextDigest(request Request) string {
@@ -29,7 +38,7 @@ func contextDigest(request Request) string {
 // Match the existing typed Request JSON exactly, while encoding one message at
 // a time. The history body is never copied into an aggregate JSON buffer.
 func contextDigestReply(request Request, reply *Message) string {
-	request.MaxOutputTokens = 0
+	request = usageDigestRequest(request)
 	hash := sha256.New()
 	if err := writeTypedRequest(hash, request, reply); err != nil {
 		return ""
@@ -77,9 +86,9 @@ func (facts *requestFacts) matches(request Request) bool {
 
 // reportedContextTokens validates the exact ordinary request prefix covered by
 // a usage anchor. Callers must prepare that request before checking its digest.
-func reportedContextTokens(view Context) (int, bool, error) {
+func reportedContextTokens(view Context, spec ModelSpec) (int, bool, error) {
 	a := view.anchor
-	if !hasReportedContextUsage(view) {
+	if !hasReportedContextUsage(view, spec) {
 		return 0, false, nil
 	}
 	digest := ""
@@ -89,9 +98,6 @@ func reportedContextTokens(view Context) (int, bool, error) {
 	if digest == "" {
 		covered := view.Request
 		covered.Messages = covered.Messages[:a.index+1]
-		if a.previousEffort != "" {
-			covered.Options.Reasoning.Effort = a.previousEffort
-		}
 		digest = contextDigest(covered)
 	}
 	if digest != a.generation.ContextDigest {
@@ -105,11 +111,11 @@ func reportedContextTokens(view Context) (int, bool, error) {
 	return total, true, nil
 }
 
-func hasReportedContextUsage(view Context) bool {
+func hasReportedContextUsage(view Context, spec ModelSpec) bool {
 	a := view.anchor
 	if a == nil || !a.usage.Available || a.usage.InputMissing || a.usage.OutputMissing ||
 		a.index < 0 || a.index >= len(view.Request.Messages) || a.generation.ContextDigest == "" ||
-		(a.generation.ConfigurationID != view.ConfigurationID && a.previousEffort == "") || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
+		a.generation.Model != spec || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
 		(a.usage.InputTokens == 0 && a.usage.OutputTokens == 0) {
 		return false
 	}
@@ -119,7 +125,7 @@ func hasReportedContextUsage(view Context) bool {
 // estimateContext uses only the bounded active projection. Provenance survives
 // reopen/fork on its assistant entry; no scan through archived attempts is needed.
 func (s *Session) estimateContext(ctx context.Context, model Model, view Context) (int, error) {
-	total, valid, err := reportedContextTokens(view)
+	total, valid, err := reportedContextTokens(view, model.Spec())
 	if err != nil {
 		return 0, err
 	}
@@ -154,7 +160,7 @@ func (s *Session) estimateContext(ctx context.Context, model Model, view Context
 // instruction. The new summary envelope is counted in full; the old envelope
 // remains in reported usage, so no estimated subtraction can undercount history.
 func estimateCompaction(ctx context.Context, model Model, source Context, request Request) (int, error) {
-	total, valid, err := reportedContextTokens(source)
+	total, valid, err := reportedContextTokens(source, model.Spec())
 	if err != nil {
 		return 0, err
 	}

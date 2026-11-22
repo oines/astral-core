@@ -84,7 +84,7 @@ func TestUsageAnchorSurvivesReopenForkAndPassiveTail(t *testing.T) {
 }
 
 func TestUsageAnchorInvalidatesForConfigurationModelAndCompaction(t *testing.T) {
-	for _, change := range []string{"configuration", "revision", "model", "compaction"} {
+	for _, change := range []string{"configuration", "revision", "context window", "model", "compaction"} {
 		t.Run(change, func(t *testing.T) {
 			ctx := context.Background()
 			m := model(func(_ context.Context, _ int, r core.Request, _ func(core.ModelEvent)) (core.Reply, error) {
@@ -116,6 +116,8 @@ func TestUsageAnchorInvalidatesForConfigurationModelAndCompaction(t *testing.T) 
 				}
 			case "revision":
 				m.spec.Revision = "new-wire-contract"
+			case "context window":
+				m.spec.ContextWindow--
 			case "model":
 				if err := s.SelectModel(ctx, core.ModelSelection{ID: "other"}); err != nil {
 					t.Fatal(err)
@@ -397,5 +399,47 @@ func TestFinalOutputValidationPrecedesInputCommit(t *testing.T) {
 	receipt, err := s.LookupInput(context.Background(), "pending")
 	if err != nil || receipt.State != core.InputPending {
 		t.Fatalf("input consumed before validation: %+v %v", receipt, err)
+	}
+}
+
+func TestDecodingChangesReuseReportedUsageWithFixedModel(t *testing.T) {
+	ctx := context.Background()
+	m := model(func(_ context.Context, _ int, r core.Request, _ func(core.ModelEvent)) (core.Reply, error) {
+		if r.SystemPrompt == "summarize" {
+			return answer("summary"), nil
+		}
+		return opaqueUsageReply(), nil
+	})
+	m.estimator = opaqueContentEstimate
+	c := testConfig(m, memory.New())
+	c.Compaction = core.CompactionPolicy{Disabled: true, SystemPrompt: "summarize", KeepRecentTokens: 1, OutputTokens: 100}
+	c.Selection = core.ModelSelection{ID: m.Spec().ID, Reasoning: &core.ReasoningOptions{Effort: "high"}}
+	s := newSession(t, newSessions(t, c), core.SessionOptions{})
+	waitOK(t, start(t, s, "work"))
+	config := s.Configuration()
+	budget := 1024
+	temp := 0.7
+	config.Selection.Reasoning = &core.ReasoningOptions{BudgetTokens: &budget}
+	config.Selection.Options.Temperature = &temp
+	if err := s.Configure(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newSessions(t, c).OpenSession(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.InspectContext(ctx)
+	if err != nil || view.EstimatedInput != 1075 {
+		t.Fatalf("lost reported usage: %d, %v", view.EstimatedInput, err)
+	}
+	if _, err = inject(s, ctx, []core.Message{snapshotMessage("recent message")}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.Compact(ctx, "")
+	if err != nil || rec.InputTokens < 1075 || rec.InputTokens >= 2000 {
+		t.Fatalf("summary lost reported usage: %d, %v", rec.InputTokens, err)
 	}
 }

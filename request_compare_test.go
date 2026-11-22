@@ -42,7 +42,7 @@ func TestMessageComparisonMatchesJSON(t *testing.T) {
 	}
 }
 
-func TestContextDigestStreamingMatchesLegacy(t *testing.T) {
+func TestContextDigestStreamingMatchesTypedJSON(t *testing.T) {
 	for _, messages := range [][]Message{nil, {}, {User("<>&\u2028")}, {{Role: RoleUser, Content: []Content{{Type: "image", Data: json.RawMessage(` "YWJj" `)}}}}} {
 		request := Request{ModelID: "m", SystemPrompt: `x,"messages":[]`, Messages: messages, MaxOutputTokens: 77}
 		old := request

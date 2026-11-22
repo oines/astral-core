@@ -53,7 +53,7 @@ func TestExecutionDigestRebasesClampedUsageFactsWithoutChangingLegacyBytes(t *te
 				t.Fatalf("execution changed the frozen recipe/digest: old=%v new=%v", oldErr, newErr)
 			}
 			reply := Message{Role: RoleAssistant, Content: Text("next answer")}
-			if generationProvenanceWithFacts(ModelAttempt{}, actual, reply, prepared).ContextDigest != legacyGenerationContextDigest(actual, reply) {
+			if generationProvenanceWithFacts(ModelAttempt{}, actual, reply, prepared).ContextDigest != referenceGenerationContextDigest(actual, reply) {
 				t.Fatal("rebased facts changed the original reply provenance")
 			}
 		})
