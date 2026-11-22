@@ -148,13 +148,17 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 					t.Fatal("cached evidence substituted for the live model's target policy")
 				}
 				compareTargets = true
+				view, err = s.InspectContext(ctx)
+				if err != nil || view.EstimatedInput != 1075 {
+					t.Fatal("restored target policy did not reevaluate the previous rejection", err)
+				}
 				changedTarget = true
 				view, err = s.InspectContext(ctx)
 				if err != nil {
 					t.Fatal(err)
 				}
 				want, _ = opaqueContentEstimate(view.Request)
-				if view.EstimatedInput != want || store.reads.Load() != 2 {
+				if view.EstimatedInput != want || store.reads.Load() != 4 {
 					t.Fatalf("stale effort target evidence survived a different target: %d / %d, reads=%d", view.EstimatedInput, want, store.reads.Load())
 				}
 			}
@@ -189,6 +193,8 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 }
 
 type effortUsageTargetTestModel struct{ effortUsageTestModel }
+
+func (effortUsageTargetTestModel) ReasoningEffortTargetPolicyID() string { return "test/client-version/v1" }
 
 func (effortUsageTargetTestModel) CompatibleReasoningEffortTargets(previous, current json.RawMessage) bool {
 	return string(previous) == `{"target":1}` && string(current) == `{"target":1,"client":"new"}`

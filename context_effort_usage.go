@@ -10,13 +10,13 @@ import (
 
 // A single immutable proof per Session avoids fetching historical attempt
 // recipes and tool schemas on every passive input after an effort change.
-// It never retains request, reply or configuration bodies. Differing targets
-// require the live model's approval on every use, even on a cache hit.
+// It never retains request, reply, target or configuration bodies. The live
+// adapter identifies its target comparison rule before each cache lookup.
 type effortUsageEvidence struct {
 	owner, attemptID, configurationID string
 	effort                            string
 	currentTarget                     [sha256.Size]byte
-	previousTarget                    json.RawMessage
+	targetPolicy                      [sha256.Size]byte
 }
 
 func (s *Session) prepareUsageFacts(ctx context.Context, model Model, view *Context) error {
@@ -41,12 +41,6 @@ func (s *Session) prepareUsageFacts(ctx context.Context, model Model, view *Cont
 		if evidence.effort == "" || !policy.CompatibleReasoningEfforts(evidence.effort, current.Effort) {
 			return nil
 		}
-		if evidence.previousTarget != nil {
-			comparer, ok := bound.Model.(ReasoningEffortUsageTargetModel)
-			if !ok || !comparer.CompatibleReasoningEffortTargets(evidence.previousTarget, bound.snapshot) {
-				return nil
-			}
-		}
 		// A Context may borrow its candidate anchor from the active projection.
 		// The exception applies only to this prepared view, never to its source.
 		candidate := *a
@@ -65,29 +59,33 @@ func (s *Session) prepareUsageFacts(ctx context.Context, model Model, view *Cont
 
 func (s *Session) effortEvidence(ctx context.Context, a *contextUsageAnchor, configurationID string, model estimatedModel) (effortUsageEvidence, error) {
 	target := sha256.Sum256(model.snapshot)
+	comparer, _ := model.Model.(ReasoningEffortUsageTargetModel)
+	var policy [sha256.Size]byte
+	if comparer != nil {
+		if id := comparer.ReasoningEffortTargetPolicyID(); id != "" {
+			policy = sha256.Sum256([]byte(id))
+		} else {
+			comparer = nil
+		}
+	}
 	s.mu.Lock()
 	cached := s.effortUsage
 	s.mu.Unlock()
-	if cached != nil && cached.owner == a.owner && cached.attemptID == a.generation.AttemptID && cached.configurationID == configurationID && cached.currentTarget == target {
+	if cached != nil && cached.owner == a.owner && cached.attemptID == a.generation.AttemptID && cached.configurationID == configurationID && cached.currentTarget == target && cached.targetPolicy == policy {
 		return *cached, nil
 	}
-	proof := effortUsageEvidence{owner: a.owner, attemptID: a.generation.AttemptID, configurationID: configurationID, currentTarget: target}
-	err := s.loadEffortEvidence(ctx, a, &proof, model)
+	proof := effortUsageEvidence{owner: a.owner, attemptID: a.generation.AttemptID, configurationID: configurationID, currentTarget: target, targetPolicy: policy}
+	err := s.loadEffortEvidence(ctx, a, &proof, model, comparer)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return proof, err
 	}
-	// Large custom snapshots remain usable for this check, without keeping
-	// them resident while the Session is idle.
-	if len(proof.previousTarget) <= 4096 {
-		proof.previousTarget = bytes.Clone(proof.previousTarget)
-		s.mu.Lock()
-		s.effortUsage = &proof
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	s.effortUsage = &proof
+	s.mu.Unlock()
 	return proof, nil
 }
 
-func (s *Session) loadEffortEvidence(ctx context.Context, a *contextUsageAnchor, proof *effortUsageEvidence, model estimatedModel) error {
+func (s *Session) loadEffortEvidence(ctx context.Context, a *contextUsageAnchor, proof *effortUsageEvidence, model estimatedModel, comparer ReasoningEffortUsageTargetModel) error {
 	// Detached forks and older imports may have provenance but no operational
 	// attempt. In that case configuration changes retain the full-estimate path.
 	attempt, err := s.config.Store.GetAttempt(ctx, a.owner, a.generation.AttemptID)
@@ -106,8 +104,8 @@ func (s *Session) loadEffortEvidence(ctx context.Context, a *contextUsageAnchor,
 			return nil
 		}
 	}
-	if !bytes.Equal(attempt.Input.Snapshot, model.snapshot) {
-		proof.previousTarget = attempt.Input.Snapshot
+	if !bytes.Equal(attempt.Input.Snapshot, model.snapshot) && (comparer == nil || !comparer.CompatibleReasoningEffortTargets(attempt.Input.Snapshot, model.snapshot)) {
+		return nil
 	}
 	previous, err := s.config.Store.Get(ctx, attempt.Input.RolloutID, attempt.Input.ConfigurationID)
 	if err != nil {

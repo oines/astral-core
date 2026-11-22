@@ -30,6 +30,11 @@ type ReasoningEffortUsageModel interface {
 // non-accounting host metadata. Both byte slices are immutable and must not
 // be retained. Without this declaration, target data must match exactly.
 type ReasoningEffortUsageTargetModel interface {
+	// ReasoningEffortTargetPolicyID identifies the rule and its eligibility
+	// across adapters and versions (e.g. "example-host/transport-v1"). For the
+	// same two snapshots, the answer must be stable for a given ID. Change
+	// the ID when the rule changes; an empty ID requires exact target data.
+	ReasoningEffortTargetPolicyID() string
 	CompatibleReasoningEffortTargets(previous, current json.RawMessage) bool
 }
 
