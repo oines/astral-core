@@ -15,7 +15,7 @@ func compactionBorrowPath() []Entry {
 	return []Entry{
 		{ID: "configuration", Kind: EntryConfiguration, Configuration: &Configuration{SystemPrompt: "instructions", Selection: ModelSelection{ID: "model"}}},
 		{ID: "user", Kind: EntryMessage, Message: &user},
-		{ID: "reply", Kind: EntryMessage, Message: &reply, Usage: Usage{Available: true, InputTokens: 500, OutputTokens: 100}, Generation: &GenerationRecord{ConfigurationID: "configuration", ContextDigest: contextDigest(covered)}},
+		{ID: "reply", Kind: EntryMessage, Message: &reply, Usage: Usage{Available: true, InputTokens: 500, OutputTokens: 100}, Generation: &GenerationRecord{Model: ModelSpec{ID: "model", ContextWindow: 500, MaxOutputTokens: 100}, ConfigurationID: "configuration", ContextDigest: contextDigest(covered)}},
 		{ID: "tail", Kind: EntryMessage, Message: copyPointer(User("retained tail"))},
 	}
 }

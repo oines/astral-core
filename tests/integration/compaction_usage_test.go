@@ -181,7 +181,7 @@ func TestCompactionUsageCountsResultsAfterToolCallAnchor(t *testing.T) {
 	}
 }
 
-func TestCompactionUsageInvalidatesForChangedRequest(t *testing.T) {
+func TestCompactionUsageChecksSelectedInputAndModelSpec(t *testing.T) {
 	for _, change := range []string{"model", "snapshot", "revision", "configuration", "prepared_system", "prepared_prefix", "missing_usage"} {
 		t.Run(change, func(t *testing.T) {
 			ctx := context.Background()
@@ -240,6 +240,12 @@ func TestCompactionUsageInvalidatesForChangedRequest(t *testing.T) {
 				}
 			}
 			record, err := s.Compact(ctx, "")
+			if change == "snapshot" {
+				if err != nil || record.InputTokens < 1075 || record.InputTokens >= 2000 {
+					t.Fatalf("matching prepared input and model spec lost usage: %+v %v", record, err)
+				}
+				return
+			}
 			if err != nil || record.InputTokens < 30000 {
 				t.Fatalf("stale usage was reused instead of full estimate: %+v %v", record, err)
 			}

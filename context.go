@@ -267,7 +267,7 @@ func validateWindowBodies(path []Entry) error {
 }
 
 func contextUsageAnchorFor(path []Entry, sources []string) *contextUsageAnchor {
-	// Only a successful assistant created after the current compaction/config
+	// Only a successful assistant created after the current compaction
 	// may anchor this projection. Summarizer usage never appears here.
 	entries := make(map[string]Entry, len(sources))
 	for _, entry := range path {
@@ -282,7 +282,7 @@ func contextUsageAnchorFor(path []Entry, sources []string) *contextUsageAnchor {
 		if entry.Generation != nil && entry.Message != nil && entry.Message.Role == RoleAssistant && !entry.Message.Failed() &&
 			entry.Usage.Available && !entry.Usage.InputMissing && !entry.Usage.OutputMissing &&
 			entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
-			return &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation, owner: entry.SessionID}
+			return &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
 		}
 	}
 	return nil

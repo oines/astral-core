@@ -2,29 +2,21 @@ package astral
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func legacyGenerationContextDigest(request Request, reply Message) string {
+func referenceGenerationContextDigest(request Request, reply Message) string {
 	// Keep the complete pre-optimization sequence independent of both typed
 	// writers: normalize Request, append the unnormalized reply, then Marshal.
 	covered := clone(request)
 	covered.Messages = append(covered.Messages, reply)
-	covered.MaxOutputTokens = 0
-	raw, err := json.Marshal(covered)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+	return referenceUsageDigest(covered)
 }
 
-func TestGenerationProvenanceMatchesLegacyNormalization(t *testing.T) {
+func TestGenerationProvenanceMatchesUsageDigestAfterNormalization(t *testing.T) {
 	changes := map[string]func(*Request){
 		"unchanged":      func(*Request) {},
 		"model-id":       func(r *Request) { r.ModelID = "bad\xff" },
@@ -61,7 +53,7 @@ func TestGenerationProvenanceMatchesLegacyNormalization(t *testing.T) {
 			for _, reply := range replies {
 				request := completeCopyRequest()
 				change(&request)
-				want := legacyGenerationContextDigest(request, reply)
+				want := referenceGenerationContextDigest(request, reply)
 				if got := GenerationProvenance(ModelAttempt{}, request, reply).ContextDigest; got != want {
 					t.Fatalf("generation digest differs from original normalization: want=%s got=%s", want, got)
 				}
@@ -72,7 +64,7 @@ func TestGenerationProvenanceMatchesLegacyNormalization(t *testing.T) {
 		request := completeCopyRequest()
 		request.Messages[0].Content[0].Text = string([]byte{byte(value)})
 		reply := replies[value%len(replies)]
-		if got, want := GenerationProvenance(ModelAttempt{}, request, reply).ContextDigest, legacyGenerationContextDigest(request, reply); got != want {
+		if got, want := GenerationProvenance(ModelAttempt{}, request, reply).ContextDigest, referenceGenerationContextDigest(request, reply); got != want {
 			t.Fatalf("byte %02x changed generation normalization: want=%s got=%s", value, want, got)
 		}
 	}
@@ -121,5 +113,57 @@ func TestRequestStringNormalizationFieldCoverage(t *testing.T) {
 		if strings.Join(got, " ") != fields {
 			t.Fatalf("%s fields changed; review request string normalization for new fields", typ)
 		}
+	}
+}
+
+func TestContextDigestKeepsInputOptionsWhileAuditCoversEveryOption(t *testing.T) {
+	spec := ModelSpec{ID: "model", ContextWindow: 128000, MaxOutputTokens: 4096}
+	req := Request{ModelID: spec.ID, Messages: []Message{User("history")}, MaxOutputTokens: 256}
+	base := Context{HeadID: "head", ConfigurationID: "cfg", Request: req}
+	original, err := FreezeRequest("rollout", base, req, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := 0.5
+	n := 200
+	seed := int64(200)
+	enabled := true
+	for _, tc := range []struct {
+		name    string
+		options GenerationOptions
+		reuse   bool
+	}{
+		{"temperature", GenerationOptions{Temperature: &f}, true},
+		{"top-p", GenerationOptions{TopP: &f}, true},
+		{"stop", GenerationOptions{Stop: []string{"stop"}}, true},
+		{"seed", GenerationOptions{Seed: &seed}, true},
+		{"frequency", GenerationOptions{FrequencyPenalty: &f}, true},
+		{"presence", GenerationOptions{PresencePenalty: &f}, true},
+		{"effort", GenerationOptions{Reasoning: ReasoningOptions{Effort: "high"}}, true},
+		{"budget", GenerationOptions{Reasoning: ReasoningOptions{BudgetTokens: &n}}, true},
+		{"enabled", GenerationOptions{Reasoning: ReasoningOptions{Enabled: &enabled}}, true},
+		{"tool-choice", GenerationOptions{ToolChoice: ToolChoice{Mode: "none"}}, false},
+		{"response-format", GenerationOptions{ResponseFormat: &ResponseFormat{Type: "json_object"}}, false},
+		{"provider-options", GenerationOptions{ProviderOptions: map[string]json.RawMessage{"native": json.RawMessage("true")}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := req
+			changed.Options = tc.options
+			if same := contextDigest(req) == contextDigest(changed); same != tc.reuse {
+				t.Fatalf("usage fingerprint equal = %v, want %v", same, tc.reuse)
+			}
+			facts, err := measureGenerationRequest(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			audit, err := freezeRequest("rollout", base, changed, spec, facts)
+			if err != nil || audit.Digest == original.Digest {
+				t.Fatalf("audit missed option change: %v", err)
+			}
+			got, err := audit.Apply(req)
+			if err != nil || !sameJSON(changed, got) {
+				t.Fatalf("frozen request lost option: %v", err)
+			}
+		})
 	}
 }

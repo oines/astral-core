@@ -24,7 +24,7 @@ func TestGenerationRequestFactsMatchSequentialDigests(t *testing.T) {
 				t.Fatalf("parallel measurement changed result: old=%v new=%v", err, parallelErr)
 			}
 			reply := Message{Role: RoleAssistant, Content: Text("done")}
-			if generationProvenanceWithFacts(ModelAttempt{}, request, reply, got).ContextDigest != legacyGenerationContextDigest(request, reply) {
+			if generationProvenanceWithFacts(ModelAttempt{}, request, reply, got).ContextDigest != referenceGenerationContextDigest(request, reply) {
 				t.Fatal("parallel measurement changed legacy provenance")
 			}
 			after, _ := json.Marshal(request)
@@ -124,11 +124,11 @@ func TestFitGenerationFactsRequireFinalValidationAndOutput(t *testing.T) {
 
 func TestGenerationKeepsEarlyUsageFactsSequential(t *testing.T) {
 	request := Request{ModelID: "model", Messages: []Message{User("question"), {Role: RoleAssistant, Content: Text("answer")}}}
-	view := Context{ConfigurationID: "config", Request: request, anchor: &contextUsageAnchor{index: 1, usage: Usage{Available: true, InputTokens: 100, OutputTokens: 20}, generation: GenerationRecord{ConfigurationID: "config", ContextDigest: legacyTypedContextDigest(request)}}}
 	model := estimatedModel{Model: projectionBoundaryModel{ModelFunc: ModelFunc{Specification: ModelSpec{ID: "model", ContextWindow: 1000, MaxOutputTokens: 128}}, project: func(r Request) (Request, error) { return r, nil }}, estimate: func(context.Context, Model, Request) (int, error) {
 		t.Fatal("valid usage anchor was re-estimated")
 		return 0, nil
 	}}
+	view := Context{ConfigurationID: "config", Request: request, anchor: &contextUsageAnchor{index: 1, usage: Usage{Available: true, InputTokens: 100, OutputTokens: 20}, generation: GenerationRecord{ConfigurationID: "config", Model: model.Spec(), ContextDigest: referenceUsageDigest(request)}}}
 	s := Session{config: Config{Budget: BudgetPolicy{SafetyMargin: 1}, MaxContextBytes: 10000}}
 	got, err := s.fitContext(context.Background(), model, view, true)
 	if err != nil || got.facts == nil || got.facts.usageDigest == "" || got.facts.requestDigest != "" {
