@@ -32,7 +32,7 @@ func (st *effortAttemptStore) GetAttempt(ctx context.Context, sessionID, id stri
 }
 
 func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
-	for _, change := range []string{"effort", "missing attempt", "snapshot", "system prompt", "other option", "disabled", "no policy", "changed prefix", "resolved options", "host update"} {
+	for _, change := range []string{"effort", "missing attempt", "snapshot", "missing snapshot", "null snapshot", "system prompt", "other option", "disabled", "no policy", "changed prefix", "resolved options", "host update"} {
 		t.Run(change, func(t *testing.T) {
 			ctx := context.Background()
 			store := &effortAttemptStore{Store: memory.New()}
@@ -50,6 +50,12 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 			changedTarget := false
 			c.ResolveModel = func(_ context.Context, sel core.ModelSelection) (core.ResolvedModel, error) {
 				r := core.ResolvedModel{Model: effortUsageTestModel{base}, Snapshot: json.RawMessage(`{"target":1}`), Options: sel.Options}
+				switch change {
+				case "missing snapshot":
+					r.Snapshot = nil
+				case "null snapshot":
+					r.Snapshot = json.RawMessage("null")
+				}
 				r.Options.Reasoning = core.ReasoningOptions{Effort: "high"}
 				if sel.Reasoning != nil {
 					r.Options.Reasoning = *sel.Reasoning

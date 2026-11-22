@@ -85,6 +85,14 @@ func (s *Session) loadEffortEvidence(ctx context.Context, a *contextUsageAnchor,
 		attempt.Input.ConfigurationID != a.generation.ConfigurationID || attempt.Input.Model != a.generation.Model || attempt.Purpose != "generation" {
 		return nil
 	}
+	// A fixed model or a resolver without a snapshot provides no evidence
+	// that an identically named target still refers to the same endpoint.
+	for _, raw := range []json.RawMessage{attempt.Input.Snapshot, model.snapshot} {
+		data := bytes.TrimSpace(raw)
+		if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+			return nil
+		}
+	}
 	if !bytes.Equal(attempt.Input.Snapshot, model.snapshot) {
 		comparer, ok := model.Model.(ReasoningEffortUsageTargetModel)
 		if !ok || !comparer.CompatibleReasoningEffortTargets(attempt.Input.Snapshot, model.snapshot) {
