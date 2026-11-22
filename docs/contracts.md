@@ -45,7 +45,9 @@ CollectContext 接收 SessionID、Reason、CompactionID 和 Context 视图，返
 
 默认摘要使用 Goal、Constraints & Preferences、Progress（Done / In Progress / Blocked）、Key Decisions、Next Steps、Critical Context 结构。已有摘要作为首条源消息参与下一次压缩；更新指令要求保留仍有效的目标与约束，合并新进展和决策，更新完成状态、阻塞与下一步，并保留准确路径、标识符和错误信息。模型只生成交接摘要，不继续执行源对话中的任务，也不能把未经确认的操作写成已完成。自定义 Compaction.SystemPrompt 可覆盖默认格式。
 
-MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。Usage.Available 仅表示存在用量报告；适配器确认提供商遗漏输入或输出计数时，分别设置 InputMissing / OutputMissing（JSON 为 input_missing / output_missing，false 省略）。两个缺失标记默认 false，保持旧记录和现有调用方的语义；单项明确报告为零不表示缺失。不完整用量仍保存于消息与 Attempt 供审计，只有 Available 且两个缺失标记均为 false 的用量可充当基线。最新回复不完整时继续查找更早的完整基线，并将它之后的消息纳入尾段估算。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型/配置或覆盖前缀改变时回退为完整内容估算。未报告、不完整、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
+MaxContextBytes 默认 32 MiB、最小 4096，约束实际 Request；历史工作窗口有约两倍字节保护上限。输入优先采用有效普通生成实报 InputTokens + OutputTokens，并增量估算其后新增内容；InputTokens 已包含缓存，缓存分项不另加。Usage.Available 仅表示存在用量报告；适配器确认提供商遗漏输入或输出计数时，分别设置 InputMissing / OutputMissing（JSON 为 input_missing / output_missing，false 省略）。两个缺失标记默认 false，保持旧记录和现有调用方的语义；单项明确报告为零不表示缺失。不完整用量仍保存于消息与 Attempt 供审计，只有 Available 且两个缺失标记均为 false 的用量可充当基线。最新回复不完整时继续查找更早的完整基线，并将它之后的消息纳入尾段估算。有效性由成功 Attempt、Configuration 和冻结请求加回复的上下文指纹确认；压缩、模型或覆盖前缀改变时回退为完整内容估算；配置改变时仅允许下述推理强度兼容路径。未报告、不完整、全零和失败用量不充当基线。估算器必须非负，并支持完整请求、空请求与不带 System/Tools/Options 的部分消息尾段。
+
+会话从一种有效推理强度切换到另一种时，模型可通过可选的 `ReasoningEffortUsageModel.CompatibleReasoningEfforts` 声明两档使用相同的输入计量。普通请求与摘要从成功生成的冻结 Attempt 还原原先实际使用的强度，包括继承的模型默认值。仅当模型规格一致、冻结目标相同、配置仅有强度差异、以旧强度复算的已准备前缀指纹完全匹配时，沿用该次实报并计入后续增量。开关或预算变化、缺少旧 Attempt 或缺少兼容声明时按完整内容估算。冻结目标默认按原字节核对；可选的 `ReasoningEffortUsageTargetModel` 允许 Host 验证明示与输入计量无关的元数据差异。每个会话至多保留一份小型核对结果，核对绑定当前目标快照摘要。既有会话使用同一读取规则；冻结请求摘要、历史和持久化格式均沿用原契约。
 
 摘要仅在普通模型与摘要模型规格及目标快照相同、普通请求准备后的选中历史未转换、基线覆盖前缀指纹有效时复用真实用量。基线从选中历史内寻找，不引用保留尾段的较新回复。完整预算为真实 InputTokens + OutputTokens、基线之后所有实际选入摘要的消息估算、完整的新摘要提示词/选项/指令开销；旧请求固定开销保守保留，不做粗估减法。旁观消息即使长期没有普通生成也持续计入增量。摘要准备或工具文本缩短改变覆盖前缀时回退为完整内容估算。摘要输入、摘要输出、独立输入上限、协议和字节预算仍全部检查；摘要成功后重新检查摘要、保留历史及待加入输入的完整候选，旧基线失效，摘要 usage 不成为新窗口基线。
 

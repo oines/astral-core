@@ -128,13 +128,8 @@ func (s *Session) draftCompaction(ctx context.Context, instructions string, norm
 			}
 		}
 	}
-	if hasReportedContextUsage(source) {
-		// Source is fixed throughout the candidate search. Retain this exact
-		// usage-prefix digest instead of re-reading its payload for every cap.
-		source.facts, err = measureRequestFacts(source.Request, source.anchor.index)
-		if err != nil {
-			return CompactionRecord{}, err
-		}
+	if err := s.prepareUsageFacts(ctx, normalModel, &source); err != nil {
+		return CompactionRecord{}, err
 	}
 	summaryModelID := summaryModel.Spec().ID
 	output := s.config.Compaction.OutputTokens

@@ -303,13 +303,8 @@ func (s *Session) measureContext(ctx context.Context, model Model, view Context)
 	if err = validatePreparedProtocol(request.Messages); err != nil {
 		return view, err
 	}
-	if hasReportedContextUsage(view) {
-		// Count this prepared body and capture both SHA prefixes in one pass.
-		// Final output digits are corrected only after the token estimate below.
-		view.facts, err = measureRequestFacts(request, view.anchor.index)
-		if err != nil {
-			return view, err
-		}
+	if err := s.prepareUsageFacts(ctx, model, &view); err != nil {
+		return view, err
 	}
 	view.EstimatedInput, err = s.estimateContext(ctx, model, view)
 	if err != nil {

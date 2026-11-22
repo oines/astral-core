@@ -294,3 +294,35 @@ func TestOmittedFormatUsesStrictProtocolDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBuiltInEffortUsageCompatibility(t *testing.T) {
+	for _, protocol := range []string{completions.Protocol, responses.Protocol, anthropic.Protocol, google.Protocol} {
+		for _, format := range models.ReasoningFormats(protocol) {
+			t.Run(protocol+"/"+string(format), func(t *testing.T) {
+				cfg := reasoningConfig(format)
+				if format == models.ReasoningFormatCustom {
+					cfg.ReasoningMapping = &models.ReasoningMapping{
+						Fields: []string{"provider.mode"}, Efforts: map[string]json.RawMessage{
+							"low":  json.RawMessage(`{"provider":{"mode":"simple"}}`),
+							"high": json.RawMessage(`{"provider":{"mode":"extended"}}`),
+						},
+					}
+				}
+				m, err := newReasoningModel(protocol, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				p := m.(core.ReasoningEffortUsageModel)
+				want := format != models.ReasoningFormatAnthropicBudget && format != models.ReasoningFormatGeminiBudget && format != models.ReasoningFormatCustom
+				if got := p.CompatibleReasoningEfforts("low", "high"); got != want {
+					t.Fatalf("active efforts: got %t, want %t", got, want)
+				}
+				for _, invalid := range []string{"", "none", "undeclared"} {
+					if p.CompatibleReasoningEfforts(invalid, "high") || p.CompatibleReasoningEfforts("low", invalid) {
+						t.Fatalf("accepted unproved effort %q", invalid)
+					}
+				}
+			})
+		}
+	}
+}

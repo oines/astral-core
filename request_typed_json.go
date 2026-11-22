@@ -219,6 +219,10 @@ func (facts *requestFacts) frozenDigest(request Request) string {
 }
 
 func measureRequestFacts(request Request, usageIndex int) (*requestFacts, error) {
+	return measureRequestUsage(request, usageIndex, "")
+}
+
+func measureRequestUsage(request Request, usageIndex int, previousEffort string) (*requestFacts, error) {
 	facts := &requestFacts{source: request, usageIndex: -1}
 	if !requestStringsUTF8(request) {
 		// GenerationProvenance normalizes these uncommon inputs before hashing.
@@ -278,7 +282,23 @@ func measureRequestFacts(request Request, usageIndex int) (*requestFacts, error)
 	}
 	if len(usagePrefix) > 0 {
 		facts.usageIndex = usageIndex
-		facts.usageDigest, _ = finishContextDigest(usagePrefix, facts.contextSuffix, nil, false)
+		usageSuffix := facts.contextSuffix
+		if previousEffort != "" {
+			// Hash the same prepared prefix with the proven prior effective
+			// effort; all size, freeze and reply hashes keep the current options.
+			var historical bytes.Buffer
+			covered.Options.Reasoning.Effort = previousEffort
+			tail.out.Reset(&historical)
+			tail.typedRequestSuffix(covered)
+			if tail.err != nil {
+				return nil, tail.err
+			}
+			if err := tail.out.Flush(); err != nil {
+				return nil, err
+			}
+			usageSuffix = historical.Bytes()
+		}
+		facts.usageDigest, _ = finishContextDigest(usagePrefix, usageSuffix, nil, false)
 	}
 	// The remaining bytes only affect size; provenance appends the reply here.
 	w.out.Reset(&size)

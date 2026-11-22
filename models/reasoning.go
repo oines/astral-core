@@ -324,6 +324,27 @@ func EncodeReasoning(protocol string, config Config, options core.ReasoningOptio
 	return ReasoningEncoding{Fields: fields, OwnedFields: p.ownedFields(), Selection: options}, nil
 }
 
+// CompatibleReasoningEfforts recognizes active levels of the built-in native
+// encoders. Custom mappings may change arbitrary provider-specific fields.
+func CompatibleReasoningEfforts(protocol string, config Config, previous, current string) bool {
+	if config.ReasoningMapping != nil || config.ReasoningFormat == ReasoningFormatCustom {
+		return false
+	}
+	p, err := resolveReasoningPlan(protocol, config)
+	if err != nil || p.caps == nil {
+		return false
+	}
+	for _, effort := range []string{previous, current} {
+		if effort == "" || effort == "none" || effort == p.caps.OffEffort {
+			return false
+		}
+		if _, err := p.encode(core.ReasoningOptions{Effort: effort}, config.Spec.MaxOutputTokens); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (p reasoningPlan) encode(o core.ReasoningOptions, maxOutput int) (map[string]any, error) {
 	if err := p.checkCapabilities(o); err != nil {
 		return nil, err
