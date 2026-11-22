@@ -48,6 +48,7 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 			c.Selection = core.ModelSelection{ID: "profile"}
 			newSelection := false
 			changedTarget := false
+			compareTargets := true
 			c.ResolveModel = func(_ context.Context, sel core.ModelSelection) (core.ResolvedModel, error) {
 				r := core.ResolvedModel{Model: effortUsageTestModel{base}, Snapshot: json.RawMessage(`{"target":1}`), Options: sel.Options}
 				switch change {
@@ -65,7 +66,9 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 					r.Options.TopP = &n
 				}
 				if newSelection && change == "host update" {
-					r.Model = effortUsageTargetTestModel{effortUsageTestModel{base}}
+					if compareTargets {
+						r.Model = effortUsageTargetTestModel{effortUsageTestModel{base}}
+					}
 					r.Snapshot = json.RawMessage(`{"target":1,"client":"new"}`)
 					if changedTarget {
 						r.Snapshot = json.RawMessage(`{"target":2,"client":"new"}`)
@@ -135,12 +138,22 @@ func TestEffortUsageChecksHistoricalEffectiveSelection(t *testing.T) {
 				t.Fatalf("reread immutable attempt %d times", n)
 			}
 			if change == "host update" {
-				changedTarget = true
+				compareTargets = false
 				view, err := s.InspectContext(ctx)
 				if err != nil {
 					t.Fatal(err)
 				}
 				want, _ := opaqueContentEstimate(view.Request)
+				if view.EstimatedInput != want {
+					t.Fatal("cached evidence substituted for the live model's target policy")
+				}
+				compareTargets = true
+				changedTarget = true
+				view, err = s.InspectContext(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, _ = opaqueContentEstimate(view.Request)
 				if view.EstimatedInput != want || store.reads.Load() != 2 {
 					t.Fatalf("stale effort target evidence survived a different target: %d / %d, reads=%d", view.EstimatedInput, want, store.reads.Load())
 				}

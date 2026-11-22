@@ -10,11 +10,13 @@ import (
 
 // A single immutable proof per Session avoids fetching historical attempt
 // recipes and tool schemas on every passive input after an effort change.
-// It never retains the request, reply, snapshot, or configuration bodies.
+// It never retains request, reply or configuration bodies. Differing targets
+// require the live model's approval on every use, even on a cache hit.
 type effortUsageEvidence struct {
 	owner, attemptID, configurationID string
 	effort                            string
 	currentTarget                     [sha256.Size]byte
+	previousTarget                    json.RawMessage
 }
 
 func (s *Session) prepareUsageFacts(ctx context.Context, model Model, view *Context) error {
@@ -38,6 +40,12 @@ func (s *Session) prepareUsageFacts(ctx context.Context, model Model, view *Cont
 		}
 		if evidence.effort == "" || !policy.CompatibleReasoningEfforts(evidence.effort, current.Effort) {
 			return nil
+		}
+		if evidence.previousTarget != nil {
+			comparer, ok := bound.Model.(ReasoningEffortUsageTargetModel)
+			if !ok || !comparer.CompatibleReasoningEffortTargets(evidence.previousTarget, bound.snapshot) {
+				return nil
+			}
 		}
 		// A Context may borrow its candidate anchor from the active projection.
 		// The exception applies only to this prepared view, never to its source.
@@ -68,9 +76,14 @@ func (s *Session) effortEvidence(ctx context.Context, a *contextUsageAnchor, con
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return proof, err
 	}
-	s.mu.Lock()
-	s.effortUsage = &proof
-	s.mu.Unlock()
+	// Large custom snapshots remain usable for this check, without keeping
+	// them resident while the Session is idle.
+	if len(proof.previousTarget) <= 4096 {
+		proof.previousTarget = bytes.Clone(proof.previousTarget)
+		s.mu.Lock()
+		s.effortUsage = &proof
+		s.mu.Unlock()
+	}
 	return proof, nil
 }
 
@@ -94,10 +107,7 @@ func (s *Session) loadEffortEvidence(ctx context.Context, a *contextUsageAnchor,
 		}
 	}
 	if !bytes.Equal(attempt.Input.Snapshot, model.snapshot) {
-		comparer, ok := model.Model.(ReasoningEffortUsageTargetModel)
-		if !ok || !comparer.CompatibleReasoningEffortTargets(attempt.Input.Snapshot, model.snapshot) {
-			return nil
-		}
+		proof.previousTarget = attempt.Input.Snapshot
 	}
 	previous, err := s.config.Store.Get(ctx, attempt.Input.RolloutID, attempt.Input.ConfigurationID)
 	if err != nil {
