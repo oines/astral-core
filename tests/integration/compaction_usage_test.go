@@ -331,6 +331,7 @@ func TestCompactionUsageRejectsRealPassiveTailOverflow(t *testing.T) {
 
 func TestCompactionUsageRechecksPendingObservationsBeforeCommit(t *testing.T) {
 	ctx := context.Background()
+	const discarded = "environment before explicit compaction"
 	m := model(func(_ context.Context, _ int, r core.Request, _ func(core.ModelEvent)) (core.Reply, error) {
 		if r.SystemPrompt == "summarize" {
 			if strings.Contains(requestText(r), "pending-only") {
@@ -341,9 +342,22 @@ func TestCompactionUsageRechecksPendingObservationsBeforeCommit(t *testing.T) {
 		return opaqueUsageReply(), nil
 	})
 	m.spec.ContextWindow = 4000
-	m.estimator = opaqueContentEstimate
+	m.estimator = func(r core.Request) (int, error) {
+		if strings.Contains(requestText(r), discarded) {
+			t.Error("estimated the discarded pre-summary candidate")
+		}
+		return opaqueContentEstimate(r)
+	}
 	c := testConfig(m, memory.New())
 	c.Compaction = core.CompactionPolicy{Disabled: true, SystemPrompt: "summarize", KeepRecentTokens: 1, OutputTokens: 100}
+	var collected bool
+	c.CollectContextReadOnly = func(_ context.Context, b core.ContextBoundary) ([]core.Message, error) {
+		if b.Reason == "compact" {
+			collected = true
+			return []core.Message{snapshotMessage(discarded)}, nil
+		}
+		return nil, nil
+	}
 	s := newSession(t, newSessions(t, c), core.SessionOptions{})
 	waitOK(t, start(t, s, "work"))
 	if _, err := inject(s, ctx, []core.Message{snapshotMessage("retain this observation")}); err != nil {
@@ -357,6 +371,9 @@ func TestCompactionUsageRechecksPendingObservationsBeforeCommit(t *testing.T) {
 	before := historyOf(s)
 	if _, err := s.Compact(ctx, ""); !errors.Is(err, core.ErrBudget) {
 		t.Fatalf("final candidate did not reject oversized pending input: %v", err)
+	}
+	if !collected {
+		t.Fatal("explicit compaction skipped context collection")
 	}
 	if len(m.observed()) != 2 || !reflect.DeepEqual(before.Entries, historyOf(s).Entries) {
 		t.Fatal("summary did not run or partial compact was committed")
