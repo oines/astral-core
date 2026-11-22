@@ -282,7 +282,7 @@ func contextUsageAnchorFor(path []Entry, sources []string) *contextUsageAnchor {
 		if entry.Generation != nil && entry.Message != nil && entry.Message.Role == RoleAssistant && !entry.Message.Failed() &&
 			entry.Usage.Available && !entry.Usage.InputMissing && !entry.Usage.OutputMissing &&
 			entry.Usage.InputTokens >= 0 && entry.Usage.OutputTokens >= 0 && (entry.Usage.InputTokens > 0 || entry.Usage.OutputTokens > 0) {
-			return &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation}
+			return &contextUsageAnchor{index: i, usage: entry.Usage, generation: *entry.Generation, owner: entry.SessionID}
 		}
 	}
 	return nil

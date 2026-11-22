@@ -39,6 +39,10 @@ func (m *Model) ProjectRequest(ctx context.Context, req core.Request) (core.Requ
 	return m.client.ProjectRequest(ctx, req)
 }
 
+func (m *Model) CompatibleReasoningEfforts(previous, current string) bool {
+	return models.CompatibleReasoningEfforts(Protocol, m.client.Config, previous, current)
+}
+
 func (m *Model) SnapshotConfig() models.Config { return m.client.SnapshotConfig() }
 
 func (m *Model) Spec() core.ModelSpec { return m.client.Spec() }

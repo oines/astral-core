@@ -19,6 +19,25 @@ type Model interface {
 	Stream(context.Context, Request, func(ModelEvent)) (Reply, error)
 }
 
+// ReasoningEffortUsageModel declares which active effort levels use the same
+// input accounting on this target. Core still verifies the frozen target,
+// every other option, and the exact prepared request prefix before reusing usage.
+type ReasoningEffortUsageModel interface {
+	CompatibleReasoningEfforts(previous, current string) bool
+}
+
+// ReasoningEffortUsageTargetModel may recognize snapshots differing only in
+// non-accounting host metadata. Both byte slices are immutable and must not
+// be retained. Without this declaration, target data must match exactly.
+type ReasoningEffortUsageTargetModel interface {
+	// ReasoningEffortTargetPolicyID identifies the rule and its eligibility
+	// across adapters and versions (e.g. "example-host/transport-v1"). For the
+	// same two snapshots, the answer must be stable for a given ID. Change
+	// the ID when the rule changes; an empty ID requires exact target data.
+	ReasoningEffortTargetPolicyID() string
+	CompatibleReasoningEffortTargets(previous, current json.RawMessage) bool
+}
+
 // RequestPreparer freezes host context before estimation, persistence and
 // generation. Stream must use that snapshot, without resolving mutable files
 // or appending live environment data. Preparation may run for inspection or

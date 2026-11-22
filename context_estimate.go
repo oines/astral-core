@@ -9,9 +9,11 @@ import (
 )
 
 type contextUsageAnchor struct {
-	index      int
-	usage      Usage
-	generation GenerationRecord
+	index          int
+	usage          Usage
+	generation     GenerationRecord
+	owner          string
+	previousEffort string // checked only for a cross-configuration usage estimate
 }
 
 func cloneContext(view Context) Context {
@@ -87,6 +89,9 @@ func reportedContextTokens(view Context) (int, bool, error) {
 	if digest == "" {
 		covered := view.Request
 		covered.Messages = covered.Messages[:a.index+1]
+		if a.previousEffort != "" {
+			covered.Options.Reasoning.Effort = a.previousEffort
+		}
 		digest = contextDigest(covered)
 	}
 	if digest != a.generation.ContextDigest {
@@ -104,7 +109,7 @@ func hasReportedContextUsage(view Context) bool {
 	a := view.anchor
 	if a == nil || !a.usage.Available || a.usage.InputMissing || a.usage.OutputMissing ||
 		a.index < 0 || a.index >= len(view.Request.Messages) || a.generation.ContextDigest == "" ||
-		a.generation.ConfigurationID != view.ConfigurationID || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
+		(a.generation.ConfigurationID != view.ConfigurationID && a.previousEffort == "") || a.usage.InputTokens < 0 || a.usage.OutputTokens < 0 ||
 		(a.usage.InputTokens == 0 && a.usage.OutputTokens == 0) {
 		return false
 	}
